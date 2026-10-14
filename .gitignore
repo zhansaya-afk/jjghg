@@ -1,0 +1,10 @@
+data/
+models/
+results/logs/
+*.joblib
+*.npz
+*.task
+*.onnx
+*.tflite
+__pycache__/
+.ipynb_checkpoints/
