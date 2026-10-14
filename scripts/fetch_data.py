@@ -25,6 +25,12 @@ def _find_col(cols, pats):
     return None
 
 
+def _norm_id(x):
+    """«007», «7.0», «Patient 7» → «7»: в таблицах и в именах папок номера записаны по-разному."""
+    m = re.search(r'\d+', str(x))
+    return str(int(m.group())) if m else None
+
+
 def eyes_defy_labels(raw):
     """Таблицы Hb (xlsx Италия/Индия) + папки пациентов с фото и масками врачей."""
     recs = []
@@ -43,23 +49,32 @@ def eyes_defy_labels(raw):
                 hbv = pd.to_numeric(str(r[hb]).replace(',', '.'), errors='coerce')
                 if pd.isna(hbv):
                     continue
-                recs.append({'country': country, 'pid': str(r[pid]).split('.')[0].strip(), 'hb_g_dl': float(hbv),
+                recs.append({'country': country, 'pid': _norm_id(r[pid]), 'hb_g_dl': float(hbv),
                              'sex': r[sex] if sex else None, 'age': r[age] if age else None})
-    tab = pd.DataFrame(recs).drop_duplicates(['country', 'pid'])
+    tab = pd.DataFrame(recs).dropna(subset=['pid']).drop_duplicates(['country', 'pid'])
+    # папка пациента = любая папка, где есть исходное фото и маска (как в рабочем загрузчике v10)
+    folders = {}
+    for f in glob.glob(f'{raw}/**/*', recursive=True):
+        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')):
+            folders.setdefault(os.path.dirname(f), []).append(os.path.basename(f))
     rows = []
-    for d in sorted(glob.glob(f'{raw}/**/', recursive=True)):
-        name = os.path.basename(os.path.normpath(d))
-        country = 'India' if '/india/' in d.lower() else 'Italy' if '/italy/' in d.lower() else None
-        if country is None or not name.isdigit():
+    for d, imgs in sorted(folders.items()):
+        low = {f: f.lower() for f in sorted(imgs)}
+        palp = [f for f, n in low.items() if 'palpebral' in n and 'forniceal' not in n]
+        forn = [f for f, n in low.items() if 'forniceal' in n and 'palpebral' not in n]
+        both = [f for f, n in low.items() if 'palpebral' in n and 'forniceal' in n]
+        orig = [f for f, n in low.items() if 'palpebral' not in n and 'forniceal' not in n]
+        if not orig or not (palp or both):
             continue
-        imgs = [f for f in os.listdir(d) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        raw_img = [f for f in imgs if not re.search(r'forniceal|palpebral', f.lower())]
-        mask = lambda k: next((os.path.relpath(os.path.join(d, f), raw) for f in imgs
-                               if f.lower().endswith(f'{k}.png')), None)
-        rows.append({'country': country, 'pid': name,
-                     'image': os.path.relpath(os.path.join(d, raw_img[0]), raw) if raw_img else None,
-                     'mask_palpebral': mask('_palpebral'), 'mask_forniceal': mask('_forniceal'),
-                     'mask_forniceal_palpebral': mask('_forniceal_palpebral')})
+        rel = lambda fs: os.path.relpath(os.path.join(d, fs[0]), raw) if fs else None
+        path = d.lower()
+        rows.append({'country': 'India' if 'india' in path else 'Italy' if 'italy' in path else 'NA',
+                     'pid': _norm_id(os.path.basename(d)), 'image': rel(orig),
+                     'mask_palpebral': rel(palp or both),     # нет отдельной маски века → общая (как в v10)
+                     'mask_forniceal': rel(forn), 'mask_forniceal_palpebral': rel(both)})
+    if (tab.country == 'NA').all():                           # страна не определяется по таблицам
+        tab = tab.drop(columns='country').drop_duplicates('pid')
+        return pd.DataFrame(rows).merge(tab, on='pid', how='left')
     return pd.DataFrame(rows).merge(tab, on=['country', 'pid'], how='left')
 
 
