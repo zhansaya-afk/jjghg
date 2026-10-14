@@ -30,6 +30,14 @@ def test_evaluate_runs_on_synthetic(tmp_path):
                        capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr[-2000:]
     assert '| phone | ridge · маска full | 30 |' in r.stdout
+    assert 'MAE константы' in r.stdout
+    # было/стало: второй прогон с другим числом копий света сравнивается с первым по OOF
+    r = subprocess.run([sys.executable, os.path.join(ROOT, 'scripts', 'evaluate.py'), '--data', str(tmp_path),
+                        '--model', 'ridge', '--no-history', '--tag', 'pytest2', '--jobs', '1', '--relight', '1',
+                        '--compare', 'pytest'], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert 'Было/стало относительно «pytest»' in r.stdout
+    assert any(v in r.stdout for v in ('лучше', 'хуже', 'в пределах шума', 'смешанно'))
 
 
 def test_eyes_defy_layout_and_seg_baseline(tmp_path):
@@ -66,3 +74,18 @@ def test_eyes_defy_layout_and_seg_baseline(tmp_path):
     assert r.returncode == 0, r.stderr[-2000:]
     assert '| eyes_defy | v11 pixel-HGB | 20 |' in r.stdout
     assert 'ridge · маска doctor' in r.stdout and 'ridge · маска pred' in r.stdout
+
+
+def test_history_gains_new_columns(tmp_path, monkeypatch):
+    """Старый metrics_history.csv (меньше колонок) переписывается с новой шапкой, строки сохраняются."""
+    sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+    import evaluate
+    hist = tmp_path / 'h.csv'
+    old_cols = evaluate.HIST_COLS[:evaluate.HIST_COLS.index('found') + 1]
+    pd.DataFrame([{c: '' for c in old_cols} | {'tag': 'old', 'mae': '16.4'}])[old_cols].to_csv(hist, index=False)
+    monkeypatch.setattr(evaluate, 'HISTORY', str(hist))
+    evaluate.append_history([{'task': 'hb', 'mae': 15.7, 'mae_null': 17.0, 'verdict': 'лучше'}], 'new', 'abc')
+    H = pd.read_csv(hist)
+    assert list(H.columns) == evaluate.HIST_COLS
+    assert H.tag.tolist() == ['old', 'new'] and H.mae.tolist() == [16.4, 15.7]
+    assert H.verdict.iloc[1] == 'лучше' and pd.isna(H.mae_null.iloc[0])

@@ -49,6 +49,11 @@ def mae(pred, true):
     return float(np.mean(np.abs(np.asarray(pred) - np.asarray(true))))
 
 
+def skill(pred, null, true):
+    """Доля MAE, которую модель убирает относительно константы: 1 − MAE/MAE₀. 0 — не лучше константы."""
+    return 1 - mae(pred, true) / mae(null, true)
+
+
 def auc(score, y):
     return float(roc_auc_score(y, score))
 

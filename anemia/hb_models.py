@@ -30,9 +30,12 @@ def cross_validate(F, feats, kind='hgb', target_sens=0.80, inner_folds=4, stress
     """F: таблица признаков; строки с aug == 0 — исходные снимки, aug > 0 — обучающие копии при другом свете.
     Обязательные колонки: group, fold, hb_g_l, normal_thr, aug. stress: таблица признаков стресс-теста
     (group, cond) — предсказывается моделью того фолда, где пациент был тестовым.
-    Возвращает OOF-таблицу исходных снимков: pred, score, thr, flag (+ stress_pred по условиям)."""
+    Возвращает OOF-таблицу исходных снимков: pred, null, score, thr, flag (+ stress_pred по условиям).
+    null — «нулевая модель»: медиана Hb обучающих фолдов (лучшая константа для MAE). Модель, которая её
+    не обгоняет, Hb по фото не оценивает, сколько бы ни показывал MAE сам по себе."""
     O = F[F.aug == 0].copy()
     O['pred'] = np.nan
+    O['null'] = np.nan
     O['thr'] = np.nan
     stress_out = []
     for f in sorted(O.fold.unique()):
@@ -40,6 +43,7 @@ def cross_validate(F, feats, kind='hgb', target_sens=0.80, inner_folds=4, stress
         te = O.index[O.fold == f]
         model = make_model(kind).fit(tr_all[feats].values, tr_all.hb_g_l.values)
         O.loc[te, 'pred'] = model.predict(O.loc[te, feats].values)
+        O.loc[te, 'null'] = O.hb_g_l[O.fold != f].median()
         if stress is not None:
             S = stress[stress.group.isin(O.loc[te, 'group'])]
             if len(S):

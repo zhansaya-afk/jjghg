@@ -8,7 +8,13 @@
   hb   — Hb по цвету конъюнктивы: MAE, Bland–Altman, AUC, чувствительность/специфичность при пороге,
          подобранном внутри обучающих фолдов, стресс-тест «другой свет».
          Маска: CP-AnemiC — весь вырез; Eyes-defy — маска врача (потолок) и маска baseline-сегментации.
+         MAE сравнивается с «нулевой моделью» (медиана Hb обучающих фолдов): skill = 1 − MAE/MAE₀.
 Все метрики — по фиксированным фолдам манифеста (по пациенту). OOF-предсказания → <data>/results/.
+
+Было/стало: --compare TAG сравнивает с OOF прошлого прогона TAG на тех же пациентах (парный бутстрэп
+по пациентам) и пишет вердикт «лучше / хуже / в пределах шума» — по нему, а не по разнице точечных оценок.
+    python scripts/evaluate.py --task hb --relight 3 --tag baseline_v11 --no-history
+    python scripts/evaluate.py --task hb --tag relight12 --compare baseline_v11
 """
 import argparse
 import datetime as dt
@@ -25,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from anemia import metrics as M  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
-from anemia.features import feature_rows, load_item, row_meta  # noqa: E402
+from anemia.features import N_RELIGHT, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
 
 HISTORY = os.path.join(ROOT, 'results', 'metrics_history.csv')
@@ -33,7 +39,9 @@ HIST_COLS = ['timestamp', 'commit', 'tag', 'task', 'dataset', 'method', 'n',
              'mae', 'mae_lo', 'mae_hi', 'bias', 'loa_lo', 'loa_hi', 'auc', 'auc_lo', 'auc_hi',
              'target_sens', 'sens', 'sens_lo', 'sens_hi', 'spec', 'spec_lo', 'spec_hi',
              'n_hb100', 'sens_hb100', 'light_med', 'light_p90',
-             'iou_mean', 'iou_lo', 'iou_hi', 'iou_median', 'dice_mean', 'found']
+             'iou_mean', 'iou_lo', 'iou_hi', 'iou_median', 'dice_mean', 'found',
+             'mae_null', 'skill', 'skill_lo', 'skill_hi', 'relight', 'seed',
+             'ref_tag', 'd_mae', 'd_mae_lo', 'd_mae_hi', 'd_auc', 'd_auc_lo', 'd_auc_hi', 'verdict']
 
 
 class Tee:
@@ -84,12 +92,12 @@ def run_seg(root, df, jobs):
 
 
 # ------------------------------------------------------------------ Hb
-def _feat_job(root, row, mask_source, mask, seed):
+def _feat_job(root, row, mask_source, mask, seed, n_relight):
     if mask is None:
         rgb, mask = load_item(root, row, mask_source)
     else:
         rgb, _ = load_item(root, row, 'full')
-    return feature_rows(rgb, mask, row_meta(row), seed)
+    return feature_rows(rgb, mask, row_meta(row), seed, n_relight)
 
 
 def hb_metrics(O, S, target):
@@ -97,6 +105,10 @@ def hb_metrics(O, S, target):
     g = O.group.values
     r = {'n': len(O), 'mae': M.mae(pred, true), 'target_sens': target, **M.bland_altman(pred, true)}
     r['mae_lo'], r['mae_hi'] = M.bootstrap_ci(M.mae, g, 1000, 0, pred, true)
+    null = O.null.values
+    r['mae_null'] = M.mae(null, true)
+    r['skill'] = M.skill(pred, null, true)
+    r['skill_lo'], r['skill_hi'] = M.bootstrap_ci(M.skill, g, 1000, 0, pred, null, true)
     if 0 < y.sum() < len(y):
         r['auc'] = M.auc(O.score.values, y)
         r['auc_lo'], r['auc_hi'] = M.bootstrap_ci(lambda s, t: M.auc(s, t), g, 1000, 0, O.score.values, y)
@@ -112,8 +124,9 @@ def hb_metrics(O, S, target):
     return r
 
 
-def run_hb(root, df, mask_source, masks, model_kind, target, jobs):
-    out = Parallel(n_jobs=jobs)(delayed(_feat_job)(root, r, mask_source, None if masks is None else masks[i], i)
+def run_hb(root, df, mask_source, masks, model_kind, target, jobs, n_relight=N_RELIGHT, seed=0):
+    out = Parallel(n_jobs=jobs)(delayed(_feat_job)(root, r, mask_source, None if masks is None else masks[i],
+                                                   i + 100_000 * seed, n_relight)
                                 for i, r in enumerate(df.to_dict('records')))
     F = pd.DataFrame([x for rows, _ in out for x in rows])
     S = pd.DataFrame([x for _, srows in out for x in srows])
@@ -123,6 +136,26 @@ def run_hb(root, df, mask_source, masks, model_kind, target, jobs):
         feats.append('male')
     O, SP = cross_validate(F, feats, model_kind, target, stress=S if len(S) else None)
     return hb_metrics(O, SP, target), O, n_skip
+
+
+def compare(O, ref_path):
+    """Парное сравнение с OOF прошлого прогона на общих пациентах: Δ = новый − старый, 95% ДИ бутстрэпом
+    по пациентам. ΔMAE < 0 и ΔAUC > 0 — лучше. Вердикт по ДИ: ноль внутри → «в пределах шума»."""
+    R = pd.read_csv(ref_path)
+    J = O[['group', 'hb_g_l', 'anemic', 'pred', 'score']].merge(
+        R[['group', 'pred', 'score']], on='group', suffixes=('', '_ref'))
+    g, t, y = J.group.values, J.hb_g_l.values, J.anemic.values.astype(bool)
+    d_mae = lambda p, q, t: M.mae(p, t) - M.mae(q, t)
+    d_auc = lambda s, u, y: M.auc(s, y) - M.auc(u, y)
+    r = {'n_cmp': len(J), 'd_mae': d_mae(J.pred.values, J.pred_ref.values, t)}
+    r['d_mae_lo'], r['d_mae_hi'] = M.bootstrap_ci(d_mae, g, 1000, 0, J.pred.values, J.pred_ref.values, t)
+    if 0 < y.sum() < len(y):
+        r['d_auc'] = d_auc(J.score.values, J.score_ref.values, y)
+        r['d_auc_lo'], r['d_auc_hi'] = M.bootstrap_ci(d_auc, g, 1000, 0, J.score.values, J.score_ref.values, y)
+    better = r['d_mae_hi'] < 0 or r.get('d_auc_lo', -1) > 0
+    worse = r['d_mae_lo'] > 0 or r.get('d_auc_hi', 1) < 0
+    r['verdict'] = 'смешанно' if better and worse else 'лучше' if better else 'хуже' if worse else 'в пределах шума'
+    return r
 
 
 # ------------------------------------------------------------------ вывод
@@ -140,7 +173,7 @@ def fmt(r, k, nd=1, pct=False):
 
 
 def print_table(rows):
-    head = ['Датасет', 'Метод', 'n', 'MAE, г/л', 'Bland–Altman: смещение [LoA]', 'AUC', 'Чувств., %', 'Спец., %',
+    head = ['Датасет', 'Метод', 'n', 'MAE, г/л', 'MAE константы', 'Skill, %', 'Bland–Altman: смещение [LoA]', 'AUC', 'Чувств., %', 'Спец., %',
             'Чувств. Hb<100, %', 'Свет: ±г/л медиана (p90)', 'IoU', 'Dice', 'Найдено, %']
     print('\n| ' + ' | '.join(head) + ' |')
     print('|' + '---|' * len(head))
@@ -149,9 +182,16 @@ def print_table(rows):
         light = f"±{r['light_med']:.1f} ({r['light_p90']:.1f})" if 'light_med' in r else '—'
         hb100 = f"{r['sens_hb100'] * 100:.0f} (n={r['n_hb100']})" if r.get('n_hb100') else '—'
         iou = f"{r['iou_mean']:.3f} [{r['iou_lo']:.3f}–{r['iou_hi']:.3f}]" if 'iou_mean' in r else '—'
-        cells = [r['dataset'], r['method'], r['n'], fmt(r, 'mae'), ba, fmt(r, 'auc', 3), fmt(r, 'sens', 0, True),
+        cells = [r['dataset'], r['method'], r['n'], fmt(r, 'mae'), fmt(r, 'mae_null'), fmt(r, 'skill', 0, True), ba, fmt(r, 'auc', 3), fmt(r, 'sens', 0, True),
                  fmt(r, 'spec', 0, True), hb100, light, iou, fmt(r, 'dice_mean', 3), fmt(r, 'found', 0, True)]
         print('| ' + ' | '.join(str(c) for c in cells) + ' |')
+    cmp = [r for r in rows if r.get('verdict')]
+    if cmp:
+        print(f"\nБыло/стало относительно «{cmp[0]['ref_tag']}» (те же пациенты; Δ = новый − старый, 95% ДИ):")
+        print('| Датасет | Метод | n | ΔMAE, г/л | ΔAUC | Вердикт |\n|---|---|---|---|---|---|')
+        for r in cmp:
+            print(f"| {r['dataset']} | {r['method']} | {r['n_cmp']} | {fmt(r, 'd_mae', 2)} | {fmt(r, 'd_auc', 3)} | "
+                  f"{r['verdict']} |")
 
 
 def append_history(rows, tag, commit):
@@ -159,6 +199,10 @@ def append_history(rows, tag, commit):
     ts = dt.datetime.now().isoformat(timespec='seconds')
     H = pd.DataFrame([{**{c: None for c in HIST_COLS}, 'timestamp': ts, 'commit': commit, 'tag': tag,
                        **{k: v for k, v in r.items() if k in HIST_COLS}} for r in rows])[HIST_COLS]
+    if os.path.exists(HISTORY):
+        old = pd.read_csv(HISTORY, dtype=str, keep_default_na=False)
+        if list(old.columns) != HIST_COLS:       # добавились колонки: переписать файл с новой шапкой
+            old.reindex(columns=HIST_COLS, fill_value='').to_csv(HISTORY, index=False)
     H.to_csv(HISTORY, mode='a', header=not os.path.exists(HISTORY), index=False, float_format='%.4f')
 
 
@@ -171,6 +215,10 @@ def main():
     ap.add_argument('--target-sens', type=float, default=0.80)
     ap.add_argument('--tag', default='baseline_v11')
     ap.add_argument('--jobs', type=int, default=-1)
+    ap.add_argument('--relight', type=int, default=N_RELIGHT,
+                    help=f'обучающих копий при случайном свете на снимок (по умолчанию {N_RELIGHT}; база v11 — 3)')
+    ap.add_argument('--seed', type=int, default=0, help='seed случайного света: разброс между seed = шум метода')
+    ap.add_argument('--compare', metavar='TAG', help='сравнить с OOF прогона TAG из <data>/results/ (было/стало)')
     ap.add_argument('--no-history', action='store_true', help='не писать в metrics_history.csv (смоук-тесты)')
     a = ap.parse_args()
 
@@ -179,7 +227,7 @@ def main():
     sys.stdout = Tee(os.path.join(ROOT, 'results', 'logs', f'evaluate_{a.tag}_{stamp}.log'))
     man = pd.read_csv(os.path.join(a.data, 'manifest.csv'))
     commit = git_commit()
-    print(f'evaluate.py · commit {commit} · tag {a.tag} · {stamp}')
+    print(f'evaluate.py · commit {commit} · tag {a.tag} · relight {a.relight} · seed {a.seed} · {stamp}')
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
     oof_dir = os.path.join(a.data, 'results')
     os.makedirs(oof_dir, exist_ok=True)
@@ -203,13 +251,21 @@ def main():
                 continue
             for mk in models:
                 print(f'[{time.time() - t0:5.0f} с] {ds}: Hb, маска={src}, модель={mk}...')
-                r, O, n_skip = run_hb(a.data, df, 'doctor' if src == 'doctor' else src, masks, mk, a.target_sens, a.jobs)
+                r, O, n_skip = run_hb(a.data, df, 'doctor' if src == 'doctor' else src, masks, mk, a.target_sens, a.jobs,
+                                      a.relight, a.seed)
+                r.update(relight=a.relight, seed=a.seed)
+                if a.compare:
+                    ref = os.path.join(oof_dir, f'oof_{a.compare}_{ds}_{src}_{mk}.csv')
+                    if os.path.exists(ref):
+                        r.update(ref_tag=a.compare, **compare(O, ref))
+                    else:
+                        print(f'   ⚠️ нет {ref}: сравнение пропущено')
                 method = f'{mk} · маска {src}'
                 if n_skip:
                     print(f'   ⚠️ без ткани на маске: {n_skip} снимков — исключены из метрик Hb')
                     method += f' (−{n_skip})'
                 rows.append({'task': 'hb', 'dataset': ds, 'method': method, **r})
-                O[['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic']].to_csv(
+                O[['group', 'fold', 'hb_g_l', 'pred', 'null', 'score', 'thr', 'flag', 'anemic']].to_csv(
                     os.path.join(oof_dir, f'oof_{a.tag}_{ds}_{src}_{mk}.csv'), index=False)
     print_table(rows)
     if not a.no_history:

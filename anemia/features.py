@@ -9,7 +9,10 @@ from .io import load_mask, load_rgb, resize_to
 from .labs import who_limits
 
 WORK_SIZE = 256        # длинная сторона снимка для признаков (как в v11)
-N_RELIGHT = 3          # обучающих копий при другом свете на снимок (как в v11)
+# Обучающих копий при случайном свете на снимок. В v11 было 3; на CP-AnemiC 12 копий дают AUC +0,01–0,02
+# и MAE −0,3…−0,7 г/л при трёх разных seed (docs/quality_roadmap.md). Первые 3 копии совпадают с v11:
+# генератор тот же, поэтому сравнение «3 против 12» парное. Базу v11 воспроизводит evaluate.py --relight 3.
+N_RELIGHT = 12
 
 
 def load_item(root, row, mask_source):
