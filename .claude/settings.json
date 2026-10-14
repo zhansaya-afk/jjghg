@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest *)",
+      "Bash(python scripts/*)",
+      "Bash(ruff *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "deny": ["Read(./kaggle.json)", "Read(./.env)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"import sys,json,subprocess; p=json.load(sys.stdin).get('tool_input',{}).get('file_path',''); p.endswith('.py') and subprocess.run(['ruff','format',p])\""
+          }
+        ]
+      }
+    ]
+  }
+}
