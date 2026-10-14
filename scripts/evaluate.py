@@ -60,7 +60,8 @@ class Tee:
 def git_commit():
     try:
         h = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no'],
+        dirty = subprocess.run(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no', '--', '.',
+                                ':!results/metrics_history.csv'],      # сама история не делает код «грязным»
                                capture_output=True, text=True).stdout.strip()
         return h + ('-dirty' if dirty else '')
     except Exception:
