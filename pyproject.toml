@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anemia"
+version = "0.1.0"
+description = "Скрининг риска анемии по фото конъюнктивы и склеры (PoC)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "opencv-python-headless>=4.8",
+    "scikit-learn>=1.3",
+    "pillow>=10",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+data = ["kagglehub>=0.2"]
+
+[tool.setuptools]
+packages = ["anemia"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

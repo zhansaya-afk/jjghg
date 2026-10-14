@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PoC офлайн-приложения (Edge AI) для скрининга **риска** анемии по фото глаза: нижняя пальпебральная конъюнктива + склера. Диагноз не ставим. Выход: риск (низкий / средний / высокий), ориентировочный диапазон Hb, «по какой ткани и почему», PDF-отчёт для врача. Команда пишет по-русски: отвечать по-русски, кратко, цифрами, без воды.
 
-## Статус репозитория (2026-10-14)
+## Статус репозитория (этап 0, 2026-10-14)
 
-Репозиторий публичный (`zhansaya-afk/jjghg`), поэтому в нём нет никаких медицинских данных, даже производных (признаки + Hb). Пакета `anemia/`, `scripts/`, `tests/` ещё нет. Сейчас в репо только `notebooks/anemia_screening_v11.ipynb`: прошлый прототип; признаки CP-AnemiC он берёт из файла `cp_anemic_features.npz` (лежит в общей папке проекта `md/current/`, в Colab перетаскивается в «Файлы»). Архив прежней работы — в общей папке проекта `/mnt/project-files/md/` (не в репозитории):
+Репозиторий публичный (`zhansaya-afk/jjghg`): никаких медицинских данных, даже производных (признаки + Hb). Готово: `anemia/color.py` (sRGB↔линейный, HSI, Lab, EI, HHR, маска ткани, признаки области, признаки «конъюнктива/склера»), `anemia/labs.py` (нормы ВОЗ 2011, Hb в г/л), `anemia/data.py` + `scripts/prepare_data.py` (манифест и фолды), `scripts/fetch_data.py`, `notebooks/colab_train.ipynb` (ячейки 1–2). `notebooks/anemia_screening_v11.ipynb` — прошлый прототип, признаки CP-AnemiC берёт из `cp_anemic_features.npz` (общая папка проекта `md/current/`). Архив прежней работы — в общей папке проекта `/mnt/project-files/md/` (не в репозитории):
 - `md/current/anemia_screening_v10.ipynb` (+ `v10_cells/`) — ручные правила + HistGradientBoosting. Брать формулы и идеи (EI, HHR, CIELAB, нормы ВОЗ, выбор метода по ожидаемой ошибке), **не архитектуру**. Описание пайплайна v10 — `md/CLAUDE.md`.
 - `md/current/anemia_screening_v11.ipynb` (+ `v11_cells/`) — MediaPipe-кроп глаза, попиксельный HGB-сегментатор конъюнктивы по маскам врачей, эвристическая склера, 3 класса + «Переснять». Полезные куски: `who_thresholds`, `relight`, `white_balance_by`, `roi_features`, `quality` в `v11_cells/cell2_lib.py`.
 - `md/datasets/` — установленные данные и каталог (`README.md`, лицензии, что не скачалось).
@@ -24,10 +24,18 @@ PoC офлайн-приложения (Edge AI) для скрининга **ри
 ## Команды
 
 ```bash
-pytest -q                                   # все тесты
-pytest tests/test_color.py::test_ei -q      # один тест
-python scripts/evaluate.py ...              # единственный источник цифр; дописывает строку в results/metrics_history.csv
+pip install -e ".[dev]"                                   # локально; в Colab это делает ячейка 1
+pytest -q                                                 # все тесты
+pytest tests/test_color.py::test_hsi_hue_primaries -q     # один тест
+python scripts/fetch_data.py --eyes-defy --cp-zip <zip>   # только в Colab: из облака Claude Kaggle закрыт
+python scripts/prepare_data.py --data <dir>               # → <dir>/manifest.csv, проверка утечки
+python scripts/evaluate.py ...                            # (этап 1) единственный источник цифр → results/metrics_history.csv
 ```
+Корень данных: `--data` или `ANEMIA_DATA` (в Colab `MyDrive/anemia/data`). Локально CP-AnemiC раскладывается из `md/history/097_*/*.zip` в каталог вне репозитория. Длинные логи — в файлы (`results/logs/`), в разговор только итог.
+
+## Манифест и фолды
+
+`data/manifest.csv` — единственный вход для обучения и оценки: одна строка — снимок; Hb в г/л; `anemic`/`grade` по ВОЗ с учётом пола, возраста, беременности (CP-AnemiC: возраст не указан, берутся нормы <5 лет). `group` = пациент + подтверждённые копии снимка; фолды (`StratifiedGroupKFold`, 5, seed 0) назначаются отдельно в каждом датасете и фиксированы — все модели сравниваются на одних фолдах. Копия = dHash ≤ 3 бит **и** разница миниатюр 32×32 < 1%: один dHash на гладких вырезах CP-AnemiC склеивал 126 разных детей.
 Длинные логи — в файлы (`results/logs/`), в разговор только итог.
 
 ## Пайплайн
