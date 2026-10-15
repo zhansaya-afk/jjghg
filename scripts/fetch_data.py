@@ -78,11 +78,31 @@ def eyes_defy_labels(raw):
     return pd.DataFrame(rows).merge(tab, on=['country', 'pid'], how='left')
 
 
-def fetch_eyes_defy(out):
-    import kagglehub
-    src = kagglehub.dataset_download('harshwardhanfartale/eyes-defy-anemia')
+ED_URL = 'https://www.kaggle.com/api/v1/datasets/download/harshwardhanfartale/eyes-defy-anemia'
+
+
+def _download_eyes_defy(out):
+    """kagglehub (api.kaggle.com), иначе прямой zip публичного датасета (www.kaggle.com → storage.googleapis.com)."""
+    try:
+        import kagglehub
+        return kagglehub.dataset_download('harshwardhanfartale/eyes-defy-anemia')
+    except Exception as e:                                    # нет kagglehub или api.kaggle.com закрыт прокси
+        print(f'kagglehub недоступен ({type(e).__name__}), качаю zip напрямую')
+    import urllib.request
+    zpath = os.path.join(out, 'eyes_defy_anemia.zip')
+    if not os.path.exists(zpath):
+        urllib.request.urlretrieve(ED_URL, zpath + '.part')
+        os.replace(zpath + '.part', zpath)
+    return zpath
+
+
+def fetch_eyes_defy(out, zip_path=None):
+    src = zip_path or _download_eyes_defy(out)
     raw = os.path.join(out, 'eyes_defy_anemia', 'raw')
-    shutil.copytree(src, raw, dirs_exist_ok=True)
+    if os.path.isfile(src):
+        zipfile.ZipFile(src).extractall(raw)
+    else:
+        shutil.copytree(src, raw, dirs_exist_ok=True)
     lab = eyes_defy_labels(raw)
     lab.to_csv(os.path.join(out, 'eyes_defy_anemia', 'labels.csv'), index=False)
     print(f'Eyes-defy-anemia: {len(lab)} пациентов, с Hb {lab.hb_g_dl.notna().sum()}, '
@@ -124,10 +144,11 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.environ.get('ANEMIA_DATA', 'data'))
     ap.add_argument('--eyes-defy', action='store_true')
+    ap.add_argument('--eyes-defy-zip', help='уже скачанный zip Eyes-defy (вместо Kaggle)')
     ap.add_argument('--cp-zip')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    if a.eyes_defy:
-        fetch_eyes_defy(a.out)
+    if a.eyes_defy or a.eyes_defy_zip:
+        fetch_eyes_defy(a.out, a.eyes_defy_zip)
     if a.cp_zip:
         fetch_cp_anemic(a.cp_zip, a.out)
