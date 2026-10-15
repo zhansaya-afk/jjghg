@@ -36,3 +36,11 @@ def test_bootstrap_ci_contains_estimate():
     x = rng.normal(5, 1, 200)
     lo, hi = M.bootstrap_ci(np.mean, np.arange(200), 500, 0, x)
     assert lo < x.mean() < hi and hi - lo < 0.5
+
+
+def test_skill_vs_constant():
+    true = np.array([100., 110., 120., 130.])
+    null = np.full(4, 115.)
+    assert M.skill(null, null, true) == pytest.approx(0)          # константа против себя
+    assert M.skill(true, null, true) == pytest.approx(1)          # идеальная модель
+    assert M.skill(true + 20, null, true) < 0                     # хуже константы
