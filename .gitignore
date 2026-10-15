@@ -9,3 +9,6 @@ results/logs/
 __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
+
+# медицинские данные: худшие снимки error-analysis
+results/errors/

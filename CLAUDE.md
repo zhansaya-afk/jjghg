@@ -95,8 +95,11 @@ python scripts/evaluate.py ...                            # (этап 1) еди�
 
 ## Скиллы и сабагенты (`.claude/`)
 
-- `/evaluate-model` — pytest → `scripts/evaluate.py` → таблица «было/стало» по `results/metrics_history.csv`. После любой правки детектора, сегментации, признаков, модели, порогов.
-- `/defense-report` — запускать вручную: метрики, примеры сегментации, ограничения для наставников.
+- `/evaluate-model` — единственный источник цифр: pytest → `scripts/evaluate.py` → строка в `results/metrics_history.csv`, таблица ≤ 15 строк.
+- `/error-analysis` — где теряется точность: маски врачей vs наши, матрица ошибок, 20 худших в `results/errors/` (не в git), разбивка по датасету/полу/яркости.
+- `/run-experiment` — одна гипотеза, 3–5 seed, принять только если улучшение больше разброса; `results/experiments.csv`.
+- `/train-segmentation` — smp U-Net/DeepLabV3+ по маскам врачей, IoU/Dice на невиданных пациентах, сравнение с `regions.py`, `models/`.
+- `/defense-report` — только вручную: «было/стало», примеры сегментации, ограничения, честная формулировка точности.
 - Сабагент `cv-reviewer` (Read, Grep, Glob, Bash) — свежий взгляд на diff: утечка train/test, подгонка порогов под фото, точность без цифр evaluate. Перед коммитом изменений в `anemia/`, `scripts/`, `notebooks/`.
 
 ## Правила работы с кодом
