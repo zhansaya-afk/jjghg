@@ -5,6 +5,10 @@
 
 Задачи:
   seg  — baseline-сегментация v11 (Eyes-defy): IoU/Dice с масками врачей на невиданных пациентах.
+  v12  — модель демо-блокнота v12 (anemia/v12_model.py): 3 класса ВОЗ по конъюнктиве / склере / обеим.
+         Сбалансированная точность (это «61%» блокнота), AUC, чувствительность/специфичность по argmax (v12.0)
+         и по порогу P(анемия), подобранному внутри обучающих фолдов (v12.1); свет — доля пациентов,
+         у которых ответ «анемия да/нет» меняется в 8 стресс-условиях.
   hb   — Hb по цвету конъюнктивы: MAE, Bland–Altman, AUC, чувствительность/специфичность при пороге,
          подобранном внутри обучающих фолдов, стресс-тест «другой свет».
          Маска: CP-AnemiC — весь вырез; Eyes-defy — маска врача (потолок) и маска baseline-сегментации.
@@ -17,23 +21,30 @@ import subprocess
 import sys
 import time
 
+import cv2
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.model_selection import GroupKFold
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from anemia import metrics as M  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
+from anemia import v12_model as V12  # noqa: E402
+from anemia.augment import STRESS_CONDITIONS, apply_illuminant  # noqa: E402
 from anemia.features import feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
+from anemia.io import load_rgb  # noqa: E402
 
 HISTORY = os.path.join(ROOT, 'results', 'metrics_history.csv')
 HIST_COLS = ['timestamp', 'commit', 'tag', 'task', 'dataset', 'method', 'n',
              'mae', 'mae_lo', 'mae_hi', 'bias', 'loa_lo', 'loa_hi', 'auc', 'auc_lo', 'auc_hi',
              'target_sens', 'sens', 'sens_lo', 'sens_hi', 'spec', 'spec_lo', 'spec_hi',
              'n_hb100', 'sens_hb100', 'light_med', 'light_p90',
-             'iou_mean', 'iou_lo', 'iou_hi', 'iou_median', 'dice_mean', 'found']
+             'iou_mean', 'iou_lo', 'iou_hi', 'iou_median', 'dice_mean', 'found',
+             'bal_acc', 'bal_acc_lo', 'bal_acc_hi', 'auc_light', 'light_flip']
 
 
 class Tee:
@@ -125,6 +136,105 @@ def run_hb(root, df, mask_source, masks, model_kind, target, jobs):
     return hb_metrics(O, SP, target), O, n_skip
 
 
+# ------------------------------------------------------------------ v12
+def _v12_job(root, row, seed):
+    """Признаки v12 одного снимка: исходный, N_RELIGHT обучающих копий при другом свете, стресс-условия."""
+    path = os.path.join(root, row['image'])
+    if row['dataset'] == 'cp_anemic':                     # уже вырезанная конъюнктива: весь кадр — ткань
+        crop = load_rgb(path, V12.CROP_SIDE)
+        conj, sclera = np.ones(crop.shape[:2], bool), None
+    else:
+        cv2.setRNGSeed(0)                                 # GrabCut в поиске тканей случаен: без сида маски плывут
+        crop, conj, sclera = V12.detect(load_rgb(path, V12.DETECT_SIDE))
+    age = row['age'] if row['age'] == row['age'] else 30.0
+    sex = row['sex'] if isinstance(row['sex'], str) else None
+    meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
+            'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant']))),
+            'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
+    rows = [{**meta, 'aug': 0, **V12.eye_features(crop, conj, sclera)}]
+    rng = np.random.default_rng(seed)
+    for a in range(1, V12.N_RELIGHT + 1):
+        rows.append({**meta, 'aug': a, **V12.eye_features(V12.relight(crop, rng), conj, sclera)})
+    srows = [{**meta, 'cond': f'{T}K×{e}', **V12.eye_features(apply_illuminant(crop, T, e), conj, sclera)}
+             for T, e in STRESS_CONDITIONS]
+    return rows, srows
+
+
+def v12_decide(P, thr=None):
+    """Класс: argmax (v12.0) или порог P(анемия) (v12.1: выше порога — не ниже «лёгкой», ниже — «норма»)."""
+    k = P.argmax(1)
+    return k if thr is None else np.where(1 - P[:, 0] >= thr, np.maximum(k, 1), 0)
+
+
+def v12_cv(F, S, feats, target, inner_folds=4):
+    """OOF по фолдам манифеста. Порог P(анемия) — вложенной CV только на обучающих фолдах."""
+    O = F[F.aug == 0].reset_index(drop=True)
+    P = np.zeros((len(O), 3))
+    thr = np.full(len(O), np.nan)
+    stress = []
+    for f in sorted(O.fold.unique()):
+        tr_all, te = F[F.fold != f], np.flatnonzero(O.fold.values == f)
+        tr0 = O[O.fold != f].reset_index(drop=True)
+        prior = V12.class_prior(tr0.y.values)
+        m = V12.fit(tr_all[feats].values, tr_all.y.values)
+        P[te] = V12.predict(m, O[feats].values[te], prior)
+        St = S[S.group.isin(O.group.values[te])]
+        inner = np.zeros((len(tr0), 3))
+        for itr, ite in GroupKFold(min(inner_folds, tr0.group.nunique())).split(tr0, groups=tr0.group):
+            T = tr_all[tr_all.group.isin(set(tr0.group.iloc[itr]))]
+            inner[ite] = V12.predict(V12.fit(T[feats].values, T.y.values), tr0[feats].values[ite],
+                                     V12.class_prior(tr0.y.values[itr]))
+        thr[te] = M.threshold_for_sensitivity(1 - inner[:, 0], tr0.anemic.values, target)
+        if len(St):
+            stress.append(St.assign(P=list(V12.predict(m, St[feats].values, prior)), thr=thr[te][0]))
+    O['P'], O['thr'] = list(P), thr
+    return O, (pd.concat(stress) if stress else None)
+
+
+def v12_metrics(O, S, use_thr, target):
+    P, y, anem, g = np.stack(O.P.values), O.y.values, O.anemic.values.astype(bool), O.group.values
+    thr = O.thr.values if use_thr else None
+    k = np.array([v12_decide(P[i:i + 1], None if thr is None else thr[i])[0] for i in range(len(P))])
+    flag = k > 0
+    r = {'n': len(O), 'bal_acc': float(balanced_accuracy_score(y, k)), 'target_sens': target if use_thr else None}
+    r['bal_acc_lo'], r['bal_acc_hi'] = M.bootstrap_ci(balanced_accuracy_score, g, 1000, 0, y, k)
+    if 0 < anem.sum() < len(anem):
+        r['auc'] = M.auc(1 - P[:, 0], anem)
+        r['auc_lo'], r['auc_hi'] = M.bootstrap_ci(M.auc, g, 1000, 0, 1 - P[:, 0], anem)
+    r['sens'], r['sens_lo'], r['sens_hi'] = M.wilson(int((flag & anem).sum()), int(anem.sum()))
+    r['spec'], r['spec_lo'], r['spec_hi'] = M.wilson(int((~flag & ~anem).sum()), int((~anem).sum()))
+    if S is not None and len(S):
+        PS = np.stack(S.P.values)
+        fl = (1 - PS[:, 0] >= S.thr.values) if use_thr else (PS.argmax(1) > 0)
+        per_cond = [M.auc(1 - PS[(S.cond == c).values, 0], S.anemic.values[(S.cond == c).values].astype(bool))
+                    for c in S.cond.unique()]
+        r['auc_light'] = float(np.mean(per_cond))
+        r['light_flip'] = float(pd.Series(fl, index=S.group.values).groupby(level=0).nunique().gt(1).mean())
+    return r
+
+
+def run_v12(root, df, target, jobs):
+    out = Parallel(n_jobs=jobs)(delayed(_v12_job)(root, r, i) for i, r in enumerate(df.to_dict('records')))
+    F = pd.DataFrame([x for rows, _ in out for x in rows])
+    S = pd.DataFrame([x for _, srows in out for x in srows])
+    sets = V12.feature_sets(F.columns, df.sex.notna().any())
+    if df.dataset.iloc[0] == 'cp_anemic':
+        sets = {'conj': sets['conj']}
+    res = []
+    for mode, feats in sets.items():
+        if len(feats) < 3:
+            continue
+        ok = set(F[F.aug == 0].dropna(subset=feats).group)            # пациенты, у которых ткань нашлась
+        Fm, Sm = F[F.group.isin(ok)].dropna(subset=feats), S[S.group.isin(ok)].dropna(subset=feats)
+        if Fm.group.nunique() < 40:
+            continue
+        O, SP = v12_cv(Fm, Sm, feats, target)
+        for use_thr in (False, True):
+            r = v12_metrics(O, SP, use_thr, target)
+            res.append((mode, 'порог 0.80' if use_thr else 'argmax', len(df) - O.group.nunique(), r, O))
+    return res
+
+
 # ------------------------------------------------------------------ вывод
 def fmt(r, k, nd=1, pct=False):
     v = r.get(k)
@@ -154,8 +264,23 @@ def print_table(rows):
         print('| ' + ' | '.join(str(c) for c in cells) + ' |')
 
 
+def print_v12_table(rows):
+    head = ['Датасет', 'Метод', 'n', 'Верный класс (сбаланс.), %', 'AUC', 'Чувств., %', 'Спец., %',
+            'AUC при другом свете', 'Свет: ответ меняется, %']
+    print('\n| ' + ' | '.join(head) + ' |')
+    print('|' + '---|' * len(head))
+    for r in rows:
+        cells = [r['dataset'], r['method'], r['n'], fmt(r, 'bal_acc', 0, True), fmt(r, 'auc', 3),
+                 fmt(r, 'sens', 0, True), fmt(r, 'spec', 0, True), fmt(r, 'auc_light', 3), fmt(r, 'light_flip', 0, True)]
+        print('| ' + ' | '.join(str(c) for c in cells) + ' |')
+
+
 def append_history(rows, tag, commit):
     os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+    if os.path.exists(HISTORY):                 # новые колонки: переписать заголовок, старые строки — пустые
+        old = pd.read_csv(HISTORY)
+        if list(old.columns) != HIST_COLS:
+            old.reindex(columns=HIST_COLS).to_csv(HISTORY, index=False, float_format='%.4f')
     ts = dt.datetime.now().isoformat(timespec='seconds')
     H = pd.DataFrame([{**{c: None for c in HIST_COLS}, 'timestamp': ts, 'commit': commit, 'tag': tag,
                        **{k: v for k, v in r.items() if k in HIST_COLS}} for r in rows])[HIST_COLS]
@@ -165,7 +290,7 @@ def append_history(rows, tag, commit):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=os.environ.get('ANEMIA_DATA', 'data'))
-    ap.add_argument('--task', choices=['all', 'seg', 'hb'], default='all')
+    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12'], default='all')
     ap.add_argument('--dataset', choices=['all', 'eyes_defy', 'cp_anemic', 'phone'], default='all')
     ap.add_argument('--model', choices=['hgb', 'ridge', 'both'], default='both')
     ap.add_argument('--target-sens', type=float, default=0.80)
@@ -188,6 +313,18 @@ def main():
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
             continue
+        if a.task in ('all', 'v12'):
+            print(f'[{time.time() - t0:5.0f} с] {ds}: модель v12, {len(df)} снимков...')
+            for mode, rule, n_skip, r, O in run_v12(a.data, df, a.target_sens, a.jobs):
+                method = f'v12 · {mode} · {rule}' + (f' (−{n_skip})' if n_skip else '')
+                rows.append({'task': 'v12', 'dataset': ds, 'method': method, **r})
+                if rule == 'argmax':
+                    P = np.stack(O.P.values)
+                    O.assign(p_norm=P[:, 0], p_mild=P[:, 1], p_mod=P[:, 2])[
+                        ['group', 'fold', 'y', 'anemic', 'p_norm', 'p_mild', 'p_mod', 'thr']].to_csv(
+                        os.path.join(oof_dir, f'oof_{a.tag}_{ds}_v12_{mode}.csv'), index=False)
+            if a.task == 'v12':
+                continue
         has_masks = df.mask_conj.notna().all()
         pred_masks = None
         if has_masks and a.task in ('all', 'seg'):
@@ -211,7 +348,10 @@ def main():
                 rows.append({'task': 'hb', 'dataset': ds, 'method': method, **r})
                 O[['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic']].to_csv(
                     os.path.join(oof_dir, f'oof_{a.tag}_{ds}_{src}_{mk}.csv'), index=False)
-    print_table(rows)
+    if any(r['task'] != 'v12' for r in rows):
+        print_table([r for r in rows if r['task'] != 'v12'])
+    if any(r['task'] == 'v12' for r in rows):
+        print_v12_table([r for r in rows if r['task'] == 'v12'])
     if not a.no_history:
         append_history(rows, a.tag, commit)
         print(f'\nСтрок дописано в results/metrics_history.csv: {len(rows)} · {time.time() - t0:.0f} с')
