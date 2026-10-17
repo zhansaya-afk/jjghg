@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 
+import cv2
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -143,6 +144,7 @@ def _v12_job(root, row, seed):
         crop = load_rgb(path, V12.CROP_SIDE)
         conj, sclera = np.ones(crop.shape[:2], bool), None
     else:
+        cv2.setRNGSeed(0)                                 # GrabCut в поиске тканей случаен: без сида маски плывут
         crop, conj, sclera = V12.detect(load_rgb(path, V12.DETECT_SIDE))
     age = row['age'] if row['age'] == row['age'] else 30.0
     sex = row['sex'] if isinstance(row['sex'], str) else None
