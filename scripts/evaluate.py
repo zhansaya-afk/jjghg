@@ -13,6 +13,9 @@
   hb   — Hb по цвету конъюнктивы: MAE, Bland–Altman, AUC, чувствительность/специфичность при пороге,
          подобранном внутри обучающих фолдов, стресс-тест «другой свет».
          Маска: CP-AnemiC — весь вырез; Eyes-defy — маска врача (потолок) и маска baseline-сегментации.
+  core — ядро HemaVision (anemia/core.py, то же, что обучает scripts/train_core.py): риск низкий/средний/высокий
+         по двум порогам P(анемия), Hb (экспериментально), OOD; все пороги — вложенной CV на обучающих фолдах.
+         Только явно: --task core (в --task all не входит). Признаки — те же, что у v12 (общий кэш).
 Все метрики — по фиксированным фолдам манифеста (по пациенту). OOF-предсказания → <data>/results/.
 
 Каждый запуск получает ID и свою папку <data>/results/runs/<run_id>/ (run.json: коммит, параметры, время,
@@ -36,6 +39,7 @@ from sklearn.model_selection import GroupKFold
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from anemia import core as CORE  # noqa: E402
 from anemia import metrics as M  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
@@ -242,6 +246,7 @@ def _v12_job(root, row, seed, cache=NO_CACHE):
     age = row['age'] if row['age'] == row['age'] else 30.0      # метки — из текущего манифеста, не из кэша
     sex = row['sex'] if isinstance(row['sex'], str) else None
     meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
+            'hb_g_l': float(row['hb_g_l']),
             'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant']))),
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
     return ([{**meta, **r} for r in rows], [{**meta, **r} for r in srows]), t
@@ -327,6 +332,46 @@ def run_v12(root, df, target, jobs, cache=NO_CACHE, timer=None):
     return res
 
 
+# ------------------------------------------------------------------ ядро HemaVision
+def v12_features(root, df, jobs, cache=NO_CACHE, timer=None, stage='признаки v12'):
+    """Признаки v12 всех снимков датасета (общий кэш с --task v12) → (F, S)."""
+    t0 = time.perf_counter()
+    res = Parallel(n_jobs=jobs)(delayed(_v12_job)(root, r, i, cache) for i, r in enumerate(df.to_dict('records')))
+    if timer is not None:
+        timer.add(f'{stage} {df.dataset.iloc[0]}: чтение + поиск тканей + признаки', [t for _, t in res],
+                  time.perf_counter() - t0)
+    F = pd.DataFrame([x for (rows, _), _ in res for x in rows])
+    S = pd.DataFrame([x for (_, srows), _ in res for x in srows])
+    return F, S
+
+
+def run_core(root, df, jobs, cache=NO_CACHE, timer=None):
+    ds = df.dataset.iloc[0]
+    F, S = v12_features(root, df, jobs, cache, timer, 'core')
+    F = CORE.usable(F)
+    feats = CORE.feature_list(F.columns, ds)
+    S = S[S.group.isin(set(F.group))]
+    O, SP = CORE.cross_validate(F, feats, ds, S)
+    r = CORE.core_metrics(O, SP)
+    r['target_sens'] = CORE.SENS_TARGET
+    return r, O, len(df) - O.group.nunique()
+
+
+def print_core_table(rows):
+    head = ['Датасет', 'n', 'AUC', 'Низкий / средний / высокий, %', 'Верно среди уверенных, %',
+            'Больных среди «высокий», %', 'Здоровых среди «низкий», %', 'Больных в «низкий»',
+            'Чувств. / спец. @0.80, %', 'MAE Hb, г/л', 'Hb показан, %', 'Hb в диапазоне, %', 'OOD, %', 'Свет: уровень меняется, %']
+    print('\n| ' + ' | '.join(head) + ' |')
+    print('|' + '---|' * len(head))
+    for r in rows:
+        zones = ' / '.join(f"{r['share_' + k] * 100:.0f}" for k in ('low', 'mid', 'high'))
+        cells = [r['dataset'], r['n'], fmt(r, 'auc', 3), zones, fmt(r, 'acc_sure', 0, True),
+                 fmt(r, 'high_ppv', 0, True), fmt(r, 'low_npv', 0, True), r['missed_in_low'],
+                 f"{fmt(r, 'sens', 0, True)} / {fmt(r, 'spec', 0, True)}", f"{r['mae']:.1f}",
+                 fmt(r, 'hb_shown', 0, True), fmt(r, 'hb_range_cover', 0, True), fmt(r, 'ood_share', 0, True), fmt(r, 'light_level_change', 0, True)]
+        print('| ' + ' | '.join(str(c) for c in cells) + ' |')
+
+
 # ------------------------------------------------------------------ вывод
 def fmt(r, k, nd=1, pct=False):
     v = r.get(k)
@@ -388,7 +433,7 @@ def save_oof(O, cols, name, run_dir, oof_dir, backup_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=os.environ.get('ANEMIA_DATA', 'data'))
-    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12'], default='all')
+    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12', 'core'], default='all')
     ap.add_argument('--dataset', choices=['all', 'eyes_defy', 'cp_anemic', 'phone'], default='all')
     ap.add_argument('--model', choices=['hgb', 'ridge', 'both'], default='both')
     ap.add_argument('--target-sens', type=float, default=0.80)
@@ -439,6 +484,16 @@ def main():
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
             continue
+        if a.task == 'core':
+            if ds not in CORE.SPECS:
+                continue
+            print(f'[{time.time() - t0:5.0f} с] {ds}: ядро HemaVision, {len(df)} снимков...')
+            r, O, n_skip = run_core(a.data, df, a.jobs, cache, timer)
+            rows.append({'task': 'core', 'dataset': ds,
+                         'method': 'core · 3 уровня риска' + (f' (−{n_skip})' if n_skip else ''), **r})
+            save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens'],
+                     f'oof_{a.tag}_{ds}_core.csv', run_dir, res_dir, backup_dir)
+            continue
         if a.task in ('all', 'v12'):
             print(f'[{time.time() - t0:5.0f} с] {ds}: модель v12, {len(df)} снимков...')
             for mode, rule, n_skip, r, O in run_v12(a.data, df, a.target_sens, a.jobs, cache, timer):
@@ -475,8 +530,10 @@ def main():
                 rows.append({'task': 'hb', 'dataset': ds, 'method': method, **r})
                 save_oof(O, ['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic'],
                          f'oof_{a.tag}_{ds}_{src}_{mk}.csv', run_dir, res_dir, backup_dir)
-    if any(r['task'] != 'v12' for r in rows):
-        print_table([r for r in rows if r['task'] != 'v12'])
+    if any(r['task'] in ('seg', 'hb') for r in rows):
+        print_table([r for r in rows if r['task'] in ('seg', 'hb')])
+    if any(r['task'] == 'core' for r in rows):
+        print_core_table([r for r in rows if r['task'] == 'core'])
     if any(r['task'] == 'v12' for r in rows):
         print_v12_table([r for r in rows if r['task'] == 'v12'])
     total = time.time() - t0
