@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "ruff>=0.6"]
 data = ["kagglehub>=0.2"]
 
 [tool.setuptools]
