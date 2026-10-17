@@ -10,17 +10,26 @@ def load_rgb(path, max_side=None):
     return resize_max(rgb, max_side) if max_side else rgb
 
 
-def load_mask(path):
-    """Маска из файла разметки: альфа-канал, иначе всё ярче почти-чёрного фона.
-    В Eyes-defy-anemia маска — это фото, где всё, кроме конъюнктивы, закрашено чёрным."""
+def load_mask(path, tol=10):
+    """Маска из файла разметки: прозрачность, если она есть, иначе всё, что отличается от цвета фона.
+    В Eyes-defy-anemia маска — это фото, где всё, кроме конъюнктивы, закрашено одним цветом: чёрным
+    (Индия, часть Италии) или белым при непрозрачном альфа-канале (31 снимок Италии; у ED_Italy_15
+    альфа почти везде 255 со сглаженными краями). Цвет фона — медиана
+    рамки кадра; блики внутри ткани того же цвета, что и фон, остаются в маске (фон — только связный с рамкой)."""
     im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if im is None:
         raise FileNotFoundError(path)
-    if im.ndim == 2:
-        return im > 15
-    if im.shape[2] == 4:
-        return im[..., 3] > 0
-    return im[..., :3].max(-1) > 15
+    if im.ndim == 3 and im.shape[2] == 4:
+        a = im[..., 3]
+        if np.median(np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])) < 128:   # фон прозрачный
+            return a > 0
+    px = im.astype(np.int16) if im.ndim == 2 else im[..., :3].astype(np.int16)
+    rim = np.concatenate([px[0], px[-1], px[:, 0], px[:, -1]])
+    bg_col = np.median(rim, axis=0)
+    near = np.abs(px - bg_col).reshape(*px.shape[:2], -1).max(-1) <= tol
+    n, lab = cv2.connectedComponents(near.astype(np.uint8), connectivity=4)
+    rim_lab = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    return ~np.isin(lab, rim_lab[rim_lab > 0])
 
 
 def resize_max(img, max_side, nearest=False):
