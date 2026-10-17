@@ -93,14 +93,27 @@ class StageTimer:
         return '\n'.join(out)
 
 
-def git_commit():
+GENERATED = ('results/metrics_history.csv',)   # файлы, которые дописывает сам evaluate.py: не правка кода
+
+
+def git_state(root=ROOT):
+    """→ {'commit': '<sha>[-dirty]', 'dirty_code': [...], 'dirty_results': [...]}.
+    «-dirty» — только если изменены отслеживаемые файлы, кроме GENERATED (их дописывают прошлые запуски)."""
     try:
-        h = subprocess.run(['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(['git', '-C', ROOT, 'status', '--porcelain', '--untracked-files=no'],
-                               capture_output=True, text=True).stdout.strip()
-        return h + ('-dirty' if dirty else '')
+        h = subprocess.run(['git', '-C', root, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True,
+                           check=True).stdout.strip()
+        st = subprocess.run(['git', '-C', root, 'status', '--porcelain', '--untracked-files=no'],
+                            capture_output=True, text=True, check=True).stdout
     except Exception:
-        return 'unknown'
+        return {'commit': 'unknown', 'dirty_code': [], 'dirty_results': []}
+    files = [line[3:].split(' -> ')[-1] for line in st.splitlines() if line.strip()]
+    code = [f for f in files if f not in GENERATED]
+    return {'commit': h + ('-dirty' if code else ''), 'dirty_code': code,
+            'dirty_results': [f for f in files if f in GENERATED]}
+
+
+def git_commit():
+    return git_state()['commit']
 
 
 # ------------------------------------------------------------------ сегментация
@@ -401,13 +414,14 @@ def main():
                      os.path.join(run_dir, 'log.txt'))
     man_path = os.path.join(a.data, 'manifest.csv')
     man = pd.read_csv(man_path)
-    commit = git_commit()
+    git = git_state()
+    commit = git['commit']
     script = source_version(os.path.abspath(__file__))
     cache_mode = 'off' if a.no_cache else 'refresh' if a.refresh_cache else 'on'
     cache = FeatureCache(a.cache_dir or os.path.join(a.data, 'cache', 'features'), cache_mode,
                          salt={'evaluate_py': script})
     timer = StageTimer()
-    meta = {'run_id': run_id, 'tag': a.tag, 'status': 'running', 'started': started, 'commit': commit,
+    meta = {'run_id': run_id, 'tag': a.tag, 'status': 'running', 'started': started, 'commit': commit, 'git': git,
             'evaluate_py_sha1': script, 'args': vars(a), 'python': sys.version.split()[0],
             'manifest': {'path': man_path, 'sha1': file_sha1(man_path), 'rows': len(man)},
             'cache': {'mode': cache_mode, 'dir': cache.root},
@@ -477,7 +491,8 @@ def main():
         append_history(rows, a.tag, commit, a.history, backup_dir=backup_dir)
         print(f'\nСтрок дописано: {len(rows)} → {a.history} и {os.path.join(res_dir, "metrics_history.csv")}')
     meta.update(status='done', finished=dt.datetime.now().isoformat(timespec='seconds'), total_s=round(total, 2),
-                timings=timer.rows, n_rows=len(rows), history=None if a.no_history else [a.history, os.path.join(res_dir, 'metrics_history.csv')])
+                timings=timer.rows, n_rows=len(rows),
+                history=None if a.no_history else [a.history, os.path.join(res_dir, 'metrics_history.csv')])
     RUNS.write_json(os.path.join(run_dir, 'run.json'), meta)
     print(f'Результаты запуска: {run_dir}')
 
