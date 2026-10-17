@@ -149,3 +149,41 @@ def test_lab_report_who():
     assert r['grade'] == 'mild' and r['anemic'] and r['normal_from_g_l'] == 130
     assert lab_hb_report('10.5 g/dl', age=3)['grade'] == 'mild'
     assert not lab_hb_report(115, sex='F', age=30, pregnant=True)['anemic']
+
+
+# ------------------------------------------------------------------ ткани по отдельности
+def test_usable_requires_tissue_of_model():
+    F, _ = _synthetic()
+    assert CORE.usable(F, 'eyes_defy_sclera').s_x.notna().all()
+    assert len(CORE.usable(F, 'eyes_defy_sclera')) < len(CORE.usable(F, 'eyes_defy_conj')) == len(F)
+    assert CORE.feature_list(['c_a', 's_a', 'w_a'], 'eyes_defy_sclera') == ['s_a', 'male']
+    assert CORE.feature_list(['c_a', 's_a', 'w_a'], 'eyes_defy_conj') == ['c_a', 'male']
+
+
+def _fake_det(use, eye='весь кадр'):
+    img, conj, sclera = synthetic_eye()
+    crop = img.astype(np.float32)
+    return {'crop': crop, 'conj': conj if 'conj' in use else np.zeros_like(conj),
+            'sclera': sclera if 'sclera' in use else np.zeros_like(sclera), 'use': set(use), 'notes': [],
+            'kind': 'глаз крупным планом', 'src_side': 1000, 'iris': None, 'eye': eye, 'score': len(use)}
+
+
+def test_model_follows_found_tissues(monkeypatch):
+    F, _ = _synthetic()
+    F = F.rename(columns={'c_x': 'c_EI_m', 'c_z': 'c_a_m', 's_x': 's_EI_m'})
+    full = {'models': {'eyes_defy': CORE.fit_core(F, ['c_EI_m', 'c_a_m', 's_EI_m', 'male'], 'eyes_defy')}}
+    S = CORE.usable(F, 'eyes_defy_sclera')
+    with_s = {'models': {**full['models'], 'eyes_defy_sclera': CORE.fit_core(S, ['s_EI_m', 'male'], 'eyes_defy_sclera')}}
+    img, _, _ = synthetic_eye()
+    monkeypatch.setattr(PR, 'quality', lambda *a: [])          # синтетика: проверяется маршрут, а не качество
+    monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det({'sclera'}))
+    r = PR.analyze_photo(img, sex='F', age=30, bundle=full, landmarker=None)
+    assert r['stage'] == 'no_model' and r['risk'] is None          # модели «только склера» нет — не подменяем
+    r = PR.analyze_photo(img, sex='F', age=30, bundle=with_s, landmarker=None)
+    assert r['tissues'] == ['sclera'] and 'только склера' in r['model']
+    assert r['features'] and not any(k.startswith('c_') for k in r['features'])
+    monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det(set(), eye=None))
+    r = PR.analyze_photo(img, bundle=with_s, landmarker=None)
+    assert r['stage'] == 'no_eye' and r['status'] == 'retake'
+    monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det(set()))
+    assert PR.analyze_photo(img, bundle=with_s, landmarker=None)['stage'] == 'no_tissue'

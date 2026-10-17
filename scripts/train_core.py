@@ -38,18 +38,20 @@ def main():
     # та же соль кэша, что у evaluate.py: признаки, посчитанные там, переиспользуются
     cache = FeatureCache(os.path.join(a.data, 'cache', 'features'), 'off' if a.no_cache else 'on',
                          salt={'evaluate_py': source_version(os.path.join(ROOT, 'scripts', 'evaluate.py'))})
-    models = {}
-    for ds in (CORE.SPECS if a.dataset == 'all' else [a.dataset]):
+    models, feats = {}, {}
+    for key in (CORE.SPECS if a.dataset == 'all' else [a.dataset]):
+        ds = CORE.SPECS[key]['data']
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
-            print(f'{ds}: нет в манифесте — пропущен')
+            print(f'{key}: нет {ds} в манифесте — пропущен')
             continue
-        print(f'{ds}: признаки {len(df)} снимков...', flush=True)
-        F, _ = v12_features(a.data, df, a.jobs, cache)
-        F = CORE.usable(F)
-        B = CORE.fit_core(F, CORE.feature_list(F.columns, ds), ds)
-        models[ds] = B
-        print(f"   пациентов {B['n_patients']} (анемия {B['n_anemic']}), без конъюнктивы {len(df) - B['n_patients']}; "
+        if ds not in feats:
+            print(f'{ds}: признаки {len(df)} снимков...', flush=True)
+            feats[ds] = v12_features(a.data, df, a.jobs, cache)[0]
+        F = CORE.usable(feats[ds], key)
+        B = CORE.fit_core(F, CORE.feature_list(F.columns, key), key)
+        models[key] = B
+        print(f"{key}: пациентов {B['n_patients']} (анемия {B['n_anemic']}), без нужной ткани {len(df) - B['n_patients']}; "
               f"пороги P(анемия): низкий ≤ {B['t_lo']:.2f}, высокий ≥ {B['t_hi']:.2f}; Hb: MAE вложенной CV "
               f"{B['hb_mae_cv']:.1f} г/л против константы {B['hb_mae_const_cv']:.1f} → "
               f"{'показывать ±' + format(B['hb_halfwidth'], '.0f') + ' г/л' if B['hb_ok'] else 'не показывать'}")
