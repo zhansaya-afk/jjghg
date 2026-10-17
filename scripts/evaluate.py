@@ -1,4 +1,5 @@
-"""Единственный источник цифр точности. Каждая строка результата дописывается в results/metrics_history.csv.
+"""Единственный источник цифр точности. Каждая строка результата дописывается в results/metrics_history.csv
+и в <data>/results/metrics_history.csv (вне git: не теряется при обновлении репозитория в Colab).
 
     python scripts/evaluate.py --data data --tag baseline_v11            # всё, что есть в манифесте
     python scripts/evaluate.py --task hb --dataset cp_anemic --model ridge
@@ -13,6 +14,11 @@
          подобранном внутри обучающих фолдов, стресс-тест «другой свет».
          Маска: CP-AnemiC — весь вырез; Eyes-defy — маска врача (потолок) и маска baseline-сегментации.
 Все метрики — по фиксированным фолдам манифеста (по пациенту). OOF-предсказания → <data>/results/.
+
+Каждый запуск получает ID и свою папку <data>/results/runs/<run_id>/ (run.json: коммит, параметры, время,
+тайминги; metrics.csv; OOF; лог), которая никогда не перезаписывается.
+Признаки снимков кэшируются в <data>/cache/features/ (anemia/cache.py: ключ = содержимое файлов + код +
+параметры; меток в кэше нет). --no-cache — без кэша, --refresh-cache — пересчитать и перезаписать.
 """
 import argparse
 import datetime as dt
@@ -33,8 +39,10 @@ sys.path.insert(0, ROOT)
 from anemia import metrics as M  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
+from anemia import runs as RUNS  # noqa: E402
 from anemia.augment import STRESS_CONDITIONS, apply_illuminant  # noqa: E402
-from anemia.features import feature_rows, load_item, row_meta  # noqa: E402
+from anemia.cache import TIMING_KEYS, FeatureCache, empty_timings, file_sha1, source_version  # noqa: E402
+from anemia.features import N_RELIGHT, WORK_SIZE, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
 from anemia.io import load_rgb  # noqa: E402
 
@@ -47,17 +55,42 @@ HIST_COLS = ['timestamp', 'commit', 'tag', 'task', 'dataset', 'method', 'n',
              'bal_acc', 'bal_acc_lo', 'bal_acc_hi', 'auc_light', 'light_flip']
 
 
+NO_CACHE = FeatureCache(None, 'off')
+
+
 class Tee:
-    def __init__(self, path):
-        self.f, self.out = open(path, 'w'), sys.stdout
+    def __init__(self, *paths):
+        self.fs, self.out = [open(p, 'w') for p in paths], sys.stdout
 
     def write(self, s):
         self.out.write(s)
-        self.f.write(s)
+        for f in self.fs:
+            f.write(s)
 
     def flush(self):
         self.out.flush()
-        self.f.flush()
+        for f in self.fs:
+            f.flush()
+
+
+class StageTimer:
+    """Время по этапам: чтение снимков, признаки, кэш — суммы по рабочим процессам; «стена» — по часам."""
+
+    def __init__(self):
+        self.rows = []
+
+    def add(self, stage, timings, wall):
+        tot = {k: float(sum(t[k] for t in timings)) for k in TIMING_KEYS}
+        self.rows.append({'stage': stage, 'n': len(timings), **tot, 'wall': wall})
+
+    def table(self):
+        head = ['Этап', 'снимков', 'из кэша', 'чтение снимков, с', 'признаки, с', 'ключ кэша (sha1 файлов), с',
+                'кэш чтение / запись, с', 'стена, с']
+        out = ['| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head)]
+        for r in self.rows:
+            out.append(f"| {r['stage']} | {r['n']} | {r['hit']:.0f} | {r['read']:.1f} | {r['features']:.1f} | "
+                       f"{r['key']:.1f} | {r['cache_read']:.1f} / {r['cache_write']:.1f} | {r['wall']:.1f} |")
+        return '\n'.join(out)
 
 
 def git_commit():
@@ -72,13 +105,21 @@ def git_commit():
 
 # ------------------------------------------------------------------ сегментация
 def _seg_prep(root, row):
+    t0 = time.perf_counter()
     rgb, doc = load_item(root, row, 'doctor')
-    return rgb, doc, SB.pixel_features(rgb)
+    t1 = time.perf_counter()
+    F = SB.pixel_features(rgb)
+    return (rgb, doc, F), {**empty_timings(), 'read': t1 - t0, 'features': time.perf_counter() - t1, 'miss': 1.0}
 
 
-def run_seg(root, df, jobs):
-    """OOF-маски baseline-сегментации по фолдам манифеста + метрики."""
-    items = Parallel(n_jobs=jobs)(delayed(_seg_prep)(root, r) for r in df.to_dict('records'))
+def run_seg(root, df, jobs, timer=None):
+    """OOF-маски baseline-сегментации по фолдам манифеста + метрики.
+    Попиксельные признаки (~7 МБ на снимок) не кэшируются: снимки здесь читаются каждый запуск."""
+    t0 = time.perf_counter()
+    out = Parallel(n_jobs=jobs)(delayed(_seg_prep)(root, r) for r in df.to_dict('records'))
+    items = [it for it, _ in out]
+    if timer is not None:
+        timer.add('сегментация v11: чтение + признаки пикселей', [t for _, t in out], time.perf_counter() - t0)
     pred = [None] * len(df)
     folds = df.fold.values
     for f in sorted(set(folds)):
@@ -95,12 +136,28 @@ def run_seg(root, df, jobs):
 
 
 # ------------------------------------------------------------------ Hb
-def _feat_job(root, row, mask_source, mask, seed):
+def _hb_compute(root, row, mask_source, mask, seed):
+    """Признаки без меток: исходный снимок, копии при другом свете, стресс-условия."""
+    t0 = time.perf_counter()
     if mask is None:
         rgb, mask = load_item(root, row, mask_source)
     else:
         rgb, _ = load_item(root, row, 'full')
-    return feature_rows(rgb, mask, row_meta(row), seed)
+    t1 = time.perf_counter()
+    out = feature_rows(rgb, mask, {}, seed)
+    return out, {'read': t1 - t0, 'features': time.perf_counter() - t1}
+
+
+def _feat_job(root, row, mask_source, mask, seed, cache=NO_CACHE):
+    files = {'image': os.path.join(root, row['image'])}
+    if mask is None and mask_source == 'doctor':
+        files['mask'] = os.path.join(root, row['mask_conj'])
+    params = {'mask_source': mask_source if mask is None else 'array', 'seed': seed, 'work_size': WORK_SIZE,
+              'n_relight': N_RELIGHT, 'stress': STRESS_CONDITIONS}
+    (rows, srows), t = cache.fetch('hb', files, {} if mask is None else {'mask': mask}, params,
+                                   _hb_compute, root, row, mask_source, mask, seed)
+    meta = row_meta(row)                                  # метки — из текущего манифеста, не из кэша
+    return ([{**meta, **r} for r in rows], [{**meta, **r} for r in srows]), t
 
 
 def hb_metrics(O, S, target):
@@ -123,9 +180,14 @@ def hb_metrics(O, S, target):
     return r
 
 
-def run_hb(root, df, mask_source, masks, model_kind, target, jobs):
-    out = Parallel(n_jobs=jobs)(delayed(_feat_job)(root, r, mask_source, None if masks is None else masks[i], i)
+def run_hb(root, df, mask_source, masks, model_kind, target, jobs, cache=NO_CACHE, timer=None, stage='Hb'):
+    t0 = time.perf_counter()
+    res = Parallel(n_jobs=jobs)(delayed(_feat_job)(root, r, mask_source, None if masks is None else masks[i], i,
+                                                   cache)
                                 for i, r in enumerate(df.to_dict('records')))
+    out = [o for o, _ in res]
+    if timer is not None:
+        timer.add(stage, [t for _, t in res], time.perf_counter() - t0)
     F = pd.DataFrame([x for rows, _ in out for x in rows])
     S = pd.DataFrame([x for _, srows in out for x in srows])
     n_skip = len(df) - F[F.aug == 0].group.nunique() if len(F) else len(df)
@@ -137,27 +199,39 @@ def run_hb(root, df, mask_source, masks, model_kind, target, jobs):
 
 
 # ------------------------------------------------------------------ v12
-def _v12_job(root, row, seed):
-    """Признаки v12 одного снимка: исходный, N_RELIGHT обучающих копий при другом свете, стресс-условия."""
-    path = os.path.join(root, row['image'])
-    if row['dataset'] == 'cp_anemic':                     # уже вырезанная конъюнктива: весь кадр — ткань
+def _v12_compute(path, cp, seed):
+    """Признаки v12 одного снимка без меток: исходный, N_RELIGHT обучающих копий при другом свете, стресс-условия."""
+    t0 = time.perf_counter()
+    if cp:                                                # уже вырезанная конъюнктива: весь кадр — ткань
         crop = load_rgb(path, V12.CROP_SIDE)
+        t1 = time.perf_counter()
         conj, sclera = np.ones(crop.shape[:2], bool), None
     else:
+        img = load_rgb(path, V12.DETECT_SIDE)
+        t1 = time.perf_counter()
         cv2.setRNGSeed(0)                                 # GrabCut в поиске тканей случаен: без сида маски плывут
-        crop, conj, sclera = V12.detect(load_rgb(path, V12.DETECT_SIDE))
-    age = row['age'] if row['age'] == row['age'] else 30.0
+        crop, conj, sclera = V12.detect(img)
+    rows = [{'aug': 0, **V12.eye_features(crop, conj, sclera)}]
+    rng = np.random.default_rng(seed)
+    for a in range(1, V12.N_RELIGHT + 1):
+        rows.append({'aug': a, **V12.eye_features(V12.relight(crop, rng), conj, sclera)})
+    srows = [{'cond': f'{T}K×{e}', **V12.eye_features(apply_illuminant(crop, T, e), conj, sclera)}
+             for T, e in STRESS_CONDITIONS]
+    return (rows, srows), {'read': t1 - t0, 'features': time.perf_counter() - t1}
+
+
+def _v12_job(root, row, seed, cache=NO_CACHE):
+    path = os.path.join(root, row['image'])
+    cp = row['dataset'] == 'cp_anemic'
+    params = {'cp': cp, 'seed': seed, 'detect_side': V12.DETECT_SIDE, 'crop_side': V12.CROP_SIDE,
+              'n_relight': V12.N_RELIGHT, 'stress': STRESS_CONDITIONS}
+    (rows, srows), t = cache.fetch('v12', {'image': path}, {}, params, _v12_compute, path, cp, seed)
+    age = row['age'] if row['age'] == row['age'] else 30.0      # метки — из текущего манифеста, не из кэша
     sex = row['sex'] if isinstance(row['sex'], str) else None
     meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
             'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant']))),
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
-    rows = [{**meta, 'aug': 0, **V12.eye_features(crop, conj, sclera)}]
-    rng = np.random.default_rng(seed)
-    for a in range(1, V12.N_RELIGHT + 1):
-        rows.append({**meta, 'aug': a, **V12.eye_features(V12.relight(crop, rng), conj, sclera)})
-    srows = [{**meta, 'cond': f'{T}K×{e}', **V12.eye_features(apply_illuminant(crop, T, e), conj, sclera)}
-             for T, e in STRESS_CONDITIONS]
-    return rows, srows
+    return ([{**meta, **r} for r in rows], [{**meta, **r} for r in srows]), t
 
 
 def v12_decide(P, thr=None):
@@ -213,8 +287,13 @@ def v12_metrics(O, S, use_thr, target):
     return r
 
 
-def run_v12(root, df, target, jobs):
-    out = Parallel(n_jobs=jobs)(delayed(_v12_job)(root, r, i) for i, r in enumerate(df.to_dict('records')))
+def run_v12(root, df, target, jobs, cache=NO_CACHE, timer=None):
+    t0 = time.perf_counter()
+    res = Parallel(n_jobs=jobs)(delayed(_v12_job)(root, r, i, cache) for i, r in enumerate(df.to_dict('records')))
+    out = [o for o, _ in res]
+    if timer is not None:
+        timer.add(f'v12 {df.dataset.iloc[0]}: чтение + поиск тканей + признаки', [t for _, t in res],
+                  time.perf_counter() - t0)
     F = pd.DataFrame([x for rows, _ in out for x in rows])
     S = pd.DataFrame([x for _, srows in out for x in srows])
     sets = V12.feature_sets(F.columns, df.sex.notna().any())
@@ -275,16 +354,22 @@ def print_v12_table(rows):
         print('| ' + ' | '.join(str(c) for c in cells) + ' |')
 
 
-def append_history(rows, tag, commit):
-    os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
-    if os.path.exists(HISTORY):                 # новые колонки: переписать заголовок, старые строки — пустые
-        old = pd.read_csv(HISTORY)
-        if list(old.columns) != HIST_COLS:
-            old.reindex(columns=HIST_COLS).to_csv(HISTORY, index=False, float_format='%.4f')
-    ts = dt.datetime.now().isoformat(timespec='seconds')
-    H = pd.DataFrame([{**{c: None for c in HIST_COLS}, 'timestamp': ts, 'commit': commit, 'tag': tag,
-                       **{k: v for k, v in r.items() if k in HIST_COLS}} for r in rows])[HIST_COLS]
-    H.to_csv(HISTORY, mode='a', header=not os.path.exists(HISTORY), index=False, float_format='%.4f')
+def append_history(rows, tag, commit, path=HISTORY, run_id=None, backup_dir=None):
+    """Строки результата → CSV истории. Колонки файла не совпали — сначала резервная копия (anemia/runs.py)."""
+    cols = HIST_COLS if run_id is None else ['run_id'] + HIST_COLS
+    fixed = {'timestamp': dt.datetime.now().isoformat(timespec='seconds'), 'commit': commit, 'tag': tag,
+             'run_id': run_id}
+    RUNS.append_history(path, rows, cols, fixed, backup_dir or os.path.join(os.path.dirname(path), 'backups'))
+
+
+def save_oof(O, cols, name, run_dir, oof_dir, backup_dir):
+    """OOF: неизменяемая копия в папке запуска + «последний прогон» <data>/results/oof_<tag>_*.csv
+    (его читает /error-analysis).
+    Последний перезаписывается, но если его копии нет ни в одной папке запуска, он сначала уходит в backups/."""
+    O[cols].to_csv(os.path.join(run_dir, name), index=False)
+    latest = os.path.join(oof_dir, name)
+    RUNS.preserve_before_overwrite(latest, os.path.dirname(run_dir), backup_dir)
+    O[cols].to_csv(latest, index=False)
 
 
 def main():
@@ -297,32 +382,59 @@ def main():
     ap.add_argument('--tag', default='baseline_v11')
     ap.add_argument('--jobs', type=int, default=-1)
     ap.add_argument('--no-history', action='store_true', help='не писать в metrics_history.csv (смоук-тесты)')
+    ap.add_argument('--history', default=HISTORY,
+                    help='история в репозитории (по умолчанию results/metrics_history.csv)')
+    ap.add_argument('--cache-dir', help='кэш признаков (по умолчанию <data>/cache/features)')
+    ap.add_argument('--no-cache', action='store_true', help='не читать и не писать кэш признаков')
+    ap.add_argument('--refresh-cache', action='store_true', help='пересчитать признаки и перезаписать кэш')
     a = ap.parse_args()
+    if a.no_cache and a.refresh_cache:
+        ap.error('--no-cache и --refresh-cache вместе не имеют смысла')
 
+    t0, started = time.time(), dt.datetime.now().isoformat(timespec='seconds')
+    res_dir = os.path.join(a.data, 'results')
+    backup_dir = os.path.join(res_dir, 'backups')
+    run_id, run_dir = RUNS.create_run_dir(os.path.join(res_dir, 'runs'), a.tag)
     os.makedirs(os.path.join(ROOT, 'results', 'logs'), exist_ok=True)
     stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    sys.stdout = Tee(os.path.join(ROOT, 'results', 'logs', f'evaluate_{a.tag}_{stamp}.log'))
-    man = pd.read_csv(os.path.join(a.data, 'manifest.csv'))
+    sys.stdout = Tee(os.path.join(ROOT, 'results', 'logs', f'evaluate_{a.tag}_{stamp}.log'),
+                     os.path.join(run_dir, 'log.txt'))
+    man_path = os.path.join(a.data, 'manifest.csv')
+    man = pd.read_csv(man_path)
     commit = git_commit()
+    script = source_version(os.path.abspath(__file__))
+    cache_mode = 'off' if a.no_cache else 'refresh' if a.refresh_cache else 'on'
+    cache = FeatureCache(a.cache_dir or os.path.join(a.data, 'cache', 'features'), cache_mode,
+                         salt={'evaluate_py': script})
+    timer = StageTimer()
+    meta = {'run_id': run_id, 'tag': a.tag, 'status': 'running', 'started': started, 'commit': commit,
+            'evaluate_py_sha1': script, 'args': vars(a), 'python': sys.version.split()[0],
+            'manifest': {'path': man_path, 'sha1': file_sha1(man_path), 'rows': len(man)},
+            'cache': {'mode': cache_mode, 'dir': cache.root},
+            'params': {'work_size': WORK_SIZE, 'n_relight': N_RELIGHT, 'stress': STRESS_CONDITIONS,
+                       'v12': {'detect_side': V12.DETECT_SIDE, 'crop_side': V12.CROP_SIDE, 'n_relight': V12.N_RELIGHT},
+                       'seg': {'seg_size': SB.SEG_SIZE, 'pix_per_image': SB.PIX_PER_IMAGE},
+                       'target_sens': a.target_sens}}
+    RUNS.write_json(os.path.join(run_dir, 'run.json'), meta)
     print(f'evaluate.py · commit {commit} · tag {a.tag} · {stamp}')
+    print(f'Запуск {run_id} → {run_dir} · кэш признаков: {cache_mode} ({cache.root})')
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
-    oof_dir = os.path.join(a.data, 'results')
-    os.makedirs(oof_dir, exist_ok=True)
-    rows, t0 = [], time.time()
+    os.makedirs(res_dir, exist_ok=True)
+    rows = []
     for ds in (['eyes_defy', 'cp_anemic', 'phone'] if a.dataset == 'all' else [a.dataset]):
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
             continue
         if a.task in ('all', 'v12'):
             print(f'[{time.time() - t0:5.0f} с] {ds}: модель v12, {len(df)} снимков...')
-            for mode, rule, n_skip, r, O in run_v12(a.data, df, a.target_sens, a.jobs):
+            for mode, rule, n_skip, r, O in run_v12(a.data, df, a.target_sens, a.jobs, cache, timer):
                 method = f'v12 · {mode} · {rule}' + (f' (−{n_skip})' if n_skip else '')
                 rows.append({'task': 'v12', 'dataset': ds, 'method': method, **r})
                 if rule == 'argmax':
                     P = np.stack(O.P.values)
-                    O.assign(p_norm=P[:, 0], p_mild=P[:, 1], p_mod=P[:, 2])[
-                        ['group', 'fold', 'y', 'anemic', 'p_norm', 'p_mild', 'p_mod', 'thr']].to_csv(
-                        os.path.join(oof_dir, f'oof_{a.tag}_{ds}_v12_{mode}.csv'), index=False)
+                    save_oof(O.assign(p_norm=P[:, 0], p_mild=P[:, 1], p_mod=P[:, 2]),
+                             ['group', 'fold', 'y', 'anemic', 'p_norm', 'p_mild', 'p_mod', 'thr'],
+                             f'oof_{a.tag}_{ds}_v12_{mode}.csv', run_dir, res_dir, backup_dir)
             if a.task == 'v12':
                 continue
         has_masks = df.mask_conj.notna().all()
@@ -330,7 +442,7 @@ def main():
         if has_masks and a.task in ('all', 'seg'):
             print(f'[{time.time() - t0:5.0f} с] {ds}: baseline-сегментация v11, {len(df)} снимков, '
                   f'{df.fold.nunique()} фолдов...')
-            res, pred_masks, _ = run_seg(a.data, df, a.jobs)
+            res, pred_masks, _ = run_seg(a.data, df, a.jobs, timer)
             rows.append({'task': 'seg', 'dataset': ds, 'method': 'v11 pixel-HGB', **res})
         if a.task not in ('all', 'hb'):
             continue
@@ -340,21 +452,34 @@ def main():
                 continue
             for mk in models:
                 print(f'[{time.time() - t0:5.0f} с] {ds}: Hb, маска={src}, модель={mk}...')
-                r, O, n_skip = run_hb(a.data, df, 'doctor' if src == 'doctor' else src, masks, mk, a.target_sens, a.jobs)
+                r, O, n_skip = run_hb(a.data, df, 'doctor' if src == 'doctor' else src, masks, mk, a.target_sens,
+                                      a.jobs, cache, timer, f'Hb {ds}, маска {src}, {mk}: чтение + признаки')
                 method = f'{mk} · маска {src}'
                 if n_skip:
                     print(f'   ⚠️ без ткани на маске: {n_skip} снимков — исключены из метрик Hb')
                     method += f' (−{n_skip})'
                 rows.append({'task': 'hb', 'dataset': ds, 'method': method, **r})
-                O[['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic']].to_csv(
-                    os.path.join(oof_dir, f'oof_{a.tag}_{ds}_{src}_{mk}.csv'), index=False)
+                save_oof(O, ['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic'],
+                         f'oof_{a.tag}_{ds}_{src}_{mk}.csv', run_dir, res_dir, backup_dir)
     if any(r['task'] != 'v12' for r in rows):
         print_table([r for r in rows if r['task'] != 'v12'])
     if any(r['task'] == 'v12' for r in rows):
         print_v12_table([r for r in rows if r['task'] == 'v12'])
+    total = time.time() - t0
+    feat_wall = sum(r['wall'] for r in timer.rows)
+    print('\nВремя (чтение / признаки / кэш — суммы по рабочим процессам; «стена» — по часам):')
+    print(timer.table())
+    print(f'Всего {total:.1f} с, из них этапы чтения и признаков {feat_wall:.1f} с, '
+          f'обучение моделей, CV и метрики {total - feat_wall:.1f} с.')
+    pd.DataFrame([{'run_id': run_id, **r} for r in rows]).to_csv(os.path.join(run_dir, 'metrics.csv'), index=False)
     if not a.no_history:
-        append_history(rows, a.tag, commit)
-        print(f'\nСтрок дописано в results/metrics_history.csv: {len(rows)} · {time.time() - t0:.0f} с')
+        append_history(rows, a.tag, commit, os.path.join(res_dir, 'metrics_history.csv'), run_id, backup_dir)
+        append_history(rows, a.tag, commit, a.history, backup_dir=backup_dir)
+        print(f'\nСтрок дописано: {len(rows)} → {a.history} и {os.path.join(res_dir, "metrics_history.csv")}')
+    meta.update(status='done', finished=dt.datetime.now().isoformat(timespec='seconds'), total_s=round(total, 2),
+                timings=timer.rows, n_rows=len(rows), history=None if a.no_history else [a.history, os.path.join(res_dir, 'metrics_history.csv')])
+    RUNS.write_json(os.path.join(run_dir, 'run.json'), meta)
+    print(f'Результаты запуска: {run_dir}')
 
 
 if __name__ == '__main__':

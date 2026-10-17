@@ -23,6 +23,9 @@ from sklearn.model_selection import GroupKFold
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'scripts'))
+from error_analysis import ea_cache_fresh, ea_cache_path, ea_rows  # noqa: E402
+
 from anemia import metrics as M  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
 from anemia.selective import zone_metrics, zone_thresholds  # noqa: E402
@@ -31,7 +34,10 @@ TARGETS = (0.90, 0.95)
 
 
 def load(data, tag, source='auto'):
-    res = pd.read_pickle(os.path.join(data, 'results', f'ea_cache_{tag}.pkl'))
+    if not ea_cache_fresh(data, tag, ea_rows(pd.read_csv(os.path.join(data, 'manifest.csv')))):
+        sys.exit(f'Кэш {ea_cache_path(data, tag)} отсутствует или посчитан для других данных или кода: '
+                 f'сначала python scripts/error_analysis.py --data {data} --tag {tag}')
+    res = pd.read_pickle(ea_cache_path(data, tag))
     F = pd.DataFrame([x for rows, _, _, _ in res for x in rows])
     info = pd.DataFrame([x[2] for x in res])
     F = F[F.source == source].merge(info[['group', 'country', 'hb_g_l', 'sex', 'age', 'doc_diff']], on='group')
