@@ -33,21 +33,36 @@ OOD_MAX = 0.30           # как в v12: больше 30% признаков д
 INNER_FOLDS = 4
 RISK_LEVELS = ('низкий', 'средний', 'высокий')
 
-SPECS = {   # какие признаки у какой модели: взрослые — снимок глаза, дети — уже вырезанная конъюнктива
-    'eyes_defy': {'prefixes': ('c_', 's_', 'w_'), 'sex': True, 'title': 'взрослые (Eyes-defy-anemia)'},
-    'cp_anemic': {'prefixes': ('c_',), 'sex': False, 'title': 'дети 6–59 мес (CP-AnemiC)'},
+SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка; взрослые — снимок глаза,
+    # дети — уже вырезанная конъюнктива. У взрослых — отдельная модель на каждый набор найденных тканей:
+    # недостающая ткань не заменяется нулями или признаками другой ткани
+    'eyes_defy': {'data': 'eyes_defy', 'prefixes': ('c_', 's_', 'w_'), 'need': ('c_',), 'sex': True,
+                  'tissues': ('conj', 'sclera'), 'title': 'взрослые (Eyes-defy-anemia), конъюнктива + склера'},
+    'eyes_defy_conj': {'data': 'eyes_defy', 'prefixes': ('c_',), 'need': ('c_',), 'sex': True,
+                       'tissues': ('conj',), 'title': 'взрослые (Eyes-defy-anemia), только конъюнктива'},
+    'eyes_defy_sclera': {'data': 'eyes_defy', 'prefixes': ('s_',), 'need': ('s_',), 'sex': True,
+                         'tissues': ('sclera',), 'title': 'взрослые (Eyes-defy-anemia), только склера'},
+    'cp_anemic': {'data': 'cp_anemic', 'prefixes': ('c_',), 'need': ('c_',), 'sex': False,
+                  'tissues': ('conj',), 'title': 'дети 6–59 мес (CP-AnemiC)'},
 }
 
 
-def feature_list(columns, dataset):
-    s = SPECS[dataset]
+def specs_for(dataset):
+    """Модели, которые обучаются на этом датасете манифеста."""
+    return [k for k, s in SPECS.items() if s['data'] == dataset]
+
+
+def feature_list(columns, key):
+    s = SPECS[key]
     f = [k for k in columns if k.startswith(s['prefixes'])]
     return f + (['male'] if s['sex'] else [])
 
 
-def usable(F):
-    """Строки пациентов, у которых конъюнктива нашлась на исходном снимке: без неё модель не применяется."""
-    c = [k for k in F.columns if k.startswith('c_')]
+def usable(F, key=None):
+    """Строки пациентов, у которых на исходном снимке нашлись ткани, обязательные для модели key
+    (по умолчанию — конъюнктива): без них модель не применяется."""
+    need = SPECS[key]['need'] if key else ('c_',)
+    c = [k for k in F.columns if k.startswith(need)]
     ok = set(F[F.aug == 0].dropna(subset=c).group)
     return F[F.group.isin(ok)].dropna(subset=c)
 
@@ -101,7 +116,7 @@ def fit_core(F, feats, dataset, seed=0, inner_folds=INNER_FOLDS, zone_target=ZON
     model, prior = _fit_cls(F, feats, seed)
     X0 = O[feats].values.astype(float)
     return {
-        'dataset': dataset, 'title': SPECS[dataset]['title'], 'feats': list(feats),
+        'dataset': dataset, 'title': SPECS[dataset]['title'], 'tissues': SPECS[dataset]['tissues'], 'feats': list(feats),
         'n_patients': int(O.group.nunique()), 'n_anemic': int(anem.sum()),
         'cls': model, 'prior': prior, 'hb': _hb_model().fit(F[feats].values, F.hb_g_l.values),
         't_lo': t_lo, 't_hi': t_hi, 'zone_target': zone_target,

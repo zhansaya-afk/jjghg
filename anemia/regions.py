@@ -129,9 +129,11 @@ def _iris_score(L, C, cx, cy, r):
     return float(np.median(L[ring]) - np.median(L[inside]))
 
 
-def find_iris(rgb, maps=None):
+def find_iris(rgb, maps=None, min_r=0.07, max_r=0.32, min_contrast=10, with_score=False):
     """Радужка: тёмный круг, окружённый более светлой тканью (склера, веко) -> (cx, cy, r) или None.
-    Кандидаты — окружности Хафа и тёмные округлые пятна; выбирается самый контрастный круг."""
+    Кандидаты — окружности Хафа и тёмные округлые пятна; выбирается самый контрастный круг.
+    min_r / max_r — радиус в долях короткой стороны (по умолчанию — глаз крупным планом, как при обучении);
+    with_score=True -> ((cx, cy, r), контраст) — насколько уверенно определена граница радужки."""
     maps = maps or color_maps(rgb)
     L, C = cv2.GaussianBlur(maps['L'], (0, 0), 1.5), maps['C']
     h, w = L.shape
@@ -140,7 +142,7 @@ def find_iris(rgb, maps=None):
     u8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
     for p2 in (30, 22, 16):
         circ = cv2.HoughCircles(u8, cv2.HOUGH_GRADIENT, dp=1.5, minDist=side / 6, param1=60, param2=p2,
-                                minRadius=int(0.07 * side), maxRadius=int(0.32 * side))
+                                minRadius=int(min_r * side), maxRadius=int(max_r * side))
         if circ is not None:
             cands += [tuple(c) for c in circ[0][:8]]
             break
@@ -149,7 +151,7 @@ def find_iris(rgb, maps=None):
         n, lab, st, cen = cv2.connectedComponentsWithStats(dark, 8)
         for i in range(1, n):
             x, y, bw, bh, a = st[i]
-            if a < 0.008 * h * w or bw > 0.6 * w or bh > 0.7 * h:
+            if a < 0.008 * h * w * (min_r / 0.07) ** 2 or bw > 0.6 * w or bh > 0.7 * h:
                 continue
             if a / (bw * bh) > 0.45 and min(bw, bh) / max(bw, bh) > 0.45:
                 cands.append((cen[i][0], cen[i][1], max(bw, bh) / 2))
@@ -160,8 +162,10 @@ def find_iris(rgb, maps=None):
         con = _iris_score(L, C, cx, cy, r)
         central = 1 - min(1, np.hypot((cx - w / 2) / w, (cy - h / 2) / h) * 1.2)
         s = con * (0.5 + central)
-        if con > 10 and s > best_s:
-            best, best_s = (float(cx), float(cy), float(r)), s
+        if con > min_contrast and s > best_s:
+            best, best_s, best_con = (float(cx), float(cy), float(r)), s, float(con)
+    if with_score:
+        return best, (best_con if best else 0.0)
     return best
 
 
