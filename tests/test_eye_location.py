@@ -168,3 +168,55 @@ def test_trim_removes_skin_keeps_real_sclera():
     assert not (out['sclera'] & upper).any() and not (out['sclera'] & lateral).any()
     assert (out['sclera'] & sclera).sum() == sclera.sum()
     assert (out['conj'] == conj).all()
+
+
+def _dark_edge(img):
+    """Чёрные волосы/фон вдоль правого края и в правом верхнем углу (как на фото глаза с волосами у края кадра)."""
+    img = img.copy()
+    H, W = img.shape[:2]
+    img[:, int(0.8 * W):] = 0.01
+    img[:int(0.3 * H), int(0.65 * W):] = 0.01
+    return img
+
+
+def test_dark_hair_at_edge_is_not_cutout():
+    """Регрессия (фото из Colab 2026-10-18): чёрная область у одного края (14% кадра) принималась за фон
+    вырезанной ткани — весь кадр становился «вырезанной тканью», и модель взрослых отказывала. Фон вырезки
+    окружает ткань со всех сторон (CP-AnemiC: от 74% края кадра)."""
+    img = _dark_edge(_in_frame(0.5, at=(0.4, 0.5)))
+    crop = P.R._prepare(img)
+    assert P.R.dark_border(crop).mean() > 0.12 and P.R.cutout_background(crop) is None
+    cut = np.zeros((300, 400, 3), np.float32)
+    cv2.ellipse(cut, (200, 150), (150, 100), 0, 0, 360, CONJ, -1)
+    assert P.R.cutout_background(_noise(cut)) is not None          # настоящая вырезка — по-прежнему вырезка
+
+
+@pytest.mark.parametrize('k', [0.5, 0.8, 1.0])
+def test_eye_with_dark_hair_at_edge_analysed(k):
+    """Тот же кадр целиком: глаз находится, обе маски на своих тканях (> 90% пикселей), отказа «вырезанная ткань»
+    нет. Покрытие склеры здесь не проверяется: _trim_to_eye срезает её часть выше центра радужки (k=0,8 — 40%)."""
+    det = P._detect(_dark_edge(_in_frame(k, at=(0.4, 0.5))))
+    assert det['kind'] != 'вырезанная ткань' and det['use'] == {'conj', 'sclera'}, det['notes']
+    for t in ('conj', 'sclera'):
+        assert _on_tissue(det['crop'], det[t], t) > 0.9, t
+    assert _covered(det['crop'], det['conj'], 'conj') > 0.5
+
+
+def test_iris_on_dark_background_rejected():
+    """Регрессия: «радужкой» шага 1 был круг на границе чёрных волос и кожи, маски — на пальцах под ним.
+    Круг, заметная часть которого лежит на тёмном фоне у края кадра, — не радужка."""
+    crop = np.empty((320, 240, 3), np.float32)
+    crop[:] = SKIN
+    crop[:, 200:] = 0.01
+    conj = _box(320, 240, 250, 300, 120, 200)
+    sclera = _box(320, 240, 170, 185, 130, 160)
+    d = dict(_det(conj, sclera, (190, 190, 60)), crop=_noise(crop))
+    assert 'тёмном фоне' in P._inconsistent(d)
+    d['iris'] = (120, 190, 40)                                      # тот же круг вдали от фона — правило молчит
+    assert 'тёмном фоне' not in P._inconsistent(d)
+
+
+def test_upside_down_eye_with_dark_edge_refused():
+    """Перевёрнутый кадр (веко над радужкой): маски на кожу не ставятся — отказ."""
+    det = P._detect(np.ascontiguousarray(_dark_edge(_in_frame(0.5, at=(0.4, 0.5)))[::-1, ::-1]))
+    assert not det['use'] and not det['conj'].any() and not det['sclera'].any()
