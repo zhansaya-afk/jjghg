@@ -1,12 +1,15 @@
-"""Baseline сегментации конъюнктивы = подход v11: попиксельный HistGradientBoosting по цветовым и
-текстурным признакам + положение относительно радужки, обучение на масках врачей Eyes-defy-anemia.
-Нужен только как точка отсчёта для этапа 2 (обученная сеть). Перенесено из md/current/v11_cells/cell2–3.
+"""Сегментация конъюнктивы = подход v11: попиксельный HistGradientBoosting по цветовым и текстурным признакам
++ положение относительно радужки, обучение на масках врачей Eyes-defy-anemia. Перенесено из md/current/v11_cells/
+cell2–3. Точка отсчёта для этапа 2 (обученная сеть) и — с 2026-10-18 — маска конъюнктивы ядра (conj_mask):
+пороговый поиск anemia.regions захватывал вместе с веком склеру, кожу и пальцы (IoU с масками врачей ≈ 0,30 —
+разовый замер 2026-10-18, не evaluate; у сегментатора v11 в evaluate baseline_v11 средний IoU 0,58).
 """
 import cv2
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 from .color import lin_to_srgb, srgb_to_lin
+from .io import resize_max, resize_to
 
 SEG_SIZE = 256
 SIGMAS = (0, 2, 4, 8, 16)
@@ -91,11 +94,41 @@ def _largest_parts(mask, min_frac=0.25):
     return np.isin(lab, 1 + np.flatnonzero(areas >= areas.max() * min_frac))
 
 
-def predict(model, F, thr=0.5):
+def _raw_mask(model, F, thr):
     h, w = F.shape[:2]
     p = model.predict_proba(F.reshape(-1, F.shape[-1]))[:, 1].reshape(h, w).astype(np.float32)
     m = cv2.GaussianBlur(p, (0, 0), 1.5) > thr
     m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+
+
+def _main_parts(m):
     m = _largest_parts(m)
-    return m if m.sum() >= 0.004 * h * w else np.zeros_like(m)
+    return m if m.sum() >= 0.004 * m.size else np.zeros_like(m)
+
+
+def predict(model, F, thr=0.5):
+    return _main_parts(_raw_mask(model, F, thr))
+
+
+def image_samples(rgb, mask, seed):
+    """Обучающие пиксели одного снимка с маской врача → (X, y); свой сид у снимка — результат можно кэшировать."""
+    return _sample(pixel_features(rgb), mask, np.random.default_rng(seed))
+
+
+def fit_samples(samples, seed=0):
+    """Сегментатор по пикселям image_samples нескольких снимков (те же настройки, что у train)."""
+    X, y = np.concatenate([a for a, _ in samples]), np.concatenate([b for _, b in samples])
+    return HistGradientBoostingClassifier(max_depth=6, learning_rate=0.1, max_iter=150, random_state=seed).fit(X, y)
+
+
+def conj_mask(model, crop):
+    """Маска конъюнктивы на вырезке любого размера → bool размера вырезки. Признаки пикселей — на SEG_SIZE,
+    как при обучении; пусто — сегментатор конъюнктивы не нашёл. Части, касающиеся нижнего края вырезки,
+    отбрасываются: вывернутое веко лежит над кожей века и пальцами и до низа кадра не доходит (Eyes-defy: 0 из 211
+    снимков), а у низа бывают ногти, губы, пальцы."""
+    m = _raw_mask(model, pixel_features(resize_max(np.ascontiguousarray(crop, np.float32), SEG_SIZE)), 0.5)
+    _, lab = cv2.connectedComponents(m.astype(np.uint8), connectivity=8)
+    bottom = np.unique(lab[-1])
+    m &= ~np.isin(lab, bottom[bottom > 0])       # до выбора крупных частей: иначе пальцы у края «съедают» веко
+    return resize_to(_main_parts(m), crop.shape[:2], nearest=True)

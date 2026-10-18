@@ -9,6 +9,7 @@ from PIL import Image
 
 from anemia import core as CORE
 from anemia import predict as PR
+from anemia import segment_baseline as SB
 from anemia.labs import hb_to_g_l, lab_hb_report
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from test_regions import synthetic_eye
@@ -112,7 +113,9 @@ def test_frame_issues():
 def _bundle():
     F, _ = _synthetic()
     F = F.rename(columns={'c_x': 'c_EI_m', 'c_z': 'c_a_m', 's_x': 's_EI_m'})
-    return {'models': {'eyes_defy': CORE.fit_core(F, ['c_EI_m', 'c_a_m', 's_EI_m', 'male'], 'eyes_defy')}}
+    img, _, conj = synthetic_eye()
+    return {'models': {'eyes_defy': CORE.fit_core(F, ['c_EI_m', 'c_a_m', 's_EI_m', 'male'], 'eyes_defy')},
+            'conj_seg': SB.fit_samples([SB.image_samples(img, conj > 0, 0)])}
 
 
 def test_analyze_photo_contract():
@@ -177,6 +180,8 @@ def test_model_follows_found_tissues(monkeypatch):
     img, _, _ = synthetic_eye()
     monkeypatch.setattr(PR, 'quality', lambda *a: [])          # синтетика: проверяется маршрут, а не качество
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det({'sclera'}))
+    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg: det)   # маршрут моделей; сегментатор — test_eye_location
+    full['conj_seg'] = with_s['conj_seg'] = 'stub'
     r = PR.analyze_photo(img, sex='F', age=30, bundle=full, landmarker=None)
     assert r['stage'] == 'no_model' and r['risk'] is None          # модели «только склера» нет — не подменяем
     r = PR.analyze_photo(img, sex='F', age=30, bundle=with_s, landmarker=None)
@@ -187,3 +192,16 @@ def test_model_follows_found_tissues(monkeypatch):
     assert r['stage'] == 'no_eye' and r['status'] == 'retake'
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det(set()))
     assert PR.analyze_photo(img, bundle=with_s, landmarker=None)['stage'] == 'no_tissue'
+
+
+def test_cross_validate_train_by_fold():
+    """Признаки обучения, зависящие от тестового фолда (маски сегментатора без него): модель фолда f учится только
+    на переданных строках; пациент теста среди них — ошибка."""
+    F, _ = _synthetic()
+    feats = ['c_x', 'c_z', 'male']
+    train = {f: F[F.fold != f] for f in sorted(F.fold.unique())}
+    O, _ = CORE.cross_validate(F, feats, 'eyes_defy', train_by_fold=train)
+    O2, _ = CORE.cross_validate(F, feats, 'eyes_defy')
+    assert np.allclose(O.p.values, O2.p.values)
+    with pytest.raises(AssertionError):
+        CORE.cross_validate(F, feats, 'eyes_defy', train_by_fold={f: F for f in train})

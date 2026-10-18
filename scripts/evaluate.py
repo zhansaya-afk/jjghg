@@ -41,6 +41,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from anemia import core as CORE  # noqa: E402
 from anemia import metrics as M  # noqa: E402
+from anemia import predict as PR  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
 from anemia import runs as RUNS  # noqa: E402
@@ -49,6 +50,7 @@ from anemia.cache import TIMING_KEYS, FeatureCache, empty_timings, file_sha1, so
 from anemia.features import N_RELIGHT, WORK_SIZE, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
 from anemia.io import load_rgb  # noqa: E402
+from anemia.regions import detect_regions  # noqa: E402
 
 HISTORY = os.path.join(ROOT, 'results', 'metrics_history.csv')
 HIST_COLS = ['timestamp', 'commit', 'tag', 'task', 'dataset', 'method', 'n',
@@ -243,13 +245,17 @@ def _v12_job(root, row, seed, cache=NO_CACHE):
     params = {'cp': cp, 'seed': seed, 'detect_side': V12.DETECT_SIDE, 'crop_side': V12.CROP_SIDE,
               'n_relight': V12.N_RELIGHT, 'stress': STRESS_CONDITIONS}
     (rows, srows), t = cache.fetch('v12', {'image': path}, {}, params, _v12_compute, path, cp, seed)
+    return _with_meta(row, rows, srows), t
+
+
+def _with_meta(row, rows, srows):
     age = row['age'] if row['age'] == row['age'] else 30.0      # метки — из текущего манифеста, не из кэша
     sex = row['sex'] if isinstance(row['sex'], str) else None
     meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
             'hb_g_l': float(row['hb_g_l']),
             'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant']))),
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
-    return ([{**meta, **r} for r in rows], [{**meta, **r} for r in srows]), t
+    return [{**meta, **r} for r in rows], [{**meta, **r} for r in srows]
 
 
 def v12_decide(P, thr=None):
@@ -345,16 +351,159 @@ def v12_features(root, df, jobs, cache=NO_CACHE, timer=None, stage='призна
     return F, S
 
 
-def run_core(root, df, jobs, cache=NO_CACHE, timer=None, key=None):
-    key = key or df.dataset.iloc[0]
-    F, S = v12_features(root, df, jobs, cache, timer, 'core')
+# ------------------------------------------------------------------ ядро: конъюнктива обученным сегментатором
+def _segpix_compute(root, row, seed):
+    t0 = time.perf_counter()
+    rgb, doc = load_item(root, row, 'doctor')
+    t1 = time.perf_counter()
+    return SB.image_samples(rgb, doc, seed), {'read': t1 - t0, 'features': time.perf_counter() - t1}
+
+
+def _segpix_job(root, row, seed, cache=NO_CACHE):
+    files = {'image': os.path.join(root, row['image']), 'mask': os.path.join(root, row['mask_conj'])}
+    params = {'seed': seed, 'seg_size': SB.SEG_SIZE, 'work_size': WORK_SIZE, 'pix_per_image': SB.PIX_PER_IMAGE}
+    return cache.fetch('segpix', files, {}, params, _segpix_compute, root, row, seed)
+
+
+def conj_segmenters(root, df, jobs, cache=NO_CACHE, timer=None, nested=False, full=True):
+    """Сегментаторы конъюнктивы по маскам врачей → {набор фолдов, которых модель НЕ видела: модель}.
+        (g,)   — маски снимков фолда g (OOF): тестовые снимки evaluate и обучающие признаки train_core;
+        (f, g) — nested=True, только evaluate: маски обучающих снимков фолда g при оценке внешнего фолда f. Так маски
+                 врачей тестового фолда f не влияют ни на одну маску, по которой учится модель риска фолда f;
+        ()     — full=True: модель на всех снимках, только для новых фото (файл модели, predict).
+    Hb и метки риска сегментатор не видит."""
+    assert WORK_SIZE == SB.SEG_SIZE, 'сегментатор обучается на load_item (WORK_SIZE), применяется на SEG_SIZE'
+    t0 = time.perf_counter()
+    res = Parallel(n_jobs=jobs)(delayed(_segpix_job)(root, r, i, cache) for i, r in enumerate(df.to_dict('records')))
+    if timer is not None:
+        timer.add(f'сегментатор конъюнктивы {df.dataset.iloc[0]}: пиксели масок врачей', [t for _, t in res],
+                  time.perf_counter() - t0)
+    samples, fold_of = [x for x, _ in res], df.fold.astype(int).values
+    folds = sorted(set(fold_of))
+    keys = ([()] if full else []) + [(g,) for g in folds] + (
+        [(f, g) for f in folds for g in folds if g != f] if nested else [])
+    t0 = time.perf_counter()
+    models = Parallel(n_jobs=jobs)(delayed(SB.fit_samples)([x for x, g in zip(samples, fold_of) if g not in k])
+                                   for k in keys)
+    if timer is not None:
+        timer.add(f'сегментатор конъюнктивы {df.dataset.iloc[0]}: обучение {len(keys)} моделей', [], time.perf_counter() - t0)
+    return dict(zip(keys, models))
+
+
+DET_KEYS = ('crop', 'conj', 'sclera', 'iris', 'use', 'kind', 'notes', 'src_side', 'score')
+
+
+def _det_compute(path):
+    """Шаг 1 анализа фото (predict._detect): весь кадр DETECT_SIDE, поиск тканей v12 с тем же сидом GrabCut."""
+    t0 = time.perf_counter()
+    img = load_rgb(path, V12.DETECT_SIDE)
+    t1 = time.perf_counter()
+    cv2.setRNGSeed(0)
+    det = detect_regions(img, 'both')
+    return {k: det[k] for k in DET_KEYS}, {'read': t1 - t0, 'features': time.perf_counter() - t1}
+
+
+def eye_route(det, seg):
+    """Снимок глаза → (ткани после тех же отказов, что в анализе фото; модель взрослых или None; причина отказа).
+    Шаг 1 _detect: несогласованные ткани → отказ; конъюнктива — сегментатор seg (learned_conj, с его отказами);
+    затем качество тканей и выбор модели (tissue_route). Остальные шаги _detect (лицо, мелкая радужка) на
+    Eyes-defy меняют маршрут 1 снимка из 216 (сверка 2026-10-18) и здесь не повторяются."""
+    why = PR._inconsistent(det)
+    det = PR.learned_conj(PR._rejected(det, why) if why else det, seg)
+    key, why = PR.tissue_route(det)
+    return det, key, why
+
+
+def _seg_features(crop, conj, sclera, seed, stress):
+    t0 = time.perf_counter()
+    rows = [{'aug': 0, **V12.eye_features(crop, conj, sclera)}]
+    rng = np.random.default_rng(seed)
+    for a in range(1, V12.N_RELIGHT + 1):
+        rows.append({'aug': a, **V12.eye_features(V12.relight(crop, rng), conj, sclera)})
+    srows = [{'cond': f'{T}K×{e}', **V12.eye_features(apply_illuminant(crop, T, e), conj, sclera)}
+             for T, e in (STRESS_CONDITIONS if stress else [])]
+    return (rows, srows), {'read': 0.0, 'features': time.perf_counter() - t0}
+
+
+def _core_job(root, row, seed, seg, stress, cache=NO_CACHE):
+    """Один снимок глаза: маршрут анализа фото + признаки тканей той модели, которой он будет оценён."""
+    path = os.path.join(root, row['image'])
+    det, t = cache.fetch('v12det', {'image': path}, {}, {'detect_side': V12.DETECT_SIDE}, _det_compute, path)
+    det, key, why = eye_route(det, seg)
+    if key is None:
+        return {'key': None, 'why': why, 'rows': [], 'srows': []}, t
+    tissues = CORE.SPECS[key]['tissues']              # как analyze_photo: только пригодные ткани
+    conj = det['conj'] if 'conj' in tissues else None
+    sclera = det['sclera'] if 'sclera' in tissues else None
+    arrays = {'crop': det['crop'], **({} if conj is None else {'conj': conj}),
+              **({} if sclera is None else {'sclera': sclera})}
+    params = {'seed': seed, 'n_relight': V12.N_RELIGHT, 'stress': STRESS_CONDITIONS if stress else None}
+    (rows, srows), t2 = cache.fetch('v12seg', {}, arrays, params, _seg_features, det['crop'], conj, sclera, seed,
+                                    stress)
+    rows, srows = _with_meta(row, rows, srows)
+    return {'key': key, 'why': '', 'rows': rows, 'srows': srows}, {k: t[k] + t2[k] for k in t}
+
+
+def _core_batch(root, items, seg, stress, cache):
+    return [(i, role, *_core_job(root, row, i, seg, stress, cache)) for i, role, row in items]
+
+
+def core_jobs(root, df, jobs, segs, cache=NO_CACHE, timer=None, nested=False):
+    """Маршрут и признаки каждого снимка глаза → список {i, role, key, why, rows, srows}.
+    role 'test' — снимок фолда g с маской сегментатора без g (+ стресс-условия света);
+    role f (nested) — тот же снимок как обучающий при внешнем фолде f, маска сегментатора без f и g."""
+    recs = list(df.to_dict('records'))
+    batches = {}
+    for i, row in enumerate(recs):
+        g = int(row['fold'])
+        batches.setdefault((g,), []).append((i, 'test', row))
+        for f in sorted(set(df.fold.astype(int))) if nested else []:
+            if f != g:
+                batches.setdefault((f, g), []).append((i, f, row))
+    t0 = time.perf_counter()
+    out = Parallel(n_jobs=jobs)(delayed(_core_batch)(root, items, segs[k], len(k) == 1, cache)
+                                for k, items in batches.items())
+    res = [r for b in out for r in b]
+    if timer is not None:
+        timer.add(f'core {df.dataset.iloc[0]}: поиск тканей + маска сегментатора + отказы + признаки',
+                  [t for *_, t in res], time.perf_counter() - t0)
+    return [{'i': i, 'role': role, **x} for i, role, x, _ in res]
+
+
+def route_counts(J, n):
+    """Сколько снимков (role 'test') анализ фото примет какой моделью и сколько отклонит, по причинам."""
+    T = [x for x in J if x['role'] == 'test']
+    c = {'n_total': n}
+    for x in T:
+        k = x['key'] or 'отказ · ' + x['why'].split(':')[0]
+        c[k] = c.get(k, 0) + 1
+    return c
+
+
+def _frame(J, role, key=None, s=False):
+    sel = [x for x in J if x['role'] == role and x['key'] is not None and (key is None or x['key'] == key)]
+    return pd.DataFrame([r for x in sel for r in (x['srows'] if s else x['rows'])])
+
+
+def run_core(df, J, key):
+    """OOF ядра модели key на снимках, которые анализ фото оценит этой моделью; модель фолда f учится на
+    принятых снимках остальных фолдов с масками сегментаторов, не видевших фолда f (nested в core_jobs).
+    → (метрики на принятых: OOD > OOD_MAX — тоже отказ; OOF-таблица всех оценённых этой моделью снимков)."""
+    F = _frame(J, 'test', key)
+    if not len(F):
+        return None, None                            # анализ фото ни один снимок этой моделью не оценит
     F = CORE.usable(F, key)
     feats = CORE.feature_list(F.columns, key)
-    S = S[S.group.isin(set(F.group))]
-    O, SP = CORE.cross_validate(F, feats, key, S)
-    r = CORE.core_metrics(O, SP)
-    r['target_sens'] = CORE.SENS_TARGET
-    return r, O, len(df) - O.group.nunique()
+    S = _frame(J, 'test', key, s=True)
+    S = S[S.group.isin(set(F.group))] if len(S) else None
+    folds = sorted(set(df.fold.astype(int)))
+    train = {f: CORE.usable(_frame(J, f), key) for f in folds}
+    O, SP = CORE.cross_validate(F, feats, key, S, train_by_fold=train)
+    acc = O.ood.values <= CORE.OOD_MAX
+    r = CORE.core_metrics(O[acc], None if SP is None else SP[SP.group.isin(set(O.group[acc]))])
+    r.update(target_sens=CORE.SENS_TARGET, n_routed=int(len(O)), n_ood=int((~acc).sum()), n_accepted=int(acc.sum()),
+             n_total=len(df))
+    return r, O.assign(accepted=acc)
 
 
 def print_core_table(rows):
@@ -485,13 +634,38 @@ def main():
         if not len(df):
             continue
         if a.task == 'core':
-            for key in CORE.specs_for(ds):   # у взрослых — модель на каждый набор тканей, одни и те же фолды
+            if ds == 'cp_anemic':           # вырезы: вся картинка — ткань, сегментатор и отказы глаза не нужны
+                key = 'cp_anemic'
                 print(f'[{time.time() - t0:5.0f} с] {key}: ядро HemaVision, {len(df)} снимков...')
-                r, O, n_skip = run_core(a.data, df, a.jobs, cache, timer, key)
+                F, S = v12_features(a.data, df, a.jobs, cache, timer, 'core')
+                F = CORE.usable(F, key)
+                O, SP = CORE.cross_validate(F, CORE.feature_list(F.columns, key), key, S[S.group.isin(set(F.group))])
+                r = {**CORE.core_metrics(O, SP), 'target_sens': CORE.SENS_TARGET}
+                n_skip = len(df) - O.group.nunique()
                 rows.append({'task': 'core', 'dataset': key,
                              'method': 'core · 3 уровня риска' + (f' (−{n_skip})' if n_skip else ''), **r})
                 save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens'],
                          f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
+                continue
+            if not df.mask_conj.notna().all():
+                sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы ядра обучить не на чем')
+            print(f'[{time.time() - t0:5.0f} с] {ds}: сегментаторы конъюнктивы по маскам врачей (без тестового фолда)...')
+            segs = conj_segmenters(a.data, df, a.jobs, cache, timer, nested=True, full=False)
+            print(f'[{time.time() - t0:5.0f} с] {ds}: маршрут анализа фото, отказы и признаки...')
+            J = core_jobs(a.data, df, a.jobs, segs, cache, timer, nested=True)
+            rc = route_counts(J, len(df))
+            print(f'{ds}: маршрут анализа фото (тестовые маски): ' + ', '.join(f'{k} {v}' for k, v in rc.items()))
+            for key in CORE.specs_for(ds):   # у взрослых — модель на каждый набор тканей, одни и те же фолды
+                print(f'[{time.time() - t0:5.0f} с] {key}: ядро HemaVision...')
+                r, O = run_core(df, J, key)
+                if r is None:
+                    print(f'{key}: анализ фото не оценит этой моделью ни одного снимка — пропуск')
+                    continue
+                rows.append({'task': 'core', 'dataset': key, 'method': f"core · принято {r['n_accepted']}/{len(df)} "
+                             f"(этой моделью {r['n_routed']}, OOD {r['n_ood']})", **r})
+                save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens',
+                             'accepted'], f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
+            RUNS.write_json(os.path.join(run_dir, f'routes_{ds}.json'), rc)
             continue
         if a.task in ('all', 'v12'):
             print(f'[{time.time() - t0:5.0f} с] {ds}: модель v12, {len(df)} снимков...')

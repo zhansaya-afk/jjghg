@@ -136,16 +136,20 @@ def apply_core(B, X):
 
 
 # ------------------------------------------------------------------ проверка на фолдах манифеста
-def cross_validate(F, feats, dataset, S=None, seed=0):
+def cross_validate(F, feats, dataset, S=None, seed=0, train_by_fold=None):
     """OOF по фолдам манифеста: модель и все её пороги обучаются на 4 фолдах, применяются к пятому.
     S — признаки тех же снимков при 8 стресс-условиях света (group, cond): риск по ним считает модель того фолда,
-    где пациент был тестовым. → (OOF-таблица исходных снимков, стресс-таблица или None)."""
+    где пациент был тестовым. train_by_fold — {фолд f: обучающие строки}, если признаки обучающих снимков зависят
+    от тестового фолда (маски сегментатора, не видевшего f); иначе обучение — строки F остальных фолдов.
+    → (OOF-таблица исходных снимков, стресс-таблица или None)."""
     O = F[F.aug == 0].reset_index(drop=True)
     cols = {k: np.full(len(O), np.nan) for k in ('p', 'level', 'hb_pred', 'ood', 'hb_ok', 'thr_sens', 'hb_hw')}
     stress = []
     for f in sorted(O.fold.unique()):
         te = np.flatnonzero(O.fold.values == f)
-        B = fit_core(F[F.fold != f], feats, dataset, seed)
+        T = F[F.fold != f] if train_by_fold is None else train_by_fold[f]
+        assert not set(T.group) & set(O.group.values[te]), 'пациент теста в обучении'
+        B = fit_core(T, feats, dataset, seed)
         p, lv, hbp, ood = apply_core(B, O[feats].values[te])
         for k, v in (('p', p), ('level', lv), ('hb_pred', hbp), ('ood', ood)):
             cols[k][te] = v

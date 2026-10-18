@@ -19,6 +19,7 @@ import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import core as CORE
+from . import segment_baseline as SB
 from . import v12_model as V12
 from .io import resize_max
 from . import regions as R
@@ -122,7 +123,14 @@ def load_bundle(path=None):
         if not os.path.exists(path):
             raise FileNotFoundError(f'нет модели {path}: сначала python scripts/train_core.py')
         import joblib
-        _BUNDLES[path] = joblib.load(path)
+
+        from .model_store import check_compat
+        b = joblib.load(path)
+        why = check_compat(b.get('compat'))
+        if why:
+            raise RuntimeError(f'модель {path} не подходит к текущему коду ({why}): запустите ячейку Я1 '
+                               '(python scripts/train_core.py)')
+        _BUNDLES[path] = b
     return _BUNDLES[path]
 
 
@@ -479,6 +487,25 @@ def _detect(rgb, landmarker=None):
     return det
 
 
+def learned_conj(det, seg):
+    """Конъюнктива ядра — сегментатор по маскам врачей Eyes-defy (anemia.segment_baseline) на вырезке, где _detect
+    нашёл глаз; та же функция даёт маски признаков обучения (scripts/evaluate.py core_features), поэтому признаки
+    снимка совпадают с обучающими. Пороговая «конъюнктива» regions нужна только для поиска глаза: она захватывает
+    склеру, кожу и пальцы (IoU с врачами ≈ 0,30, разовый замер). Сегментатор конъюнктиву не нашёл — её нет; затем ткани ещё раз
+    проверяются на согласие с радужкой (_inconsistent). Конъюнктивы нет — отказ целиком: «склера» без вывернутого
+    века не привязана к глазу надёжно (на фото проверки ею оказывалась кожа щёк при ложной «радужке»)."""
+    if not det['use'] or det['kind'] == 'вырезанная ткань':
+        return det
+    conj = SB.conj_mask(seg, det['crop'])
+    d = dict(det, conj=conj, use=(set(det['use']) - {'conj'}) | ({'conj'} if conj.any() else set()),
+             notes=[n for n in det['notes'] if n != 'оценка по одной ткани'])
+    if not conj.any():                      # без века оценки нет: «склера» без него бывает кожей (у Eyes-defy
+        return _rejected(d, 'конъюнктива не найдена сегментатором (обучен на масках врачей): нижнее веко не '
+                            'вывернуто или не в кадре — оттяните его вниз')   # веко находится на всех снимках)
+    why = _inconsistent(d)
+    return _rejected(d, why) if why else d
+
+
 def _small_irises(img):
     """Кандидаты в мелкую радужку [((cx, cy, r), контраст края)], лучшие первыми. Окружности Хафа всех трёх
     порогов (find_iris останавливается на первом пороге, где нашлись хоть какие-то окружности, и при сдвиге или
@@ -532,6 +559,22 @@ def tissue_status(crop, det):
 
 
 ADULT_MODEL = {('conj', 'sclera'): 'eyes_defy', ('conj',): 'eyes_defy_conj', ('sclera',): 'eyes_defy_sclera'}
+
+
+def tissue_route(det):
+    """Снимок глаза → (модель взрослых, которой его оценит analyze_photo, или None; причина отказа). Те же шаги,
+    что в analyze_photo: ткани не найдены → отказ; проверка качества каждой ткани и всех вместе (tissue_status,
+    quality) → отказ или выбор модели по пригодным тканям. evaluate --task core и train_core применяют её к
+    Eyes-defy, чтобы обучение и метрики шли на тех же снимках, которые принимает анализ фото."""
+    if not det['use']:
+        return None, 'нет тканей: ' + (det['notes'][-1] if det['notes'] else 'не найдены')
+    ts = tissue_status(det['crop'], det)
+    good = tuple(t for t in ('conj', 'sclera') if ts[t] == 'пригодна')
+    found = [det[t] for t in ('conj', 'sclera') if t in det['use']]
+    whole = quality(det['crop'], found[0], found[-1] if len(found) > 1 else np.zeros_like(found[0]), det['src_side'])
+    if not good or whole:
+        return None, 'качество: ' + '; '.join(whole + [f'{TISSUE_RU[t]}: {v}' for t, v in ts.items() if v != 'пригодна'])
+    return ADULT_MODEL[good], ''
 TISSUE_RU = {'conj': 'конъюнктива', 'sclera': 'склера'}
 
 
@@ -573,7 +616,12 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
             r['notes'].append(lm_note)
     elif landmarker:
         lm = landmarker
-    det = _detect(rgb, lm)                  # ориентация — как есть (EXIF учтён); повёрнутый кадр меняет ответ
+    if bundle.get('conj_seg') is None:
+        r['status'], r['stage'] = 'unreliable', 'no_model'
+        r['issues'].append('в файле модели нет сегментатора конъюнктивы (модель старше кода) — перезапустите ячейку Я1 '
+                           '(python scripts/train_core.py)')
+        return r
+    det = learned_conj(_detect(rgb, lm), bundle['conj_seg'])   # ориентация — как есть (EXIF учтён)
     crop, conj, sclera = det['crop'], det['conj'], det['sclera']
     ts = tissue_status(crop, det)
     good = tuple(t for t in ('conj', 'sclera') if ts[t] == 'пригодна')

@@ -1,13 +1,16 @@
 """Скачивает и раскладывает датасеты в data/ (запускается в Colab: из облака Claude Kaggle закрыт).
 
     python scripts/fetch_data.py --eyes-defy                         # Kaggle harshwardhanfartale/eyes-defy-anemia
-    python scripts/fetch_data.py --cp-zip /content/drive/MyDrive/anemia/CP-AnemiC_dataset.zip
+    python scripts/fetch_data.py --cp-kaggle                         # CP-AnemiC V2: копия на Kaggle, сверка по sha1
+    python scripts/fetch_data.py --cp-zip CP-AnemiC_dataset.zip      # или исходный архив Mendeley m53vz6b7fx
 
 Результат: data/eyes_defy_anemia/{raw/, labels.csv}, data/cp_anemic/{images/, labels.csv}.
-Исходные архивы не изменяются.
+Исходные архивы не изменяются. Каждый файл сверяется по sha1 со списками scripts/eyes_defy.sha1 и
+scripts/cp_anemic_v2.sha1 (только имена и хэши, без меток): несовпадение — понятная ошибка, а не тихо другие данные.
 """
 import argparse
 import glob
+import hashlib
 import io
 import os
 import re
@@ -15,6 +18,49 @@ import shutil
 import zipfile
 
 import pandas as pd
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMEOUT = 600            # с на одну загрузку: сеть пропала — ошибка, а не вечное ожидание
+
+
+def read_sha1_list(name):
+    """scripts/<name>: строки «sha1 путь» или «имя sha1» → {путь: sha1}; # — комментарии."""
+    out = {}
+    for line in open(os.path.join(HERE, name), encoding='utf-8'):
+        line = line.strip()
+        if line and not line.startswith('#'):
+            a, b = line.split(' ', 1)
+            path, sha = (b, a) if re.fullmatch(r'[0-9a-f]{40}', a) else (a, b)
+            out[path] = sha
+    return out
+
+
+def sha1_file(path):
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_files(root, expected, what):
+    """Все файлы из списка есть в root и совпадают по sha1, иначе RuntimeError с первыми расхождениями."""
+    bad = [p for p, s in expected.items()
+           if not os.path.isfile(os.path.join(root, p)) or sha1_file(os.path.join(root, p)) != s]
+    if bad:
+        raise RuntimeError(f'{what}: {len(bad)} из {len(expected)} файлов нет или они другие (sha1), например '
+                           f'{bad[:3]} — источник изменился; данные не используются')
+    print(f'{what}: целостность проверена, {len(expected)} файлов совпали по sha1')
+
+
+def _download(url, path):
+    import urllib.request
+    if not os.path.exists(path):
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as r, open(path + '.part', 'wb') as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        os.replace(path + '.part', path)
+    return path
 
 
 # ------------------------------------------------------------------ Eyes-defy-anemia
@@ -88,12 +134,7 @@ def _download_eyes_defy(out):
         return kagglehub.dataset_download('harshwardhanfartale/eyes-defy-anemia')
     except Exception as e:                                    # нет kagglehub или api.kaggle.com закрыт прокси
         print(f'kagglehub недоступен ({type(e).__name__}), качаю zip напрямую')
-    import urllib.request
-    zpath = os.path.join(out, 'eyes_defy_anemia.zip')
-    if not os.path.exists(zpath):
-        urllib.request.urlretrieve(ED_URL, zpath + '.part')
-        os.replace(zpath + '.part', zpath)
-    return zpath
+    return _download(ED_URL, os.path.join(out, 'eyes_defy_anemia.zip'))
 
 
 def fetch_eyes_defy(out, zip_path=None):
@@ -103,6 +144,7 @@ def fetch_eyes_defy(out, zip_path=None):
         zipfile.ZipFile(src).extractall(raw)
     else:
         shutil.copytree(src, raw, dirs_exist_ok=True)
+    verify_files(raw, read_sha1_list('eyes_defy.sha1'), 'Eyes-defy-anemia')
     lab = eyes_defy_labels(raw)
     lab.to_csv(os.path.join(out, 'eyes_defy_anemia', 'labels.csv'), index=False)
     print(f'Eyes-defy-anemia: {len(lab)} пациентов, с Hb {lab.hb_g_dl.notna().sum()}, '
@@ -137,7 +179,38 @@ def fetch_cp_anemic(zip_path, out):
             f.write(zf.read(src))
         rows.append({'file': f'images/{r.File_Name}', 'hb_g_dl': float(r.Hb_g_dl), 'label': r.Folder_Label})
     pd.DataFrame(rows).to_csv(os.path.join(d, 'labels.csv'), index=False)
+    verify_files(d, {f'images/{k}': v for k, v in read_sha1_list('cp_anemic_v2.sha1').items()}, 'CP-AnemiC')
     print(f'CP-AnemiC: {len(rows)} фото')
+
+
+CP_KAGGLE = 'kritagyadev/cp-anemic-dataset-from-ghana'   # копия: 499 фото + лист Hb на 710 детей Ганы
+
+
+def fetch_cp_kaggle(out):
+    """CP-AnemiC V2 без ручной загрузки: публичная копия на Kaggle содержит все 251 снимок V2 байт-в-байт (сверка
+    по sha1 из scripts/cp_anemic_v2.sha1) и тот же Hb в листе Anemia_Data_Collection_Sheet.xlsx (проверено
+    2026-10-18: 251/251). Берутся только эти 251 снимок, в порядке листа V2 — манифест и фолды те же, что с
+    исходным архивом Mendeley. Условия CP-AnemiC: только академическое использование, с цитированием."""
+    zpath = _download(f'https://www.kaggle.com/api/v1/datasets/download/{CP_KAGGLE}',
+                      os.path.join(out, 'cp_anemic_kaggle.zip'))
+    zf = zipfile.ZipFile(zpath)
+    want = read_sha1_list('cp_anemic_v2.sha1')
+    pngs = {os.path.basename(n): n for n in zf.namelist() if n.lower().endswith('.png')}
+    xlsx = next(n for n in zf.namelist() if n.lower().endswith('.xlsx'))
+    tab = pd.read_excel(io.BytesIO(zf.read(xlsx))).set_index('IMAGE_ID')
+    d = os.path.join(out, 'cp_anemic')
+    os.makedirs(os.path.join(d, 'images'), exist_ok=True)
+    rows = []
+    for name in want:
+        if name not in pngs:
+            raise RuntimeError(f'CP-AnemiC: в копии на Kaggle нет {name} — источник изменился')
+        with open(os.path.join(d, 'images', name), 'wb') as f:
+            f.write(zf.read(pngs[name]))
+        r = tab.loc[os.path.splitext(name)[0]]
+        rows.append({'file': f'images/{name}', 'hb_g_dl': float(r.HB_LEVEL), 'label': r.REMARK})
+    verify_files(d, {f'images/{k}': v for k, v in want.items()}, 'CP-AnemiC')
+    pd.DataFrame(rows).to_csv(os.path.join(d, 'labels.csv'), index=False)
+    print(f'CP-AnemiC: {len(rows)} фото (копия Kaggle {CP_KAGGLE})')
 
 
 if __name__ == '__main__':
@@ -145,10 +218,13 @@ if __name__ == '__main__':
     ap.add_argument('--out', default=os.environ.get('ANEMIA_DATA', 'data'))
     ap.add_argument('--eyes-defy', action='store_true')
     ap.add_argument('--eyes-defy-zip', help='уже скачанный zip Eyes-defy (вместо Kaggle)')
-    ap.add_argument('--cp-zip')
+    ap.add_argument('--cp-zip', help='исходный архив CP-AnemiC (Mendeley m53vz6b7fx)')
+    ap.add_argument('--cp-kaggle', action='store_true', help='CP-AnemiC V2 из копии на Kaggle (без ручной загрузки)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if a.eyes_defy or a.eyes_defy_zip:
         fetch_eyes_defy(a.out, a.eyes_defy_zip)
     if a.cp_zip:
         fetch_cp_anemic(a.cp_zip, a.out)
+    elif a.cp_kaggle:
+        fetch_cp_kaggle(a.out)

@@ -7,6 +7,7 @@ import pytest
 from test_regions import CONJ, IRIS, SCLERA, SKIN, _noise, synthetic_eye
 
 import anemia.predict as P
+import anemia.segment_baseline as SB
 
 COLORS = {'skin': SKIN, 'sclera': SCLERA, 'iris': IRIS, 'conj': CONJ}
 
@@ -220,3 +221,55 @@ def test_upside_down_eye_with_dark_edge_refused():
     """Перевёрнутый кадр (веко над радужкой): маски на кожу не ставятся — отказ."""
     det = P._detect(np.ascontiguousarray(_dark_edge(_in_frame(0.5, at=(0.4, 0.5)))[::-1, ::-1]))
     assert not det['use'] and not det['conj'].any() and not det['sclera'].any()
+
+
+# ------------------------------------------------------------------ конъюнктива обученным сегментатором
+class _PosSeg:
+    """Сегментатор-заглушка: «конъюнктива» — заданные прямоугольники в долях кадра (по признакам положения x/w, y/h,
+    они стоят 4-м и 3-м с конца в segment_baseline.pixel_features)."""
+
+    def __init__(self, *boxes):
+        self.boxes = boxes
+
+    def predict_proba(self, X):
+        x, y = X[:, -4], X[:, -3]
+        p = np.zeros(len(X))
+        for y0, y1, x0, x1 in self.boxes:
+            p[(y >= y0) & (y < y1) & (x >= x0) & (x < x1)] = 1.0
+        return np.stack([1 - p, p], 1)
+
+
+def test_conj_part_touching_bottom_dropped():
+    """Часть «конъюнктивы» у нижнего края вырезки (ногти, пальцы, губы) отбрасывается, веко остаётся."""
+    crop = synthetic_eye()[0]
+    m = SB.conj_mask(_PosSeg((0.55, 0.75, 0.3, 0.7), (0.85, 1.0, 0.1, 0.3)), crop)
+    assert m.shape == crop.shape[:2]
+    rows = np.nonzero(m.any(1))[0]
+    assert rows.min() > 0.5 * crop.shape[0] and rows.max() < 0.8 * crop.shape[0]
+
+
+def test_eye_without_learned_conj_refused():
+    """Сегментатор века не нашёл → отказ целиком, «склера» без века не оценивается (была кожей щёк)."""
+    det = P._detect(synthetic_eye()[0])
+    assert det['use'] == {'conj', 'sclera'}
+    d = P.learned_conj(det, _PosSeg())
+    assert d['use'] == set() and not d['conj'].any() and not d['sclera'].any()
+    assert 'сегментатором' in d['notes'][-1]
+
+
+def test_learned_conj_trained_on_one_eye_finds_lid_of_another():
+    """Сегментатор, обученный на одном синтетическом глазу, на другом (сдвиг и масштаб) кладёт маску на веко:
+    маска — из сегментатора, а не из порогового поиска, и лежит на ткани века."""
+    img, _, conj = synthetic_eye()
+    seg = SB.fit_samples([SB.image_samples(img, conj > 0, 0)])
+    det = P.learned_conj(P._detect(_in_frame(0.5, at=(0.4, 0.45))), seg)
+    assert 'conj' in det['use'], det['notes']
+    assert _on_tissue(det['crop'], det['conj'], 'conj') > 0.9
+    assert _covered(det['crop'], det['conj'], 'conj') > 0.5
+
+
+def test_analyze_photo_needs_segmenter():
+    """Модель без сегментатора конъюнктивы (обучена старым кодом) → нет оценки, просьба перезапустить Я1."""
+    r = P.analyze_photo((synthetic_eye()[0] * 255).astype(np.uint8), bundle={'models': {'eyes_defy': {'title': 't'}}},
+                        landmarker=None)
+    assert r['status'] == 'unreliable' and r['stage'] == 'no_model' and r['risk'] is None
