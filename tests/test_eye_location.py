@@ -273,3 +273,30 @@ def test_analyze_photo_needs_segmenter():
     r = P.analyze_photo((synthetic_eye()[0] * 255).astype(np.uint8), bundle={'models': {'eyes_defy': {'title': 't'}}},
                         landmarker=None)
     assert r['status'] == 'unreliable' and r['stage'] == 'no_model' and r['risk'] is None
+
+
+def test_zoom_conj_finds_lid_on_eye_box_without_sclera():
+    """Глаз в части кадра, шаг 1 принял кадр целиком: повторный поиск века на рамке вокруг круга шага 1 находит
+    веко сегментатором (на ткани века), склеру не использует (её нечем проверить на такой рамке)."""
+    img, _, conj = synthetic_eye()
+    seg = SB.fit_samples([SB.image_samples(img, conj > 0, 0)])
+    frame = _in_frame(0.5, at=(0.4, 0.45))                  # радужка глаза — (480, 393), r 21 px кадра 1200×900
+    small = P.resize_max(frame, P.V12.DETECT_SIDE)
+    H, W = small.shape[:2]
+    crop = cv2.resize(small, (320, round(320 * H / W)), interpolation=cv2.INTER_AREA)
+    k = 320 / 1200
+    det = {'crop': crop, 'iris': (480 * k, 393 * k, 21 * k), 'eye': 'глаз крупным планом'}
+    z, log = P._zoom_conj(frame, det, seg, H, W)
+    assert z is not None, log
+    assert 'conj' in z['use'] and 'sclera' not in z['use'] and not z['sclera'].any()
+    assert _on_tissue(z['crop'], z['conj'], 'conj') > 0.9
+    assert all(x.startswith('рамка') for x in log)
+
+
+def test_diagnostics_in_result():
+    """В результате analyze_photo — диагностика по шагам (вырезка, маски, сегментатор, итог)."""
+    from test_core import _bundle
+    img = synthetic_eye()[0]
+    r = P.analyze_photo((img * 255).astype(np.uint8), bundle=_bundle(), landmarker=None)
+    assert r['diag'] and r['diag'][0].startswith('фото 400x300')
+    assert 'Диагностика:' in P.format_result(r)

@@ -487,23 +487,77 @@ def _detect(rgb, landmarker=None):
     return det
 
 
-def learned_conj(det, seg):
+def _seg_steps(seg, crop):
+    """Только для диагностики отказа: пиксели маски сегментатора после каждого шага SB.conj_mask (на кадре SEG_SIZE):
+    raw — порог 0,5 и морфология; без нижнего края; крупные части; минимальная площадь, ниже которой маска пуста."""
+    small = resize_max(np.ascontiguousarray(crop, np.float32), SB.SEG_SIZE)
+    m = SB._raw_mask(seg, SB.pixel_features(small), 0.5)
+    out = {'кадр': f'{small.shape[1]}x{small.shape[0]}', 'raw': int(m.sum())}
+    _, lab = cv2.connectedComponents(m.astype(np.uint8), connectivity=8)
+    bottom = np.unique(lab[-1])
+    m &= ~np.isin(lab, bottom[bottom > 0])
+    out['без нижнего края'] = int(m.sum())
+    out['крупные части'] = int(SB._largest_parts(m).sum())
+    out['мин. площадь'] = int(0.004 * m.size)
+    return out
+
+
+def learned_conj(det, seg, force=False):
     """Конъюнктива ядра — сегментатор по маскам врачей Eyes-defy (anemia.segment_baseline) на вырезке, где _detect
     нашёл глаз; та же функция даёт маски признаков обучения (scripts/evaluate.py core_features), поэтому признаки
     снимка совпадают с обучающими. Пороговая «конъюнктива» regions нужна только для поиска глаза: она захватывает
     склеру, кожу и пальцы (IoU с врачами ≈ 0,30, разовый замер). Сегментатор конъюнктиву не нашёл — её нет; затем ткани ещё раз
     проверяются на согласие с радужкой (_inconsistent). Конъюнктивы нет — отказ целиком: «склера» без вывернутого
     века не привязана к глазу надёжно (на фото проверки ею оказывалась кожа щёк при ложной «радужке»)."""
-    if not det['use'] or det['kind'] == 'вырезанная ткань':
+    if (not det['use'] and not force) or det['kind'] == 'вырезанная ткань':
         return det
-    conj = SB.conj_mask(seg, det['crop'])
+    conj, steps = SB.conj_mask(seg, det['crop']), _seg_steps(seg, det['crop'])
     d = dict(det, conj=conj, use=(set(det['use']) - {'conj'}) | ({'conj'} if conj.any() else set()),
-             notes=[n for n in det['notes'] if n != 'оценка по одной ткани'])
+             notes=[n for n in det['notes'] if n != 'оценка по одной ткани'], seg_steps=steps)
     if not conj.any():                      # без века оценки нет: «склера» без него бывает кожей (у Eyes-defy
         return _rejected(d, 'конъюнктива не найдена сегментатором (обучен на масках врачей): нижнее веко не '
                             'вывернуто или не в кадре — оттяните его вниз')   # веко находится на всех снимках)
     why = _inconsistent(d)
     return _rejected(d, why) if why else d
+
+
+ZOOM_CONJ_BOXES = (   # рамки повторного поиска века: (название, доли «радиуса» найденного круга влево/вправо, вверх, вниз)
+    ('по контуру глаза', 1.2, 0.8, 1.0),   # круг шага 1 бывает всем контуром глаза (r в 3 раза больше радужки)
+    ('по радужке', None, None, None),      # круг — радужка: рамка глаза _iris_box
+)
+
+
+def _zoom_conj(rgb, det, seg, H, W):
+    """Повторный поиск века на рамке вокруг глаза, найденного шагом 1 во весь кадр. Сегментатор века обучен на
+    крупных планах Eyes-defy (глаз во весь кадр); его признаки пикселей зависят от кадра (баланс «серый мир» и
+    яркость по всему кадру, положение пикселя), и когда глаз занимает треть кадра, а остальное — кожа и пальцы,
+    веко он не находит. Рамка вырезается из исходного фото (_analyze_box), обе ткани ищутся в ней заново, так что
+    маски и вырезка в одних координатах; проверки те же (learned_conj → _inconsistent), пороги не меняются.
+    Склера здесь не используется (оценка по конъюнктиве): радиус радужки на такой рамке неизвестен, и пороговая
+    «склера» на фото проверки ложилась на кожу у края рамки.
+    → (результат с веком или None, строки диагностики)."""
+    k = W / det['crop'].shape[1]                     # вырезка шага 1 → кадр DETECT_SIDE
+    cx, cy, r = (v * k for v in det['iris'])
+    scale = rgb.shape[1] / W
+    log = []
+    for name, a, up, down in ZOOM_CONJ_BOXES:
+        box = _iris_box((cx, cy, r), H, W) if a is None else (cx - a * r, cy - up * r, cx + a * r, cy + down * r)
+        box = (max(0, box[0]), max(0, box[1]), min(W, box[2]), min(H, box[3]))
+        x0, y0, x1, y1 = (int(round(v * scale)) for v in box)
+        if x1 - x0 < 40 or y1 - y0 < 40:
+            log.append(f'рамка {name}: меньше 40 px — пропуск')
+            continue
+        z = learned_conj(_analyze_box(rgb, scale, box, (cx, cy, r), 'глаз в части кадра'), seg, force=True)
+        ok = 'conj' in z['use']
+        if ok and 'sclera' in z['use']:   # масштаб глаза неизвестен (круг — контур глаза или радужка): проверить
+            z = dict(z, sclera=np.zeros_like(z['sclera']), use=z['use'] - {'sclera'},   # «склеру» нечем, на
+                     notes=z['notes'] + ['склера на рамке повторного поиска не используется: её нечем проверить'])
+        log.append(f"рамка {name}: x {x0}–{x1}, y {y0}–{y1} px фото; сегментатор {z.get('seg_steps')}; "
+                   + ('веко принято' if ok else 'отказ: ' + (z['notes'][-1] if z['notes'] else 'тканей нет')))
+        if ok:
+            z['eye'] = f"{det['eye']}; веко найдено на рамке {name}"
+            return z, log
+    return None, log
 
 
 def _small_irises(img):
@@ -600,7 +654,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
          'model': B['title'], 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
-         'sclera': None, 'disclaimer': DISCLAIMER}
+         'sclera': None, 'disclaimer': DISCLAIMER, 'diag': []}
     try:
         rgb = load_photo(photo)
     except PhotoError as e:
@@ -621,7 +675,22 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
         r['issues'].append('в файле модели нет сегментатора конъюнктивы (модель старше кода) — перезапустите ячейку Я1 '
                            '(python scripts/train_core.py)')
         return r
-    det = learned_conj(_detect(rgb, lm), bundle['conj_seg'])   # ориентация — как есть (EXIF учтён)
+    img_hw = resize_max(rgb, V12.DETECT_SIDE).shape[:2]
+    det0 = _detect(rgb, lm)                 # ориентация — как есть (EXIF учтён)
+    det = learned_conj(det0, bundle['conj_seg'])
+    diag = [f'фото {rgb.shape[1]}x{rgb.shape[0]} px; поиск глаза: {det0["eye"] or "не найден"}; вырезка '
+            f'{det0["crop"].shape[1]}x{det0["crop"].shape[0]} px (сторона источника {det0["src_side"]} px); радужка '
+            + (str(tuple(round(v) for v in det0['iris'])) if det0.get('iris') is not None else 'нет'),
+            f'поиск тканей (пороги): {sorted(det0["use"]) or "ничего"}; конъюнктива {int(det0["conj"].sum())} px, '
+            f'склера {int(det0["sclera"].sum())} px; заметки: {det0["notes"] or "-"}',
+            'сегментатор века на вырезке: ' + (str(det['seg_steps']) if 'seg_steps' in det else
+                                               'не запускался (тканей нет или вырезка ткани)')]
+    if ('conj' not in det['use'] and det0['kind'] != 'вырезанная ткань' and det0['eye'] is not None
+            and det0.get('iris') is not None and det0['src_side'] == max(img_hw)):
+        z, log = _zoom_conj(rgb, det0, bundle['conj_seg'], *img_hw)
+        diag += log
+        det = z or det
+    r['diag'] = diag
     crop, conj, sclera = det['crop'], det['conj'], det['sclera']
     ts = tissue_status(crop, det)
     good = tuple(t for t in ('conj', 'sclera') if ts[t] == 'пригодна')
@@ -637,6 +706,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
         return r
     found = [det[t] for t in ('conj', 'sclera') if t in det['use']]
     whole = quality(crop, found[0], found[-1] if len(found) > 1 else np.zeros_like(found[0]), det['src_side'])
+    r['diag'].append(f'QC: {ts}; общая проверка качества: {whole or "пройдена"}')
     if not good or whole:                   # проверка всех найденных тканей вместе — как раньше, не слабее
         r['stage'] = 'quality'
         r['issues'] = whole + [f'{TISSUE_RU[t]}: {v}' for t, v in ts.items() if v != 'пригодна']
@@ -725,6 +795,8 @@ def format_result(r):
     else:
         lines += [f'Проблема: {x}' for x in r['issues']]
     lines += [f'Примечание: {x}' for x in r['notes']]
+    if r.get('diag'):
+        lines += ['Диагностика:'] + [f'  {x}' for x in r['diag']] + [f"  итог: {r['status']} / этап {r['stage']}"]
     lines.append(r['disclaimer'])
     return '\n'.join(lines)
 
