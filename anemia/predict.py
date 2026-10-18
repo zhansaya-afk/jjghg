@@ -148,7 +148,20 @@ FACE_MODEL_URL = ('https://storage.googleapis.com/mediapipe-models/face_landmark
                   'face_landmarker.task')
 EYE_SMALL = 0.075        # радиус радужки меньше этой доли короткой стороны кадра — глаз мелкий, вырезаем его
 IRIS_MIN_R = 0.012       # самая мелкая радужка, которую ищем (доля короткой стороны кадра 1024 px → ≥ 6 px)
+IRIS_SCLERA_L = 0.6      # мелкая радужка: L* внутри ≤ 0,6 L* склеры (у глаза на фото проверки 0,37–0,40; без размеченных данных)
+SCLERA_LID_MARGIN = 1.0  # склера не дальше 1 r в сторону за край вывернутого века (конъюнктивы)
+SCLERA_KEEP_R = 1.8      # ближе 1,8 r к центру радужки склеру по этому правилу не режем
+IRIS_SHIFT = 1.0         # уточнение мелкой радужки сдвигает центр не дальше 1 радиуса
+SMALL_IRIS_TRIES = 3     # сколько тёмных пятен проверить как «мелкую радужку» (по убыванию контраста края)
 ZOOM_MAX_AREA = 0.5     # рамка вокруг радужки — меньше половины кадра, иначе это уже крупный план
+CONJ_SPREAD_MAX = 5.0    # части «конъюнктивы» дальше друг от друга (в радиусах радужки) — это не одно веко
+CONJ_SPREAD_MAX_SEEN = 3.7   # максимум на 211 снимках Eyes-defy с радужкой (2026-10-18), запас ×1,35
+SCLERA_AREA_MAX = 1.4    # площадь «склеры» в площадях радужки (π r²); выше — кожа/фон вокруг ложной радужки
+SCLERA_AREA_MAX_SEEN = 1.15  # максимум на 192 снимках Eyes-defy со склерой
+CONJ_FRAC_NO_IRIS = 0.05 # без радужки «конъюнктива» должна занимать ≥ 5% кадра (крупный план века)
+CONJ_FRAC_NO_IRIS_SEEN = 0.098  # минимум у 5 снимков Eyes-defy без радужки
+CONJ_DY_MIN = -2.5       # центр «конъюнктивы» выше центра радужки больше чем на 2,5 r — не нижнее веко
+CONJ_DY_MIN_SEEN = -2.0  # минимум на 211 снимках Eyes-defy (там «радужкой» бывает и не радужка)
 IRIS_CONTRAST = 20       # мелкую радужку принимаем, только если её край в 2 раза контрастнее, чем при обучении (10)
 _FACE = {}
 
@@ -192,6 +205,52 @@ def _analyze_box(rgb, scale, box, iris, kind):
     cv2.setRNGSeed(0)
     r = R._analyze_crop(crop, True, True, iris=ir, kind=kind)
     r['src_side'] = max(x1 - x0, y1 - y0)
+    return _trim_to_eye(r) if ir is not None else r
+
+
+def _trim_to_eye(r):
+    """Рамка глаза (не весь кадр, путь обучения не трогается): из масок убирается то, что анатомически не может
+    быть тканью этого глаза.
+    1) Части масок целиком выше центра радужки: нижнее веко и видимая склера доходят до линии центра радужки
+       (уголки глаза на её уровне); целиком выше — верхнее веко, ресницы, кожа.
+    2) Склера сбоку дальше вывернутого века: веко с конъюнктивой тянется под всей глазной щелью, поэтому склера
+       не выходит за его края больше чем на SCLERA_LID_MARGIN r. Пиксели ближе SCLERA_KEEP_R r к центру радужки
+       не трогаются: склера, прилегающая к радужке, остаётся всегда, даже если конъюнктива найдена не целиком.
+    Правила — по форме и положению, без порогов цвета; у Eyes-defy (если бы применялись) правило 2 задело бы
+    5 снимков из 192 и убрало бы не больше 29% склеры."""
+    cx, cy, ri = r['iris']
+    new = {}
+    for t in ('conj', 'sclera'):
+        m = r[t]
+        if t not in r['use'] or not m.any():
+            continue
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
+        up = [i for i in range(1, n) if st[i, cv2.CC_STAT_TOP] + st[i, cv2.CC_STAT_HEIGHT] < cy]
+        if up:
+            new[t] = (m & ~np.isin(lab, up), 'убраны участки выше центра радужки (веко, кожа)')
+    conj = new['conj'][0] if 'conj' in new else r['conj']
+    scl, why_s = new.get('sclera', (r['sclera'], ''))
+    if 'conj' in r['use'] and conj.any() and 'sclera' in r['use'] and scl.any():
+        xs = np.nonzero(conj)[1]
+        h, w = scl.shape
+        yy, xx = np.ogrid[0:h, 0:w]
+        side = (xx < xs.min() - SCLERA_LID_MARGIN * ri) | (xx > xs.max() + SCLERA_LID_MARGIN * ri)
+        out = scl & side & (np.hypot(xx - cx, yy - cy) > SCLERA_KEEP_R * ri)
+        if out.any():
+            scl = scl & ~out
+            why_s = '; '.join(x for x in (why_s, f'убрано {out.sum()} px сбоку за краем века (кожа у уголка глаза)') if x)
+            new['sclera'] = (scl, why_s)
+    if not new:
+        return r
+    maps = R.color_maps(r['crop'])
+    for t, (m, note) in new.items():
+        ok, why = (R.check_conj(maps, m, sclera=scl) if t == 'conj' else R.check_sclera(maps, m, conj))
+        r[t] = m if ok else np.zeros_like(m)
+        r['notes'] = list(r['notes']) + [f'{TISSUE_RU[t]}: {note}']
+        if not ok:
+            r['use'] = r['use'] - {t}
+            r['notes'].append(why)
+    r['score'] = (2.0 if 'conj' in r['use'] else 0) + (1.0 if 'sclera' in r['use'] else 0) + 0.1
     return r
 
 
@@ -203,55 +262,201 @@ def _iris_box(iris, H, W):
 
 
 def _zoom(rgb, scale, det, iris, H, W, how):
-    """Разобрать рамку вокруг радужки. Принимается, только если рядом с радужкой нашлась склера (иначе тёмный
-    круг мог быть чем угодно: логотип, ноздря) и пригодных тканей больше, чем во всём кадре."""
+    """Разобрать рамку вокруг радужки. Тёмный круг в части кадра может быть чем угодно (ноздря, щель между
+    пальцами, край волос), поэтому рамка принимается, только если глаз подтверждён целиком: найдены обе ткани,
+    они складываются в один глаз (_inconsistent), радужка намного темнее склеры (_dark_iris) и вывернутое веко
+    лежит под радужкой (_lid_under_iris). Иначе — отказ, а не догадка."""
     box = _iris_box(iris, H, W)
     if box[2] - box[0] < 20 or box[3] - box[1] < 20 or (box[2] - box[0]) * (box[3] - box[1]) > ZOOM_MAX_AREA * H * W:
         return None
+    iris = _refine_iris(rgb, scale, box, iris)
+    box = _iris_box(iris, H, W)
     z = _analyze_box(rgb, scale, box, iris, 'глаз в части кадра')
-    if 'sclera' in z['use'] and len(z['use']) > len(det['use']):
+    if z['use'] == {'conj', 'sclera'} and not _inconsistent(z) and _dark_iris(z) and _lid_under_iris(z):
         z['eye'] = how
         return z
     return None
+
+
+def _refine_iris(rgb, scale, box, iris):
+    """Уточнить мелкую радужку по рамке в полном разрешении: в уменьшенном кадре её центр бывает сдвинут на
+    радиус (тогда зона поиска склеры съезжает на кожу у уголка глаза). Локальный перебор центра (до ±IRIS_SHIFT r)
+    и радиуса (×0,75–1,25) по тому же контрасту края, что у find_iris. -> (cx, cy, r) в координатах кадра."""
+    x0, y0, x1, y1 = (int(round(v * scale)) for v in box)
+    crop = R._prepare(rgb[y0:y1, x0:x1])
+    s = crop.shape[1] / (x1 - x0)
+    maps = R.color_maps(crop)
+    L = cv2.GaussianBlur(maps['L'], (0, 0), 1.5)
+    cx0, cy0, r0 = (iris[0] * scale - x0) * s, (iris[1] * scale - y0) * s, iris[2] * scale * s
+    best = (R._iris_score(L, maps['C'], cx0, cy0, r0), cx0, cy0, r0)
+    for step in (0.2, 0.1, 0.05):
+        _, bx, by, br = best
+        for dx in np.arange(-3, 4) * step * r0:
+            for dy in np.arange(-3, 4) * step * r0:
+                for k in (0.9, 1.0, 1.1):
+                    x, y, r = bx + dx, by + dy, float(np.clip(br * k, 0.75 * r0, 1.25 * r0))
+                    if np.hypot(x - cx0, y - cy0) > IRIS_SHIFT * r0:
+                        continue
+                    sc = R._iris_score(L, maps['C'], x, y, r)
+                    if sc > best[0]:
+                        best = (sc, x, y, r)
+    _, x, y, r = best
+    return ((x / s + x0) / scale, (y / s + y0) / scale, r / s / scale)
+
+
+def _lid_under_iris(z):
+    """Вывернутое нижнее веко (конъюнктива) лежит под радужкой: по горизонтали проходит под её центром,
+    а его середина ниже центра радужки. Губы, щель между пальцами рядом с ложной «радужкой» так не лежат."""
+    cx, cy, _ = z['iris']
+    ys, xs = np.nonzero(z['conj'])
+    return bool(len(xs)) and xs.min() <= cx <= xs.max() and ys.mean() > cy
+
+
+def _dark_iris(z):
+    """Радужка — отдельное тёмное пятно, а не край тёмной области:
+    1) L* внутри круга ≤ IRIS_SCLERA_L × L* склеры (у ноздри или тени рядом «склера» — кожа, разница меньше);
+    2) сразу под радужкой (1,15–1,6 r, в пределах её ширины) — склера или веко: светлее середины между радужкой
+       и склерой. Прядь волос, край одежды продолжаются вниз тем же тёмным."""
+    L = R.color_maps(z['crop'])['L']
+    h, w = L.shape
+    cx, cy, r = z['iris']
+    yy, xx = np.ogrid[0:h, 0:w]
+    inside = np.hypot(xx - cx, yy - cy) < 0.9 * r
+    below = (np.abs(xx - cx) < 0.5 * r) & (yy > cy + 1.15 * r) & (yy < cy + 1.6 * r)
+    if not inside.any() or not below.any():
+        return False
+    li, ls = np.median(L[inside]), np.median(L[z['sclera']])
+    return li <= IRIS_SCLERA_L * ls and np.median(L[below]) >= (li + ls) / 2
+
+
+def conj_spread(conj, r):
+    """Разброс частей маски конъюнктивы: расстояние между крайними центрами компонент в радиусах радужки."""
+    c = cv2.connectedComponentsWithStats(conj.astype(np.uint8), 8)[3][1:]
+    return float(np.hypot(*(c.max(0) - c.min(0))) / r) if len(c) > 1 else 0.0
+
+
+def _inconsistent(d):
+    """Причина, по которой найденные ткани не складываются в один глаз, или ''. Правила:
+    1) только «склера», без радужки и без конъюнктивы (не вырезка): привязать её к глазу нечем — светлым бывает
+       лоб, щека, стена (у Eyes-defy такого нет ни разу: без радужки всегда есть конъюнктива);
+       и то же для «конъюнктивы» меньше CONJ_FRAC_NO_IRIS кадра: без радужки принимаем только крупный план века;
+    2) «склера» больше SCLERA_AREA_MAX площадей радужки (кожа или фон вокруг ложной «радужки»), если при этом
+       радужка не подтверждена как глаз (_dark_iris и веко под ней): широко открытый глаз может дать и больше;
+    3) центр «конъюнктивы» выше центра радужки больше чем на -CONJ_DY_MIN радиуса (это не нижнее веко);
+    4) части «конъюнктивы» разнесены дальше CONJ_SPREAD_MAX радиусов радужки (веко и губы, веко и ноздря).
+    Пороги — с запасом за пределами всех 216 снимков Eyes-defy (путь обучения ими не задевается)."""
+    if d.get('iris') is None:
+        if d.get('kind') == 'вырезанная ткань':
+            return ''
+        if d['use'] == {'sclera'}:
+            return ('найдена только светлая область без радужки и без конъюнктивы: нельзя проверить, что это склера '
+                    'глаза, а не кожа или фон')
+        if 'conj' in d['use'] and d['conj'].mean() < CONJ_FRAC_NO_IRIS:
+            return (f'радужка не найдена, а «конъюнктива» занимает {d["conj"].mean():.0%} кадра: это не крупный план '
+                    f'века (у таких снимков Eyes-defy ≥ {CONJ_FRAC_NO_IRIS_SEEN:.0%}), нельзя проверить, что это веко')
+        return ''
+    _, cy, r = d['iris']
+    if (d['sclera'] is not None and d['sclera'].sum() > SCLERA_AREA_MAX * np.pi * r * r
+            and not (d.get('crop') is not None and _dark_iris(d) and d['conj'] is not None and _lid_under_iris(d))):
+        return (f'«склера» в {d["sclera"].sum() / (np.pi * r * r):.1f} раза больше радужки (у снимков глаза не больше '
+                f'{SCLERA_AREA_MAX_SEEN}): это кожа или фон, а найденная «радужка» — не радужка')
+    if d['conj'] is None or not d['conj'].any():
+        return ''
+    dy = (np.nonzero(d['conj'])[0].mean() - cy) / r
+    if dy < CONJ_DY_MIN:
+        return (f'«конъюнктива» выше радужки ({-dy:.1f} её радиуса; у снимков глаза не выше {-CONJ_DY_MIN_SEEN}): '
+                f'это не нижнее веко')
+    k = conj_spread(d['conj'], r)
+    if k > CONJ_SPREAD_MAX:
+        return (f'«конъюнктива» — несколько областей далеко друг от друга ({k:.1f} радиуса радужки, у снимков глаза '
+                f'не больше {CONJ_SPREAD_MAX_SEEN}): это не одно веко, ткани не связаны с глазом надёжно')
+    return ''
+
+
+def _rejected(d, why):
+    """Тот же результат, но без тканей: лучше отказ, чем маска не на глазу."""
+    d = dict(d, conj=np.zeros_like(d['conj']), sclera=np.zeros_like(d['sclera']), use=set(), score=0.0)
+    d['notes'] = list(d['notes']) + [why]
+    return d
 
 
 def _detect(rgb, landmarker=None):
     """Глаз по шагам → результат regions (crop, conj, sclera, use, notes, kind, src_side) + eye — как найден глаз
     (None — не найден).
     1) Весь кадр — ровно как при обучении (все снимки Eyes-defy проходят этим путём, признаки совпадают).
-       Обе ткани нашлись или это вырезанная ткань → готово.
+       Обе ткани нашлись, они складываются в один глаз (_inconsistent) или это вырезанная ткань → готово.
+       Не складываются (например, «конъюнктива» на веке и на губах) → весь кадр и его «радужку» не используем.
     2) Иначе MediaPipe ищет лицо; нашёл и глаз не во весь кадр → рамки глаз по точкам лица. Если в кадре была
-       крупная радужка, рамки берутся, только если в них нашлась склера и пригодных тканей больше (на крупных
-       планах MediaPipe иногда «видит» лицо, которого нет).
-    3) Крупная радужка была → результат шага 1 (радужку, найденную во всём кадре, для приближения не используем:
-       на крупных планах ею бывает зрачок).
-    4) Ни радужки, ни лица → ищем мелкую радужку с надёжной (вдвое контрастнее обычного) границей и разбираем рамку
-       вокруг неё; берём, только если рядом нашлась склера и пригодных тканей больше, чем во всём кадре."""
+       надёжная крупная радужка, рамки берутся, только если в них нашлась склера и пригодных тканей больше (на
+       крупных планах MediaPipe иногда «видит» лицо, которого нет).
+    3) Надёжная крупная радужка была → результат шага 1 (радужку, найденную во всём кадре, для приближения не
+       используем: на крупных планах ею бывает зрачок).
+    4) Иначе ищем мелкую радужку с надёжной (вдвое контрастнее обычного) границей и разбираем рамку вокруг неё;
+       берём, только если рядом нашлась склера и пригодных тканей больше, чем во всём кадре.
+    Любой результат с тканями, которые не складываются в один глаз, заменяется отказом (_rejected)."""
     img = resize_max(rgb, V12.DETECT_SIDE)
     H, W = img.shape[:2]
     scale = rgb.shape[1] / W
     cv2.setRNGSeed(0)                       # GrabCut случаен: тот же сид, что при обучении (evaluate._v12_compute)
     det = detect_regions(img, 'both')
     det['eye'] = 'глаз крупным планом' if det['iris'] is not None else 'весь кадр' if det['use'] else None
-    if det['use'] == {'conj', 'sclera'} or det['kind'] == 'вырезанная ткань':
+    bad = _inconsistent(det)
+    if bad:
+        det = _rejected(det, bad)
+        det['eye'] = None
+    big_iris = det['iris'] is not None and not bad
+    if not bad and (det['use'] == {'conj', 'sclera'} or det['kind'] == 'вырезанная ткань'):
         return det
     faces = R.face_eye_crops(img, landmarker) if landmarker else []
     if faces and max(c['box'][2] - c['box'][0] for c in faces) <= 0.5 * W:
         best = None
         for c in faces:
             r = _analyze_box(rgb, scale, c['box'], c['iris'], c['how'])
+            why = _inconsistent(r)
+            r = _rejected(r, why) if why else r
             if best is None or r['score'] > best['score']:
                 best = r
         best['eye'] = 'лицо в кадре, глаз по точкам MediaPipe'
-        if det['iris'] is None or ('sclera' in best['use'] and len(best['use']) > len(det['use'])):
+        if not big_iris or ('sclera' in best['use'] and len(best['use']) > len(det['use'])):
             return best                      # лицо целиком: остальной кадр не разбираем (губы, нос — не ткани)
-    if det['iris'] is not None:
+    if big_iris:
         return det                           # крупная радужка есть: снимок как обучающие, ничего не угадываем
-    iris, con = R.find_iris(img, min_r=IRIS_MIN_R, max_r=EYE_SMALL, min_contrast=IRIS_CONTRAST, with_score=True)
-    if iris is None or iris[2] > EYE_SMALL * min(H, W):     # тёмное пятно крупнее «мелкой радужки» — не она
-        return det
-    z = _zoom(rgb, scale, det, iris, H, W, f'мелкая радужка r={iris[2] * scale:.0f} px, контраст края {con:.0f}')
-    return z or det
+    for iris, con in _small_irises(img)[:SMALL_IRIS_TRIES]:
+        z = _zoom(rgb, scale, det, iris, H, W, f'мелкая радужка r={iris[2] * scale:.0f} px, контраст края {con:.0f}')
+        if z:
+            return z
+    return det
+
+
+def _small_irises(img):
+    """Кандидаты в мелкую радужку [((cx, cy, r), контраст края)], лучшие первыми. Окружности Хафа всех трёх
+    порогов (find_iris останавливается на первом пороге, где нашлись хоть какие-то окружности, и при сдвиге или
+    отражении кадра радужку пропускает) + ответ find_iris. Радужка с надёжным краем (IRIS_CONTRAST) и целиком в
+    кадре с запасом 1,5 r: мелкий глаз помещается в кадр, а у края тёмными бывают волосы, тень, угол."""
+    H, W = img.shape[:2]
+    side = min(H, W)
+    maps = R.color_maps(img)
+    L = cv2.GaussianBlur(maps['L'], (0, 0), 1.5)
+    u8 = np.clip(L * 2.55, 0, 255).astype(np.uint8)
+    cands = []
+    for p2 in (30, 22, 16):
+        c = cv2.HoughCircles(u8, cv2.HOUGH_GRADIENT, dp=1.5, minDist=side / 6, param1=60, param2=p2,
+                             minRadius=int(IRIS_MIN_R * side), maxRadius=int(EYE_SMALL * side))
+        cands += [] if c is None else [tuple(float(v) for v in x) for x in c[0][:8]]
+    best = R.find_iris(img, maps, min_r=IRIS_MIN_R, max_r=EYE_SMALL, min_contrast=IRIS_CONTRAST)
+    cands += [best] if best else []
+    out = []
+    for cx, cy, r in cands:
+        if min(cx, cy, W - cx, H - cy) <= 1.5 * r or r > EYE_SMALL * side:
+            continue
+        if any(np.hypot(cx - o[0][0], cy - o[0][1]) < 0.5 * max(r, o[0][2]) for o in out):
+            continue                                    # та же окружность с другого порога
+        con = R._iris_score(L, maps['C'], cx, cy, r)
+        if con > IRIS_CONTRAST:
+            central = 1 - min(1, np.hypot((cx - W / 2) / W, (cy - H / 2) / H) * 1.2)
+            out.append(((cx, cy, r), con, con * (0.5 + central)))
+    out.sort(key=lambda o: -o[2])
+    return [(i, c) for i, c, _ in out]
 
 
 def tissue_status(crop, det):
