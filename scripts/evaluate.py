@@ -345,13 +345,13 @@ def v12_features(root, df, jobs, cache=NO_CACHE, timer=None, stage='призна
     return F, S
 
 
-def run_core(root, df, jobs, cache=NO_CACHE, timer=None):
-    ds = df.dataset.iloc[0]
+def run_core(root, df, jobs, cache=NO_CACHE, timer=None, key=None):
+    key = key or df.dataset.iloc[0]
     F, S = v12_features(root, df, jobs, cache, timer, 'core')
-    F = CORE.usable(F)
-    feats = CORE.feature_list(F.columns, ds)
+    F = CORE.usable(F, key)
+    feats = CORE.feature_list(F.columns, key)
     S = S[S.group.isin(set(F.group))]
-    O, SP = CORE.cross_validate(F, feats, ds, S)
+    O, SP = CORE.cross_validate(F, feats, key, S)
     r = CORE.core_metrics(O, SP)
     r['target_sens'] = CORE.SENS_TARGET
     return r, O, len(df) - O.group.nunique()
@@ -485,14 +485,13 @@ def main():
         if not len(df):
             continue
         if a.task == 'core':
-            if ds not in CORE.SPECS:
-                continue
-            print(f'[{time.time() - t0:5.0f} с] {ds}: ядро HemaVision, {len(df)} снимков...')
-            r, O, n_skip = run_core(a.data, df, a.jobs, cache, timer)
-            rows.append({'task': 'core', 'dataset': ds,
-                         'method': 'core · 3 уровня риска' + (f' (−{n_skip})' if n_skip else ''), **r})
-            save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens'],
-                     f'oof_{a.tag}_{ds}_core.csv', run_dir, res_dir, backup_dir)
+            for key in CORE.specs_for(ds):   # у взрослых — модель на каждый набор тканей, одни и те же фолды
+                print(f'[{time.time() - t0:5.0f} с] {key}: ядро HemaVision, {len(df)} снимков...')
+                r, O, n_skip = run_core(a.data, df, a.jobs, cache, timer, key)
+                rows.append({'task': 'core', 'dataset': key,
+                             'method': 'core · 3 уровня риска' + (f' (−{n_skip})' if n_skip else ''), **r})
+                save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens'],
+                         f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
             continue
         if a.task in ('all', 'v12'):
             print(f'[{time.time() - t0:5.0f} с] {ds}: модель v12, {len(df)} снимков...')
