@@ -8,7 +8,8 @@ description: Единственный источник цифр точности
 Цифры точности — только отсюда. Нет прогона `scripts/evaluate.py` → нет цифры.
 
 1. `python -m pytest -q`, показать вывод. Красные тесты → сначала чинить.
-2. `python scripts/evaluate.py --data <dir> --tag <этап>_<что_менялось>` (наборы: `--dataset eyes_defy|cp_anemic|phone`,
+2. `python scripts/evaluate.py --data <dir> --tag <этап>_<что_менялось>` (наборы: `--dataset eyes_defy|phone`; CP-AnemiC исключён 2026-10-19;
+   внешняя проверка Индия ↔ Италия — `--task country`;
    по умолчанию все из `<dir>/manifest.csv`). Смоук — `--no-history`. Eyes-defy в облаке Claude недоступен →
    написать команде, какие ячейки `notebooks/colab_train.ipynb` запустить, и ждать вывод.
 3. Разбиение — фиксированные фолды манифеста (StratifiedGroupKFold по пациенту); порог и калибровка — только внутри обучающих фолдов.

@@ -43,7 +43,8 @@ def _synthetic(n=80, seed=0):
 def test_feature_list_by_dataset():
     cols = ['c_a', 's_a', 'w_a', 'male', 'group']
     assert CORE.feature_list(cols, 'eyes_defy') == ['c_a', 's_a', 'w_a', 'male']
-    assert CORE.feature_list(cols, 'cp_anemic') == ['c_a']
+    assert CORE.feature_list(cols, 'eyes_defy_conj') == ['c_a', 'male']
+    assert 'cp_anemic' not in CORE.SPECS                 # CP-AnemiC исключён 2026-10-19
 
 
 def test_fit_core_thresholds_and_hb_rule():
@@ -130,8 +131,8 @@ def test_analyze_photo_contract():
     else:
         assert r['risk'] in CORE.RISK_LEVELS
     assert isinstance(PR.format_result(r), str)
-    with pytest.raises(KeyError):
-        PR.analyze_photo(img, age=2, bundle=B)    # модели детей в этом наборе нет
+    kid = PR.analyze_photo(img, age=2, bundle=B)    # детской модели нет: отказ, а не модель взрослых
+    assert kid['status'] == 'unreliable' and kid['stage'] == 'age' and kid['risk'] is None
 
 
 # ------------------------------------------------------------------ анализ крови

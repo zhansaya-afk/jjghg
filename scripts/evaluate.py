@@ -2,7 +2,7 @@
 и в <data>/results/metrics_history.csv (вне git: не теряется при обновлении репозитория в Colab).
 
     python scripts/evaluate.py --data data --tag baseline_v11            # всё, что есть в манифесте
-    python scripts/evaluate.py --task hb --dataset cp_anemic --model ridge
+    python scripts/evaluate.py --task hb --dataset eyes_defy --model ridge
 
 Задачи:
   seg  — baseline-сегментация v11 (Eyes-defy): IoU/Dice с масками врачей на невиданных пациентах.
@@ -12,10 +12,16 @@
          у которых ответ «анемия да/нет» меняется в 8 стресс-условиях.
   hb   — Hb по цвету конъюнктивы: MAE, Bland–Altman, AUC, чувствительность/специфичность при пороге,
          подобранном внутри обучающих фолдов, стресс-тест «другой свет».
-         Маска: CP-AnemiC — весь вырез; Eyes-defy — маска врача (потолок) и маска baseline-сегментации.
+         Маска: Eyes-defy — маска врача (потолок) и маска baseline-сегментации; без масок врача — весь кадр.
   core — ядро HemaVision (anemia/core.py, то же, что обучает scripts/train_core.py): риск низкий/средний/высокий
          по двум порогам P(анемия), Hb (экспериментально), OOD; все пороги — вложенной CV на обучающих фолдах.
          Только явно: --task core (в --task all не входит). Признаки — те же, что у v12 (общий кэш).
+  country — внешняя проверка ядра внутри Eyes-defy: обучение на всех пациентах Индии → тест на всех пациентах
+         Италии и наоборот; сегментатор, модель, пороги и OOD обучаются только на стране обучения. Плюс базовая
+         модель «всегда частый класс страны обучения». Только явно: --task country. Ограничения — CLAUDE.md, «Как устроена оценка».
+Для каждого бинарного ответа «анемия» (положительный класс — анемия по ВОЗ): матрица ошибок TP/FP/FN/TN,
+accuracy, precision (PPV), recall (= чувствительность), специфичность, NPV (ДИ Уилсона), F1 и сбалансированная
+точность двух классов (бутстрэп-ДИ по пациентам); не определённая метрика (нулевой знаменатель) — «—», не 0.
 Все метрики — по фиксированным фолдам манифеста (по пациенту). OOF-предсказания → <data>/results/.
 
 Каждый запуск получает ID и свою папку <data>/results/runs/<run_id>/ (run.json: коммит, параметры, время,
@@ -50,6 +56,7 @@ from anemia.cache import TIMING_KEYS, FeatureCache, empty_timings, file_sha1, so
 from anemia.features import N_RELIGHT, WORK_SIZE, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
 from anemia.io import load_rgb  # noqa: E402
+from anemia.labs import is_pregnant  # noqa: E402
 from anemia.regions import detect_regions  # noqa: E402
 
 HISTORY = os.path.join(ROOT, 'results', 'metrics_history.csv')
@@ -58,7 +65,9 @@ HIST_COLS = ['timestamp', 'commit', 'tag', 'task', 'dataset', 'method', 'n',
              'target_sens', 'sens', 'sens_lo', 'sens_hi', 'spec', 'spec_lo', 'spec_hi',
              'n_hb100', 'sens_hb100', 'light_med', 'light_p90',
              'iou_mean', 'iou_lo', 'iou_hi', 'iou_median', 'dice_mean', 'found',
-             'bal_acc', 'bal_acc_lo', 'bal_acc_hi', 'auc_light', 'light_flip']
+             'bal_acc', 'bal_acc_lo', 'bal_acc_hi', 'auc_light', 'light_flip',
+             'tp', 'fp', 'fn', 'tn', 'acc', 'acc_lo', 'acc_hi', 'prec', 'prec_lo', 'prec_hi', 'rec', 'npv', 'npv_lo',
+             'npv_hi', 'f1', 'f1_lo', 'f1_hi', 'bacc2', 'bacc2_lo', 'bacc2_hi', 'n_accepted', 'n_ood']
 
 
 NO_CACHE = FeatureCache(None, 'off')
@@ -190,6 +199,7 @@ def hb_metrics(O, S, target):
     flag = O.flag.values
     r['sens'], r['sens_lo'], r['sens_hi'] = M.wilson(int((flag & y).sum()), int(y.sum()))
     r['spec'], r['spec_lo'], r['spec_hi'] = M.wilson(int((~flag & ~y).sum()), int((~y).sum()))
+    r.update(M.binary_report(flag, y, g))
     low = true < 100
     r['n_hb100'] = int(low.sum())
     r['sens_hb100'] = float(flag[low].mean()) if low.any() else float('nan')
@@ -218,18 +228,13 @@ def run_hb(root, df, mask_source, masks, model_kind, target, jobs, cache=NO_CACH
 
 
 # ------------------------------------------------------------------ v12
-def _v12_compute(path, cp, seed):
+def _v12_compute(path, seed):
     """Признаки v12 одного снимка без меток: исходный, N_RELIGHT обучающих копий при другом свете, стресс-условия."""
     t0 = time.perf_counter()
-    if cp:                                                # уже вырезанная конъюнктива: весь кадр — ткань
-        crop = load_rgb(path, V12.CROP_SIDE)
-        t1 = time.perf_counter()
-        conj, sclera = np.ones(crop.shape[:2], bool), None
-    else:
-        img = load_rgb(path, V12.DETECT_SIDE)
-        t1 = time.perf_counter()
-        cv2.setRNGSeed(0)                                 # GrabCut в поиске тканей случаен: без сида маски плывут
-        crop, conj, sclera = V12.detect(img)
+    img = load_rgb(path, V12.DETECT_SIDE)
+    t1 = time.perf_counter()
+    cv2.setRNGSeed(0)                                     # GrabCut в поиске тканей случаен: без сида маски плывут
+    crop, conj, sclera = V12.detect(img)
     rows = [{'aug': 0, **V12.eye_features(crop, conj, sclera)}]
     rng = np.random.default_rng(seed)
     for a in range(1, V12.N_RELIGHT + 1):
@@ -241,10 +246,9 @@ def _v12_compute(path, cp, seed):
 
 def _v12_job(root, row, seed, cache=NO_CACHE):
     path = os.path.join(root, row['image'])
-    cp = row['dataset'] == 'cp_anemic'
-    params = {'cp': cp, 'seed': seed, 'detect_side': V12.DETECT_SIDE, 'crop_side': V12.CROP_SIDE,
+    params = {'seed': seed, 'detect_side': V12.DETECT_SIDE, 'crop_side': V12.CROP_SIDE,
               'n_relight': V12.N_RELIGHT, 'stress': STRESS_CONDITIONS}
-    (rows, srows), t = cache.fetch('v12', {'image': path}, {}, params, _v12_compute, path, cp, seed)
+    (rows, srows), t = cache.fetch('v12', {'image': path}, {}, params, _v12_compute, path, seed)
     return _with_meta(row, rows, srows), t
 
 
@@ -253,7 +257,7 @@ def _with_meta(row, rows, srows):
     sex = row['sex'] if isinstance(row['sex'], str) else None
     meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
             'hb_g_l': float(row['hb_g_l']),
-            'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant']))),
+            'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, is_pregnant(row['pregnant']))),
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
     return [{**meta, **r} for r in rows], [{**meta, **r} for r in srows]
 
@@ -301,6 +305,7 @@ def v12_metrics(O, S, use_thr, target):
         r['auc_lo'], r['auc_hi'] = M.bootstrap_ci(M.auc, g, 1000, 0, 1 - P[:, 0], anem)
     r['sens'], r['sens_lo'], r['sens_hi'] = M.wilson(int((flag & anem).sum()), int(anem.sum()))
     r['spec'], r['spec_lo'], r['spec_hi'] = M.wilson(int((~flag & ~anem).sum()), int((~anem).sum()))
+    r.update(M.binary_report(flag, anem, g))
     if S is not None and len(S):
         PS = np.stack(S.P.values)
         fl = (1 - PS[:, 0] >= S.thr.values) if use_thr else (PS.argmax(1) > 0)
@@ -321,8 +326,6 @@ def run_v12(root, df, target, jobs, cache=NO_CACHE, timer=None):
     F = pd.DataFrame([x for rows, _ in out for x in rows])
     S = pd.DataFrame([x for _, srows in out for x in srows])
     sets = V12.feature_sets(F.columns, df.sex.notna().any())
-    if df.dataset.iloc[0] == 'cp_anemic':
-        sets = {'conj': sets['conj']}
     res = []
     for mode, feats in sets.items():
         if len(feats) < 3:
@@ -506,6 +509,108 @@ def run_core(df, J, key):
     return r, O.assign(accepted=acc)
 
 
+# ------------------------------------------------------------------ ядро: проверка между странами (Eyes-defy)
+COUNTRY_DIRECTIONS = (('India', 'Italy'), ('Italy', 'India'))
+
+
+def country_of(df):
+    """Страна пациента Eyes-defy из patient_id (ED_<страна>_<номер>); у других датасетов страны нет."""
+    assert (df.dataset == 'eyes_defy').all(), 'страна есть только у Eyes-defy'
+    c = df.patient_id.str.split('_').str[1]
+    assert c.isin([x for d in COUNTRY_DIRECTIONS for x in d]).all(), 'неизвестная страна в patient_id'
+    return c
+
+
+def country_split(df, train_c, test_c):
+    """→ (A — снимки страны обучения, B — снимки страны теста, исключённые группы). Группа манифеста (пациент +
+    подтверждённые копии снимка), попавшая в обе страны, — это копия одного снимка: она убирается из обеих частей
+    и печатается, иначе тест видел бы обучающий снимок."""
+    country = country_of(df)
+    both = set(df.group[(country == train_c).values]) & set(df.group[(country == test_c).values])
+    keep = ~df.group.isin(both).values
+    A = df[(country == train_c).values & keep].reset_index(drop=True)
+    B = df[(country == test_c).values & keep].reset_index(drop=True)
+    assert len(A) and len(B), f'нет снимков {train_c} или {test_c}'
+    assert not set(A.group) & set(B.group)
+    return A, B, sorted(both)
+
+
+def eval_external(T, F, S, key):
+    """Модель key обучается только на T (страна обучения; пороги и решение о Hb — вложенной CV внутри T, OOD — по
+    диапазону T) и применяется к F (страна теста) без какой-либо настройки на F.
+    → (метрики на принятых снимках или None, OOF-таблица F, строка базовой модели «самый частый класс T»)."""
+    if not len(T) or not len(F):                       # анализ фото не оценит этой моделью ни одного снимка
+        return None, None, None
+    T, F = CORE.usable(T, key), CORE.usable(F, key)
+    if not len(T) or not len(F):
+        return None, None, None
+    assert not set(T.group) & set(F.group), 'пациент теста в обучении'
+    feats = CORE.feature_list(T.columns, key)
+    B = CORE.fit_core(T, feats, key)
+    O = F[F.aug == 0].reset_index(drop=True)
+    p, lv, hbp, ood = CORE.apply_core(B, O[feats].values)
+    O = O.assign(p=p, level=lv, hb_pred=hbp, ood=ood, hb_ok=B['hb_ok'], thr_sens=B['thr_sens'],
+                 hb_hw=B['hb_halfwidth'])
+    acc = O.ood.values <= CORE.OOD_MAX
+    if not acc.any():
+        return None, O.assign(accepted=acc), None
+    SP = None
+    if S is not None and len(S):
+        S = S[S.group.isin(set(O.group[acc]))]
+        if len(S):
+            ps, ls, _, _ = CORE.apply_core(B, S[feats].values)
+            SP = S[['group', 'cond', 'anemic']].assign(p=ps, level=ls)
+    t0 = T[T.aug == 0]
+    r = CORE.core_metrics(O[acc], SP)
+    r.update(target_sens=CORE.SENS_TARGET, n_train=int(t0.group.nunique()), n_routed=int(len(O)),
+             n_ood=int((~acc).sum()), n_accepted=int(acc.sum()), train_prev=float(t0.anemic.mean()),
+             test_prev=float(O.anemic.values[acc].mean()))
+    const = bool(t0.anemic.mean() >= 0.5)              # простая базовая модель: без фото, только частота в T
+    y = O.anemic.values[acc].astype(bool)
+    base = {'n': int(acc.sum()), 'const': const, **M.binary_report(np.full(len(y), const), y, O.group.values[acc])}
+    base['sens'], base['sens_lo'], base['sens_hi'] = base['rec'], base['rec_lo'], base['rec_hi']
+    return r, O.assign(accepted=acc), base
+
+
+def run_country(root, df, jobs, cache=NO_CACHE, timer=None):
+    """Внешняя проверка внутри Eyes-defy: все пациенты одной страны → обучение, все пациенты другой → тест.
+    Всё обучаемое видит только страну обучения: сегментатор конъюнктивы по маскам врачей, модель риска, её пороги,
+    диапазон OOD, решение «показывать Hb». Маски обучающих снимков — сегментатором без их фолда (OOF внутри страны
+    обучения, как в train_core), тестовых — сегментатором на всей стране обучения (как predict на новом фото).
+    → [(направление, key, метрики или None, OOF или None, строка базовой модели или None)]."""
+    out = []
+    for train_c, test_c in COUNTRY_DIRECTIONS:
+        A, B, dropped = country_split(df, train_c, test_c)
+        if dropped:
+            print(f'{train_c}→{test_c}: копии снимков в обеих странах исключены из обеих частей: {len(dropped)} групп '
+                  f'({", ".join(dropped[:5])})')
+        segs = conj_segmenters(root, A, jobs, cache, timer, nested=False, full=True)
+        JA = core_jobs(root, A, jobs, segs, cache, timer)
+        JB = core_jobs(root, B, jobs, {(int(g),): segs[()] for g in set(B.fold)}, cache, timer)
+        for key in CORE.specs_for('eyes_defy'):
+            S = _frame(JB, 'test', key, s=True)
+            r, O, base = eval_external(_frame(JA, 'test', key), _frame(JB, 'test', key), S if len(S) else None, key)
+            out.append((f'{train_c}→{test_c}', key, r, O, base))
+    return out
+
+
+def print_binary_table(rows):
+    """Бинарный ответ «анемия» при пороге thr_sens (подобран на обучающих пациентах): матрица ошибок и метрики."""
+    print(f'\nПоложительный класс: {M.POSITIVE_CLASS}. Ответ «анемия»: порог P(анемия), подобранный только на '
+          'обучающих пациентах (у строк v12 «argmax» — класс с наибольшей вероятностью). Accuracy при дисбалансе '
+          'классов обманчива — смотреть вместе со сбаланс. точностью и F1. ДИ долей — Уилсон по снимкам (у Eyes-defy '
+          '218 снимков на 217 пациентов), F1 и сбаланс. точности — бутстрэп по пациентам.')
+    head = ['Задача', 'Датасет', 'Метод', 'n', 'TP / FP / FN / TN', 'Accuracy, %', 'Precision (PPV), %',
+            'Recall (чувств.), %', 'Спец., %', 'NPV, %', 'F1', 'Сбаланс. точн. (2 класса), %', 'AUC']
+    print('| ' + ' | '.join(head) + ' |')
+    print('|' + '---|' * len(head))
+    for r in rows:
+        cells = [r['task'], r['dataset'], r['method'], r['n'], f"{r['tp']} / {r['fp']} / {r['fn']} / {r['tn']}",
+                 fmt(r, 'acc', 0, True), fmt(r, 'prec', 0, True), fmt(r, 'rec', 0, True), fmt(r, 'spec', 0, True),
+                 fmt(r, 'npv', 0, True), fmt(r, 'f1', 2), fmt(r, 'bacc2', 0, True), fmt(r, 'auc', 3)]
+        print('| ' + ' | '.join(str(c) for c in cells) + ' |')
+
+
 def print_core_table(rows):
     head = ['Датасет', 'n', 'AUC', 'Низкий / средний / высокий, %', 'Верно среди уверенных, %',
             'Больных среди «высокий», %', 'Здоровых среди «низкий», %', 'Больных в «низкий»',
@@ -582,8 +687,8 @@ def save_oof(O, cols, name, run_dir, oof_dir, backup_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=os.environ.get('ANEMIA_DATA', 'data'))
-    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12', 'core'], default='all')
-    ap.add_argument('--dataset', choices=['all', 'eyes_defy', 'cp_anemic', 'phone'], default='all')
+    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12', 'core', 'country'], default='all')
+    ap.add_argument('--dataset', choices=['all', 'eyes_defy', 'phone'], default='all')
     ap.add_argument('--model', choices=['hgb', 'ridge', 'both'], default='both')
     ap.add_argument('--target-sens', type=float, default=0.80)
     ap.add_argument('--tag', default='baseline_v11')
@@ -629,24 +734,29 @@ def main():
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
     os.makedirs(res_dir, exist_ok=True)
     rows = []
-    for ds in (['eyes_defy', 'cp_anemic', 'phone'] if a.dataset == 'all' else [a.dataset]):
+    for ds in (['eyes_defy', 'phone'] if a.dataset == 'all' else [a.dataset]):
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
             continue
-        if a.task == 'core':
-            if ds == 'cp_anemic':           # вырезы: вся картинка — ткань, сегментатор и отказы глаза не нужны
-                key = 'cp_anemic'
-                print(f'[{time.time() - t0:5.0f} с] {key}: ядро HemaVision, {len(df)} снимков...')
-                F, S = v12_features(a.data, df, a.jobs, cache, timer, 'core')
-                F = CORE.usable(F, key)
-                O, SP = CORE.cross_validate(F, CORE.feature_list(F.columns, key), key, S[S.group.isin(set(F.group))])
-                r = {**CORE.core_metrics(O, SP), 'target_sens': CORE.SENS_TARGET}
-                n_skip = len(df) - O.group.nunique()
-                rows.append({'task': 'core', 'dataset': key,
-                             'method': 'core · 3 уровня риска' + (f' (−{n_skip})' if n_skip else ''), **r})
-                save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens'],
-                         f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
+        if a.task == 'country':
+            if ds != 'eyes_defy':
+                print(f'{ds}: проверка между странами только для Eyes-defy — пропуск')
                 continue
+            print(f'[{time.time() - t0:5.0f} с] {ds}: проверка между странами (Индия ↔ Италия)...')
+            for direction, key, r, O, base in run_country(a.data, df, a.jobs, cache, timer):
+                name = f'{ds} {direction}'
+                if r is None:
+                    print(f'{name} · {key}: нет принятых снимков в одной из стран — пропуск')
+                    continue
+                rows.append({'task': 'country', 'dataset': name, 'method': f"{key} · core · обучение "
+                             f"{r['n_train']} пац., тест принято {r['n_accepted']}/{len(O)} (OOD {r['n_ood']})", **r})
+                rows.append({'task': 'country', 'dataset': name, 'method': f"базовая: всегда «"
+                             f"{'анемия' if base['const'] else 'норма'}» (частый класс страны обучения)", **base})
+                save_oof(O, ['group', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens', 'accepted'],
+                         f"oof_{a.tag}_{ds}_{direction.replace('→', '_to_')}_{key}_country.csv", run_dir, res_dir,
+                         backup_dir)
+            continue
+        if a.task == 'core':
             if not df.mask_conj.notna().all():
                 sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы ядра обучить не на чем')
             print(f'[{time.time() - t0:5.0f} с] {ds}: сегментаторы конъюнктивы по маскам врачей (без тестового фолда)...')
@@ -707,6 +817,10 @@ def main():
         print_table([r for r in rows if r['task'] in ('seg', 'hb')])
     if any(r['task'] == 'core' for r in rows):
         print_core_table([r for r in rows if r['task'] == 'core'])
+    if any(r['task'] == 'country' and 'share_low' in r for r in rows):
+        print_core_table([r for r in rows if r['task'] == 'country' and 'share_low' in r])
+    if any('tp' in r for r in rows):
+        print_binary_table([r for r in rows if 'tp' in r])
     if any(r['task'] == 'v12' for r in rows):
         print_v12_table([r for r in rows if r['task'] == 'v12'])
     total = time.time() - t0

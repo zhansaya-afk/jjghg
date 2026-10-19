@@ -33,8 +33,8 @@ OOD_MAX = 0.30           # как в v12: больше 30% признаков д
 INNER_FOLDS = 4
 RISK_LEVELS = ('низкий', 'средний', 'высокий')
 
-SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка; взрослые — снимок глаза,
-    # дети — уже вырезанная конъюнктива. У взрослых — отдельная модель на каждый набор найденных тканей:
+SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка (снимок глаза взрослого;
+    # детской модели нет — CP-AnemiC исключён 2026-10-19). Отдельная модель на каждый набор найденных тканей:
     # недостающая ткань не заменяется нулями или признаками другой ткани
     'eyes_defy': {'data': 'eyes_defy', 'prefixes': ('c_', 's_', 'w_'), 'need': ('c_',), 'sex': True,
                   'tissues': ('conj', 'sclera'), 'title': 'взрослые (Eyes-defy-anemia), конъюнктива + склера'},
@@ -42,8 +42,6 @@ SPECS = {   # модель → датасет манифеста, признак
                        'tissues': ('conj',), 'title': 'взрослые (Eyes-defy-anemia), только конъюнктива'},
     'eyes_defy_sclera': {'data': 'eyes_defy', 'prefixes': ('s_',), 'need': ('s_',), 'sex': True,
                          'tissues': ('sclera',), 'title': 'взрослые (Eyes-defy-anemia), только склера'},
-    'cp_anemic': {'data': 'cp_anemic', 'prefixes': ('c_',), 'need': ('c_',), 'sex': False,
-                  'tissues': ('conj',), 'title': 'дети 6–59 мес (CP-AnemiC)'},
 }
 
 
@@ -179,6 +177,7 @@ def core_metrics(O, S=None):
     flag = p >= O.thr_sens.values
     r['sens'], r['sens_lo'], r['sens_hi'] = M.wilson(int((flag & anem).sum()), int(anem.sum()))
     r['spec'], r['spec_lo'], r['spec_hi'] = M.wilson(int((~flag & ~anem).sum()), int((~anem).sum()))
+    r.update(M.binary_report(flag, anem, g))       # бинарный ответ — тот же порог thr_sens (вложенная CV на train)
     r['mae'] = M.mae(O.hb_pred.values, O.hb_g_l.values)
     r['hb_shown'] = float(O.hb_ok.mean())
     r['hb_range_cover'] = float((np.abs(O.hb_pred.values - O.hb_g_l.values) <= O.hb_hw.values).mean())

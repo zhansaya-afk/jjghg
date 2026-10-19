@@ -34,6 +34,7 @@ from anemia import regions as R  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
 from anemia.augment import STRESS_CONDITIONS, apply_illuminant  # noqa: E402
 from anemia.io import load_mask, load_rgb, resize_to  # noqa: E402
+from anemia.labs import is_pregnant  # noqa: E402
 
 SOURCES = ('doctor', 'auto', 'v11')
 NAMES = {'doctor': 'маска врача', 'auto': 'авто v12 (regions)', 'v11': 'авто v11 (обучена на масках врачей)'}
@@ -51,7 +52,7 @@ def _job(root, row, v11_mask, seed):
     masks = {'doctor': doc, 'auto': auto, 'v11': resize_to(v11_mask, shape, nearest=True)}
     age = row['age'] if row['age'] == row['age'] else 30.0
     sex = row['sex'] if isinstance(row['sex'], str) else None
-    y = V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, bool(row['pregnant'])))
+    y = V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, is_pregnant(row['pregnant'])))
     base = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']), 'y': y,
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
     rows, srows = [], []

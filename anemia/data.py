@@ -13,15 +13,16 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from .labs import is_anemic, who_grade
+from .labs import is_anemic, is_pregnant, norm_pregnant, who_grade
 
 COLUMNS = ['dataset', 'patient_id', 'group', 'image', 'mask_conj', 'hb_g_l', 'sex', 'age', 'pregnant',
            'population', 'anemic', 'grade', 'sha1', 'dhash', 'fold']
 N_FOLDS = 5
 DHASH_MAX_DIST = 3     # кандидат в копию: dHash отличается не более чем на 3 бита из 64
 THUMB_MAX_MAD = 0.01   # и подтверждение: средняя разница пикселей миниатюр 32×32 < 1%
-# Только dHash на гладких вырезах конъюнктивы (CP-AnemiC) склеивает разных детей: проверено, 0 из 243 пар
-# с dHash ≤ 3 не были копиями (MAD ≥ 0,02), поэтому копией считается только пара, прошедшая оба теста.
+# Только dHash на гладких вырезах конъюнктивы склеивает разные снимки: проверено 2026-10-14 на вырезах CP-AnemiC
+# (датасет с 2026-10-19 исключён), 0 из 243 пар с dHash ≤ 3 не были копиями (MAD ≥ 0,02), поэтому копией
+# считается только пара, прошедшая оба теста.
 
 
 # ------------------------------------------------------------------ хеши
@@ -80,21 +81,8 @@ def load_eyes_defy(root):
         'hb_g_l': lab.hb_g_dl.map(_num) * 10,
         'sex': lab['sex'].map(norm_sex) if 'sex' in lab else None,
         'age': lab['age'].map(_num) if 'age' in lab else np.nan,
-        'pregnant': False, 'population': 'adult'})
-
-
-def load_cp_anemic(root):
-    """data/cp_anemic/: images/*.png + labels.csv (file, hb_g_dl). Дети 6–59 мес, одно фото на ребёнка."""
-    d = os.path.join(root, 'cp_anemic')
-    lab = pd.read_csv(os.path.join(d, 'labels.csv'))
-    return pd.DataFrame({
-        'dataset': 'cp_anemic',
-        'patient_id': 'CP_' + lab.file.map(lambda f: os.path.splitext(os.path.basename(f))[0]),
-        'image': lab.file.map(lambda f: os.path.join('cp_anemic', f)),
-        'mask_conj': None,                  # фото уже вырезаны по конъюнктиве
-        'hb_g_l': lab.hb_g_dl.astype(float) * 10,
-        'sex': None, 'age': 2.0,            # возраст в датасете не указан; 6–59 мес → нормы ВОЗ для <5 лет
-        'pregnant': False, 'population': 'child'})
+        'pregnant': None,                   # в Eyes-defy поля беременности нет — статус неизвестен, не False
+        'population': 'adult'})
 
 
 def load_phone(root):
@@ -111,13 +99,12 @@ def load_phone(root):
         'hb_g_l': lab.hb_g_l.astype(float),
         'sex': get('sex', pd.Series([None] * len(lab))).map(norm_sex),
         'age': get('age', pd.Series([np.nan] * len(lab))).map(_num),
-        'pregnant': get('pregnant', pd.Series([False] * len(lab))).fillna(False).astype(bool),
+        'pregnant': get('pregnant', pd.Series([None] * len(lab))).map(norm_pregnant).astype(object),
         'population': np.where(get('age', pd.Series([99] * len(lab))).map(_num) < 15, 'child', 'adult')})
 
 
 LOADERS = {'eyes_defy': ('eyes_defy_anemia/labels.csv', load_eyes_defy),
-           'cp_anemic': ('cp_anemic/labels.csv', load_cp_anemic),
-           'phone': ('phone/hb.csv', load_phone)}
+           'phone': ('phone/hb.csv', load_phone)}       # CP-AnemiC исключён 2026-10-19
 
 
 # ------------------------------------------------------------------ группы и фолды
@@ -183,6 +170,7 @@ def build_manifest(root, datasets=None, n_folds=N_FOLDS, seed=0):
         raise FileNotFoundError(f'В {root} нет ни одного датасета (ожидаются: '
                                 + ', '.join(m for m, _ in LOADERS.values()) + ')')
     df = pd.concat(parts, ignore_index=True)
+    df['pregnant'] = df.pregnant.map(norm_pregnant).astype(object)     # None = неизвестно
     df = df[df.image.notna() & df.hb_g_l.notna()].reset_index(drop=True)
     exists = df.image.map(lambda p: os.path.exists(os.path.join(root, p)))
     if (~exists).any():
@@ -190,9 +178,9 @@ def build_manifest(root, datasets=None, n_folds=N_FOLDS, seed=0):
         df = df[exists].reset_index(drop=True)
     df['sha1'] = df.image.map(lambda p: sha1_file(os.path.join(root, p)))
     df['dhash'] = df.image.map(lambda p: dhash(os.path.join(root, p)))
-    df['anemic'] = [is_anemic(h, s, a if pd.notna(a) else None, bool(p))
+    df['anemic'] = [is_anemic(h, s, a if pd.notna(a) else None, is_pregnant(p))
                     for h, s, a, p in zip(df.hb_g_l, df.sex, df.age, df.pregnant)]
-    df['grade'] = [who_grade(h, s, a if pd.notna(a) else None, bool(p))
+    df['grade'] = [who_grade(h, s, a if pd.notna(a) else None, is_pregnant(p))
                    for h, s, a, p in zip(df.hb_g_l, df.sex, df.age, df.pregnant)]
     thumbs = [thumb(os.path.join(root, p)) for p in df.image]
     df['group'] = _groups(df, thumbs)

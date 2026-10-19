@@ -1,7 +1,7 @@
 """Готовит итоговую модель ядра HemaVision (все пациенты каждого датасета) в одном файле — обучает только то,
 чего нет: 1) совместимая модель уже лежит в --out (тот же код признаков и scikit-learn) → ничего не делаем;
 2) модели взрослых есть в GitHub Release для текущего кода (anemia/model_store.py) → скачиваем, сверяем sha256;
-3) остальное (дети CP-AnemiC — всегда, лицензия не даёт публиковать) обучаем здесь. --force — обучить всё заново.
+3) остальное обучаем здесь. --force — обучить всё заново. Детской модели нет (CP-AnemiC исключён 2026-10-19).
 
     python scripts/train_core.py --data data                 # → models/hemavision_core.joblib (или $ANEMIA_MODELS)
 
@@ -24,7 +24,7 @@ import sklearn
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'scripts'))
-from evaluate import _frame, conj_segmenters, core_jobs, git_state, route_counts, v12_features  # noqa: E402
+from evaluate import _frame, conj_segmenters, core_jobs, git_state, route_counts  # noqa: E402
 
 from anemia import core as CORE  # noqa: E402
 from anemia import model_store as STORE  # noqa: E402
@@ -58,8 +58,7 @@ def main():
         else:
             conj_seg = old.get('conj_seg') if not ({'eyes_defy', 'eyes_defy_conj', 'eyes_defy_sclera'} & set(keys)
                                                     - set(old['models'])) else None
-            models.update({k: v for k, v in old['models'].items()
-                           if k in keys and (conj_seg is not None or CORE.SPECS[k]['data'] == 'cp_anemic')})
+            models.update({k: v for k, v in old['models'].items() if k in keys and conj_seg is not None})
             sources.update(old.get('sources', {}))
     adult = [k for k in keys if k not in models and CORE.SPECS[k]['data'] in STORE.PUBLIC_DATASETS]
     if adult and not a.force and not a.no_download:
@@ -81,19 +80,15 @@ def main():
         if not len(df):
             print(f'{key}: нет {ds} в манифесте — пропущен')
             continue
-        if ds not in feats:
-            if ds == 'cp_anemic':
-                print(f'{ds}: признаки {len(df)} снимков...', flush=True)
-                feats[ds] = v12_features(a.data, df, a.jobs, cache)[0]
-            else:                        # снимки глаза: обучаемся только на тех, что примет анализ фото
-                if not df.mask_conj.notna().all():
-                    sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы обучить не на чем')
-                print(f'{ds}: сегментатор конъюнктивы по маскам врачей {len(df)} снимков...', flush=True)
-                segs = conj_segmenters(a.data, df, a.jobs, cache)
-                conj_seg = segs[()]
-                J = core_jobs(a.data, df, a.jobs, segs, cache)
-                print(f'{ds}: маршрут анализа фото: ' + ', '.join(f'{k} {v}' for k, v in route_counts(J, len(df)).items()))
-                feats[ds] = _frame(J, 'test')
+        if ds not in feats:              # снимки глаза: обучаемся только на тех, что примет анализ фото
+            if not df.mask_conj.notna().all():
+                sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы обучить не на чем')
+            print(f'{ds}: сегментатор конъюнктивы по маскам врачей {len(df)} снимков...', flush=True)
+            segs = conj_segmenters(a.data, df, a.jobs, cache)
+            conj_seg = segs[()]
+            J = core_jobs(a.data, df, a.jobs, segs, cache)
+            print(f'{ds}: маршрут анализа фото: ' + ', '.join(f'{k} {v}' for k, v in route_counts(J, len(df)).items()))
+            feats[ds] = _frame(J, 'test')
         F = CORE.usable(feats[ds], key)
         B = CORE.fit_core(F, CORE.feature_list(F.columns, key), key)
         models[key] = B

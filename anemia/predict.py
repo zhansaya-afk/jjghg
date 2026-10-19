@@ -22,11 +22,16 @@ from . import core as CORE
 from . import segment_baseline as SB
 from . import v12_model as V12
 from .io import resize_max
+from .labs import is_pregnant
 from . import regions as R
 from .regions import detect_regions, quality
 
 MODEL_FILE = 'hemavision_core.joblib'
-MIN_SIDE = 24            # px по короткой стороне (вырезы CP-AnemiC бывают 171×34); мелкую ткань ловит quality()
+MIN_SIDE = 24            # px по короткой стороне (вырезы ткани бывают 171×34 — так было в исключённом CP-AnemiC);
+                         # мелкую ткань ловит quality()
+CHILD_MIN_AGE = 5        # лет; моложе — модели нет (CP-AnemiC исключён 2026-10-19): отказ, модель взрослых не подставляем
+CHILD_REFUSAL = ('для детей младше 5 лет оценка по фото не проводится: модели, проверенной на детях, нет '
+                 '(нормы ВОЗ и вид конъюнктивы у них другие) — сдайте общий анализ крови (Hb)')
 STATUS_RU = {'ok': 'оценка выполнена', 'retake': 'переснимите фото', 'unreliable': 'оценка ненадёжна'}
 RISK_TEXT = {'высокий': 'признаки бледности выражены — сдайте общий анализ крови (Hb)',
              'средний': 'по фото уверенно сказать нельзя — сдайте общий анализ крови (Hb)',
@@ -86,7 +91,7 @@ def load_photo(src):
         alpha = np.asarray(im.convert('RGBA'))[..., 3]
     rgb = np.asarray(im.convert('RGB'), np.float32) / 255
     if alpha is not None:
-        rgb[alpha == 0] = 0                        # как в CP-AnemiC: прозрачный фон — чёрный
+        rgb[alpha == 0] = 0                        # вырезанная ткань: прозрачный фон — чёрный
     return rgb
 
 
@@ -141,10 +146,17 @@ def _sex(sex):
     return 'M' if s[:1] in ('M', 'М') else 'F' if s[:1] in ('F', 'Ж', 'W') else None
 
 
+def child_refused(age):
+    """Возраст младше 5 лет → оценки по фото нет (True). Возраст не указан → модель взрослых, как раньше."""
+    return age is not None and age < CHILD_MIN_AGE
+
+
 def pick_model(bundle, age):
-    """Дети до 5 лет — модель CP-AnemiC, остальные — модель взрослых (Eyes-defy)."""
-    child = age is not None and age < 5
-    key = 'cp_anemic' if child else 'eyes_defy'
+    """Модель взрослых (Eyes-defy) для возраста ≥ 5 лет или неуказанного; младше 5 лет → None (оценки нет:
+    детской модели нет, модель взрослых детям не подставляется)."""
+    if child_refused(age):
+        return None
+    key = 'eyes_defy'
     if key not in bundle['models']:
         raise KeyError(f'в модели нет части «{key}» (обучена на {sorted(bundle["models"])})')
     return key
@@ -633,12 +645,13 @@ TISSUE_RU = {'conj': 'конъюнктива', 'sclera': 'склера'}
 
 
 # ------------------------------------------------------------------ главный вход
-def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landmarker='auto'):
-    """Фото глаза (оттянутое нижнее веко; можно уже вырезанную конъюнктиву) → dict:
+def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmarker='auto'):
+    """Фото глаза (оттянутое нижнее веко) → dict. Уже вырезанная ткань не оценивается (stage 'mismatch'),
+    ребёнок младше 5 лет — тоже (stage 'age', до загрузки модели и разбора фото). pregnant: True / False / None.
         status   — 'ok' | 'retake' (снимок непригоден) | 'unreliable' (снимок не похож на обучающие / нет модели);
         stage    — где остановились: 'frame' (кадр технически непригоден), 'no_eye' (глаз не найден), 'no_tissue'
                    (глаз есть, тканей нет), 'quality' (ткани найдены, качество недостаточно), 'no_model' (для
-                   этого набора тканей нет обученной модели), 'mismatch' (вырез vs снимок глаза), 'ood', 'ok';
+                   этого набора тканей нет обученной модели), 'mismatch' (вырез вместо снимка глаза), 'age' (младше 5 лет), 'ood', 'ok';
         eye      — как найден глаз; tissue_status — {'conj': …, 'sclera': …}; tissues — какие ткани использованы;
         risk     — 'низкий' / 'средний' / 'высокий' или None; p_anemia — P(анемия) модели или None;
         hb_range — (от, до) г/л, экспериментально, или None; hb_note — почему цифры Hb нет / что она значит;
@@ -647,14 +660,19 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
     Модель взрослых выбирается по пригодным тканям (обе / только конъюнктива / только склера): каждая обучена
     и проверена на своих признаках, недостающая ткань ничем не подменяется.
     landmarker — 'auto' (MediaPipe, если установлен), готовый детектор или None (без поиска лица)."""
-    bundle = bundle if bundle is not None else load_bundle()
     sex = _sex(sex)
-    key = pick_model(bundle, age)
-    B = bundle['models'][key]
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
-         'model': B['title'], 'features': None, 'eye': None, 'tissue_status': {},
+         'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
          'sclera': None, 'disclaimer': DISCLAIMER, 'diag': []}
+    if child_refused(age):
+        r['status'], r['stage'], r['model'] = 'unreliable', 'age', 'нет (младше 5 лет)'
+        r['issues'].append(CHILD_REFUSAL)
+        return r
+    bundle = bundle if bundle is not None else load_bundle()
+    key = pick_model(bundle, age)
+    B = bundle['models'][key]
+    r['model'] = B['title']
     try:
         rgb = load_photo(photo)
     except PhotoError as e:
@@ -712,27 +730,18 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
         r['issues'] = whole + [f'{TISSUE_RU[t]}: {v}' for t, v in ts.items() if v != 'пригодна']
         return r
     if det['kind'] == 'вырезанная ткань':
-        if key == 'eyes_defy':
-            r['status'], r['stage'] = 'unreliable', 'mismatch'
-            r['issues'].append('это уже вырезанная ткань, а модель взрослых обучена на снимках глаза целиком — '
-                               'пришлите фото глаза с оттянутым нижним веком')
-            return r
-        crop = resize_max(rgb, V12.CROP_SIDE)            # как обучались вырезы CP-AnemiC: весь кадр — ткань
-        conj, sclera, good = np.ones(crop.shape[:2], bool), None, ('conj',)
-    elif key == 'cp_anemic':
         r['status'], r['stage'] = 'unreliable', 'mismatch'
-        r['issues'].append('модель детей до 5 лет обучена только на вырезанной конъюнктиве (CP-AnemiC); на снимке '
-                           'глаза целиком она не проверялась — пришлите вырез конъюнктивы или сдайте анализ крови')
+        r['issues'].append('это уже вырезанная ткань, а модель взрослых обучена на снимках глаза целиком — '
+                           'пришлите фото глаза с оттянутым нижним веком')
         return r
-    else:
-        key = ADULT_MODEL[good]
-        if key not in bundle['models']:
-            r['status'], r['stage'] = 'unreliable', 'no_model'
-            r['issues'].append(f'пригодна только ткань «{", ".join(TISSUE_RU[t] for t in good)}», а модели для неё '
-                               'в файле нет — перезапустите ячейку Я1 (scripts/train_core.py)')
-            return r
-        B = bundle['models'][key]
-        r['model'] = B['title']
+    key = ADULT_MODEL[good]
+    if key not in bundle['models']:
+        r['status'], r['stage'] = 'unreliable', 'no_model'
+        r['issues'].append(f'пригодна только ткань «{", ".join(TISSUE_RU[t] for t in good)}», а модели для неё '
+                           'в файле нет — перезапустите ячейку Я1 (scripts/train_core.py)')
+        return r
+    B = bundle['models'][key]
+    r['model'] = B['title']
     r['tissues'] = list(good)
     f = V12.eye_features(crop, conj if 'conj' in good else None,
                          sclera if 'sclera' in good and sclera is not None else None)
@@ -757,8 +766,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
                          'eyes_defy_conj': 'оценено только по цвету конъюнктивы (склера непригодна — без поправки '
                                            'на свет по белку глаза)',
                          'eyes_defy_sclera': 'оценено только по цвету склеры (конъюнктива непригодна); у этой '
-                                             'модели своя, отдельно проверенная точность — см. evaluate',
-                         'cp_anemic': 'оценено по цвету вырезанной конъюнктивы'}[key])
+                                             'модели своя, отдельно проверенная точность — см. evaluate'}[key])
     low = (f'≤ {B["t_lo"]:.2f} — низкий' if np.isfinite(B['t_lo']) else
            'уровня «низкий» у этой модели нет (на обучающих пациентах не нашлось зоны, где здоровых '
            f'≥ {B["zone_target"]:.0%})')
@@ -774,7 +782,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=False, bundle=None, landma
     else:
         r['hb_note'] = (f'цифра Hb не выдаётся: на проверке модель Hb почти не лучше константы '
                         f'(MAE {B["hb_mae_cv"]:.0f} против {B["hb_mae_const_cv"]:.0f} г/л)')
-    if pregnant or (age is not None and 5 <= age < 18):
+    if is_pregnant(pregnant) or (age is not None and CHILD_MIN_AGE <= age < 18):
         r['notes'].append('модель обучена на небеременных взрослых: для беременных и подростков оценка ориентировочная')
     return r
 

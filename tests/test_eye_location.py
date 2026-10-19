@@ -152,7 +152,7 @@ def test_each_refusal_rule(case, needle):
 
 
 def test_cutout_tissue_is_exempt():
-    """Вырезанная ткань (как в CP-AnemiC) не проверяется по радужке: её там нет по построению."""
+    """Вырезанная ткань не проверяется по радужке: её там нет по построению."""
     m = _box(300, 400, 0, 300, 0, 400)
     assert P._inconsistent(_det(m, np.zeros_like(m), None, use=('conj',), kind='вырезанная ткань')) == ''
 
@@ -183,7 +183,7 @@ def _dark_edge(img):
 def test_dark_hair_at_edge_is_not_cutout():
     """Регрессия (фото из Colab 2026-10-18): чёрная область у одного края (14% кадра) принималась за фон
     вырезанной ткани — весь кадр становился «вырезанной тканью», и модель взрослых отказывала. Фон вырезки
-    окружает ткань со всех сторон (CP-AnemiC: от 74% края кадра)."""
+    окружает ткань со всех сторон (в исключённом CP-AnemiC: от 74% края кадра)."""
     img = _dark_edge(_in_frame(0.5, at=(0.4, 0.5)))
     crop = P.R._prepare(img)
     assert P.R.dark_border(crop).mean() > 0.12 and P.R.cutout_background(crop) is None

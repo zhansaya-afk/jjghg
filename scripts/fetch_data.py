@@ -1,17 +1,14 @@
 """Скачивает и раскладывает датасеты в data/ (запускается в Colab: из облака Claude Kaggle закрыт).
 
     python scripts/fetch_data.py --eyes-defy                         # Kaggle harshwardhanfartale/eyes-defy-anemia
-    python scripts/fetch_data.py --cp-kaggle                         # CP-AnemiC V2: копия на Kaggle, сверка по sha1
-    python scripts/fetch_data.py --cp-zip CP-AnemiC_dataset.zip      # или исходный архив Mendeley m53vz6b7fx
 
-Результат: data/eyes_defy_anemia/{raw/, labels.csv}, data/cp_anemic/{images/, labels.csv}.
-Исходные архивы не изменяются. Каждый файл сверяется по sha1 со списками scripts/eyes_defy.sha1 и
-scripts/cp_anemic_v2.sha1 (только имена и хэши, без меток): несовпадение — понятная ошибка, а не тихо другие данные.
+Результат: data/eyes_defy_anemia/{raw/, labels.csv}. CP-AnemiC исключён из проекта 2026-10-19 и не скачивается.
+Исходные архивы не изменяются. Каждый файл сверяется по sha1 со списком scripts/eyes_defy.sha1 (только имена
+и хэши, без меток): несовпадение — понятная ошибка, а не тихо другие данные.
 """
 import argparse
 import glob
 import hashlib
-import io
 import os
 import re
 import shutil
@@ -151,80 +148,13 @@ def fetch_eyes_defy(out, zip_path=None):
           f'с маской {lab.mask_palpebral.notna().sum()}; {lab.country.value_counts().to_dict()}')
 
 
-# ------------------------------------------------------------------ CP-AnemiC
-def _open_nested(zf):
-    """Архив Mendeley — zip внутри zip: спускаемся, пока не найдём xlsx."""
-    while not any(n.lower().endswith('.xlsx') for n in zf.namelist()):
-        inner = [n for n in zf.namelist() if n.lower().endswith('.zip')]
-        if not inner:
-            raise ValueError('в архиве нет xlsx CP-AnemiC')
-        zf = zipfile.ZipFile(io.BytesIO(zf.read(inner[0])))
-    return zf
-
-
-def fetch_cp_anemic(zip_path, out):
-    zf = _open_nested(zipfile.ZipFile(zip_path))
-    d = os.path.join(out, 'cp_anemic')
-    os.makedirs(os.path.join(d, 'images'), exist_ok=True)
-    xlsx = next(n for n in zf.namelist() if n.lower().endswith('.xlsx'))
-    sheets = pd.read_excel(io.BytesIO(zf.read(xlsx)), sheet_name=None)
-    tab = next(v for v in sheets.values() if {'File_Name', 'Hb_g_dl'} <= set(v.columns))
-    pngs = {os.path.basename(n): n for n in zf.namelist() if '/All Categories/' in n and n.endswith('.png')}
-    rows = []
-    for _, r in tab.iterrows():
-        src = pngs.get(r.File_Name)
-        if src is None:
-            continue
-        with open(os.path.join(d, 'images', r.File_Name), 'wb') as f:
-            f.write(zf.read(src))
-        rows.append({'file': f'images/{r.File_Name}', 'hb_g_dl': float(r.Hb_g_dl), 'label': r.Folder_Label})
-    pd.DataFrame(rows).to_csv(os.path.join(d, 'labels.csv'), index=False)
-    verify_files(d, {f'images/{k}': v for k, v in read_sha1_list('cp_anemic_v2.sha1').items()}, 'CP-AnemiC')
-    print(f'CP-AnemiC: {len(rows)} фото')
-
-
-CP_KAGGLE = 'kritagyadev/cp-anemic-dataset-from-ghana'   # копия: 499 фото + лист Hb на 710 детей Ганы
-
-
-def fetch_cp_kaggle(out):
-    """CP-AnemiC V2 без ручной загрузки: публичная копия на Kaggle содержит все 251 снимок V2 байт-в-байт (сверка
-    по sha1 из scripts/cp_anemic_v2.sha1) и тот же Hb в листе Anemia_Data_Collection_Sheet.xlsx (проверено
-    2026-10-18: 251/251). Берутся только эти 251 снимок, в порядке листа V2 — манифест и фолды те же, что с
-    исходным архивом Mendeley. Условия CP-AnemiC: только академическое использование, с цитированием."""
-    zpath = _download(f'https://www.kaggle.com/api/v1/datasets/download/{CP_KAGGLE}',
-                      os.path.join(out, 'cp_anemic_kaggle.zip'))
-    zf = zipfile.ZipFile(zpath)
-    want = read_sha1_list('cp_anemic_v2.sha1')
-    pngs = {os.path.basename(n): n for n in zf.namelist() if n.lower().endswith('.png')}
-    xlsx = next(n for n in zf.namelist() if n.lower().endswith('.xlsx'))
-    tab = pd.read_excel(io.BytesIO(zf.read(xlsx))).set_index('IMAGE_ID')
-    d = os.path.join(out, 'cp_anemic')
-    os.makedirs(os.path.join(d, 'images'), exist_ok=True)
-    rows = []
-    for name in want:
-        if name not in pngs:
-            raise RuntimeError(f'CP-AnemiC: в копии на Kaggle нет {name} — источник изменился')
-        with open(os.path.join(d, 'images', name), 'wb') as f:
-            f.write(zf.read(pngs[name]))
-        r = tab.loc[os.path.splitext(name)[0]]
-        rows.append({'file': f'images/{name}', 'hb_g_dl': float(r.HB_LEVEL), 'label': r.REMARK})
-    verify_files(d, {f'images/{k}': v for k, v in want.items()}, 'CP-AnemiC')
-    pd.DataFrame(rows).to_csv(os.path.join(d, 'labels.csv'), index=False)
-    print(f'CP-AnemiC: {len(rows)} фото (копия Kaggle {CP_KAGGLE})')
-
-
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=os.environ.get('ANEMIA_DATA', 'data'))
     ap.add_argument('--eyes-defy', action='store_true')
     ap.add_argument('--eyes-defy-zip', help='уже скачанный zip Eyes-defy (вместо Kaggle)')
-    ap.add_argument('--cp-zip', help='исходный архив CP-AnemiC (Mendeley m53vz6b7fx)')
-    ap.add_argument('--cp-kaggle', action='store_true', help='CP-AnemiC V2 из копии на Kaggle (без ручной загрузки)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if a.eyes_defy or a.eyes_defy_zip:
         fetch_eyes_defy(a.out, a.eyes_defy_zip)
-    if a.cp_zip:
-        fetch_cp_anemic(a.cp_zip, a.out)
-    elif a.cp_kaggle:
-        fetch_cp_kaggle(a.out)
+

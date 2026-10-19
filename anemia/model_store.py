@@ -4,7 +4,7 @@
     releases/download/models-<код признаков>/hemavision_adult_sklearn-<X.Y>.joblib (+ .json с sha256)
 <код признаков> — sha1 модулей, от которых зависят признаки и модель (FEATURE_MODULES): изменился код — тег другой,
 и старая модель не подхватится. Модель pickle читается только той же версией scikit-learn (X.Y), иначе — обучение
-на месте. Модель детей (CP-AnemiC, только академическое использование) не публикуется: она обучается за минуты.
+на месте. Детской модели нет (CP-AnemiC исключён 2026-10-19).
 """
 import hashlib
 import json
@@ -96,7 +96,8 @@ def write_published(bundle, out_dir):
     """Модели публичных датасетов из bundle → <out_dir>/<asset>.joblib + .json (sha256, отметка, источники)."""
     import joblib
     from .core import SPECS
-    models = {k: v for k, v in bundle['models'].items() if SPECS[k]['data'] in PUBLIC_DATASETS}
+    models = {k: v for k, v in bundle['models'].items()       # ключи вне SPECS (старая детская модель) — нет
+              if k in SPECS and SPECS[k]['data'] in PUBLIC_DATASETS}
     pub = {**bundle, 'models': models}
     os.makedirs(out_dir, exist_ok=True)
     name = asset_name(bundle['compat']['sklearn'])

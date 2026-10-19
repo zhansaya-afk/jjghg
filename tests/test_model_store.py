@@ -36,7 +36,7 @@ def test_publish_and_fetch(server, tmp_path):
     bundle = {'models': {'eyes_defy': {'w': 1}, 'cp_anemic': {'w': 2}}, 'compat': STORE.compat_stamp(), 'commit': 'abc'}
     path, tag = STORE.write_published(bundle, str(server / f'models-{STORE.code_version()}'))
     assert tag == f'models-{STORE.code_version()}'
-    assert set(joblib.load(path)['models']) == {'eyes_defy'}          # модели детей не публикуются (лицензия)
+    assert set(joblib.load(path)['models']) == {'eyes_defy'}          # ключ старой детской модели не публикуется
     got, msg = STORE.fetch_published(str(tmp_path / 'dl'))
     assert got and joblib.load(got)['models'] == {'eyes_defy': {'w': 1}}, msg
     meta_path = path[:-len('.joblib')] + '.json'
@@ -62,7 +62,5 @@ def test_verify_files(tmp_path):
 
 
 def test_sha1_lists_parse():
-    cp = fetch_data.read_sha1_list('cp_anemic_v2.sha1')
     ed = fetch_data.read_sha1_list('eyes_defy.sha1')
-    assert len(cp) == 251 and all(k.endswith('.png') for k in cp)
     assert len(ed) == 865 and sum(k.endswith('.jpg') for k in ed) >= 216
