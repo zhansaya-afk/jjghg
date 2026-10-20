@@ -64,5 +64,5 @@ def test_eyes_defy_layout_and_seg_baseline(tmp_path):
                         '--model', 'ridge', '--no-history', '--tag', 'pytest', '--jobs', '1'],
                        capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr[-2000:]
-    assert '| eyes_defy | v11 pixel-HGB | 20 |' in r.stdout
+    assert '| eyes_defy | v11 pixel-HGB | 19 |' in r.stdout   # ED_India_2 — в BAD_DOCTOR_MASKS, в IoU не идёт
     assert 'ridge · маска doctor' in r.stdout and 'ridge · маска pred' in r.stdout

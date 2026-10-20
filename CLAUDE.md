@@ -64,6 +64,7 @@ python scripts/evaluate.py ...                            # (этап 1) еди�
 | Eyes-defy-anemia | ~218 взрослых (Италия, Индия), фото с насадки, Hb, пол, возраст, маски конъюнктивы врачей; поля беременности нет; CC BY-SA 4.0 (так указано на Kaggle) | Kaggle `harshwardhanfartale/eyes-defy-anemia`; скрипт `md/datasets/eyes_defy_anemia/fetch_eyes_defy_anemia.py` |
 | ~~CP-AnemiC V2~~ | **исключён 2026-10-19** (решение команды): не скачивается, не обучается, не оценивается; детей до 5 лет система не оценивает (отказ) | архив в общей папке `md/datasets/cp_anemic/`, не удалять |
 | turna1 | 183 фото, только бинарная метка, много дублей | `md/datasets/conj_binary_turna1/`; делить по колонке `group` |
+| Внешние Kaggle без Hb (`anemia/external.py`) | `phone_conj_masks` — 83 фото глаза с телефона + маски конъюнктивы, Apache 2.0: только обучение сегментатора и IoU (`evaluate.py --task seg_ext`); `kaggle_conj_binary` = turna1 (бинарная метка); `indonesia_phone` — 209 фото без меток, лицензия не указана, **в именах файлов ФИО**: только проверка приёма снимков. Модель риска на них не учится. `kpriyadharcini/anaemia`, `abood92/eye-segmentation` — побайтные копии Eyes-defy, не качаются | `scripts/fetch_data.py --external`, индекс `<data>/external/index.csv` (вне git) |
 | `data/phone/` | наши фото со смартфона + `hb.csv` (+ ручные маски) | пополняется командой |
 
 - Облачная сеть отдаёт 403 на kaggle.com, Mendeley, Zenodo, Roboflow, HF: датасеты скачивает ячейка 1 Colab-блокнота, не облачная сессия. Работает только `git clone` с GitHub.

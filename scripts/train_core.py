@@ -8,12 +8,14 @@
 Модель та же, что проверяет `python scripts/evaluate.py --task core` (anemia/core.py, fit_core): цифры точности
 брать оттуда, этот скрипт метрик не считает. Конъюнктиву снимков глаза выделяет сегментатор по маскам врачей
 (anemia/segment_baseline.py): признаки обучения — по маскам моделей, не видевших фолда снимка (как в evaluate),
-в файл модели (conj_seg) идёт сегментатор на всех снимках — им predict размечает новые фото.
+в файл модели (conj_seg) идёт сегментатор на всех снимках — им predict размечает новые фото. Если скачаны внешние
+телефонные фото с масками (fetch_data.py --external), они добавляются в обучение сегментатора (не модели риска).
 Пороги риска и решение «показывать ли Hb» подбираются вложенной CV
 по пациентам внутри обучающих данных. Признаки — общий кэш с evaluate.py (<data>/cache/features).
 """
 import argparse
 import datetime as dt
+import hashlib
 import os
 import sys
 
@@ -27,9 +29,22 @@ sys.path.insert(0, os.path.join(ROOT, 'scripts'))
 from evaluate import _frame, conj_segmenters, core_jobs, git_state, route_counts  # noqa: E402
 
 from anemia import core as CORE  # noqa: E402
+from anemia import external as EXT  # noqa: E402
 from anemia import model_store as STORE  # noqa: E402
 from anemia.cache import FeatureCache, source_version  # noqa: E402
+from anemia.data import BAD_DOCTOR_MASKS  # noqa: E402
 from anemia.predict import MODEL_FILE  # noqa: E402
+
+
+def train_data_fingerprint(man, ext_sha1):
+    """sha1 того, на чём учится модель: снимки и маски манифеста, фолды, исключённые маски, телефонные фото
+    сегментатора. Другие данные → готовая модель не подходит (иначе исправления данных не доходят до модели)."""
+    h = hashlib.sha1()
+    cols = [c for c in ('dataset', 'patient_id', 'sha1', 'mask_conj', 'hb_g_l', 'fold') if c in man]
+    h.update(man[cols].astype(str).sort_values(cols).to_csv(index=False).encode())
+    h.update(repr(sorted(BAD_DOCTOR_MASKS)).encode())
+    h.update(repr(list(ext_sha1)).encode())
+    return h.hexdigest()[:16]
 
 
 def main():
@@ -40,6 +55,8 @@ def main():
     ap.add_argument('--dataset', choices=['all', *CORE.SPECS], default='all')
     ap.add_argument('--jobs', type=int, default=-1)
     ap.add_argument('--no-cache', action='store_true')
+    ap.add_argument('--no-external-seg', action='store_true',
+                    help='сегментатор только по маскам Eyes-defy, без телефонных фото <data>/external (scripts/fetch_data.py --external)')
     ap.add_argument('--force', action='store_true', help='обучить всё заново, не глядя на готовые модели')
     ap.add_argument('--no-download', action='store_true', help='не скачивать опубликованную модель взрослых')
     ap.add_argument('--publish-dir', help='сюда же положить файл для GitHub Release (только модели взрослых)')
@@ -49,10 +66,14 @@ def main():
     cache = FeatureCache(os.path.join(a.data, 'cache', 'features'), 'off' if a.no_cache else 'on',
                          salt={'evaluate_py': source_version(os.path.join(ROOT, 'scripts', 'evaluate.py'))})
     keys = list(CORE.SPECS) if a.dataset == 'all' else [a.dataset]
+    ext_sha1 = [] if a.no_external_seg else sorted(EXT.seg_index(a.data).get('sha1', pd.Series(dtype=str)))
+    data_fp = train_data_fingerprint(man, ext_sha1)
     models, feats, sources, conj_seg = {}, {}, {}, None
     if not a.force and os.path.exists(a.out):
         old = joblib.load(a.out)
         why = STORE.check_compat(old.get('compat'))
+        if not why and old.get('train_data') != data_fp:
+            why = 'другие обучающие данные (манифест, исключённые маски или телефонные фото сегментатора)'
         if why:
             print(f'Модель {a.out} не подходит ({why}) — готовлю заново')
         else:
@@ -66,7 +87,11 @@ def main():
         print(msg)
         if path:
             pub = joblib.load(path)
-            got = {k: v for k, v in pub['models'].items() if k in adult} if pub.get('conj_seg') is not None else {}
+            same_data = pub.get('train_data') == data_fp
+            if not same_data:
+                print('опубликованная модель обучена на других данных — обучаю здесь')
+            got = ({k: v for k, v in pub['models'].items() if k in adult}
+                   if pub.get('conj_seg') is not None and same_data else {})
             conj_seg = pub.get('conj_seg') if got else conj_seg
             models.update(got)
             sources.update({k: f"GitHub Release models-{pub['compat']['code']} (коммит {pub.get('commit')})" for k in got})
@@ -84,7 +109,7 @@ def main():
             if not df.mask_conj.notna().all():
                 sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы обучить не на чем')
             print(f'{ds}: сегментатор конъюнктивы по маскам врачей {len(df)} снимков...', flush=True)
-            segs = conj_segmenters(a.data, df, a.jobs, cache)
+            segs = conj_segmenters(a.data, df, a.jobs, cache, external=not a.no_external_seg)
             conj_seg = segs[()]
             J = core_jobs(a.data, df, a.jobs, segs, cache)
             print(f'{ds}: маршрут анализа фото: ' + ', '.join(f'{k} {v}' for k, v in route_counts(J, len(df)).items()))
@@ -102,7 +127,8 @@ def main():
     git = git_state()
     bundle = {'models': models, 'commit': git['commit'], 'created': dt.datetime.now().isoformat(timespec='seconds'),
               'sklearn': sklearn.__version__, 'manifest_rows': len(man), 'compat': STORE.compat_stamp(),
-              'sources': sources, 'conj_seg': conj_seg}
+              'sources': sources, 'conj_seg': conj_seg, 'train_data': data_fp,
+              'conj_seg_external': ext_sha1}      # телефонные фото, на которых учился сегментатор (их IoU — не честный)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     joblib.dump(bundle, a.out)
     print(f'Модель → {a.out} (коммит {git["commit"]}, sklearn {sklearn.__version__}); '

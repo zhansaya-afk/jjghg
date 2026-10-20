@@ -51,11 +51,13 @@ from anemia import predict as PR  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
 from anemia import runs as RUNS  # noqa: E402
+from anemia import external as EXT  # noqa: E402
+from anemia.data import BAD_DOCTOR_MASKS  # noqa: E402
 from anemia.augment import STRESS_CONDITIONS, apply_illuminant  # noqa: E402
 from anemia.cache import TIMING_KEYS, FeatureCache, empty_timings, file_sha1, source_version  # noqa: E402
 from anemia.features import N_RELIGHT, WORK_SIZE, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
-from anemia.io import load_rgb  # noqa: E402
+from anemia.io import load_mask, load_rgb, resize_to  # noqa: E402
 from anemia.labs import is_pregnant  # noqa: E402
 from anemia.regions import detect_regions  # noqa: E402
 
@@ -150,16 +152,18 @@ def run_seg(root, df, jobs, timer=None):
         timer.add('сегментация v11: чтение + признаки пикселей', [t for _, t in out], time.perf_counter() - t0)
     pred = [None] * len(df)
     folds = df.fold.values
+    good = ~df.patient_id.isin(BAD_DOCTOR_MASKS).values      # испорченные маски: не учим и не меряем по ним
     for f in sorted(set(folds)):
-        tr = [i for i in range(len(df)) if folds[i] != f]
+        tr = [i for i in range(len(df)) if folds[i] != f and good[i]]
         model = SB.train([items[i][2] for i in tr], [items[i][1] for i in tr])
         for i in np.flatnonzero(folds == f):
             pred[i] = SB.predict(model, items[i][2])
-    ious = np.array([M.iou(p, it[1]) for p, it in zip(pred, items)])
-    dices = np.array([M.dice(p, it[1]) for p, it in zip(pred, items)])
-    lo, hi = M.bootstrap_ci(np.mean, df.group.values, 1000, 0, ious)
-    res = {'n': len(df), 'iou_mean': ious.mean(), 'iou_lo': lo, 'iou_hi': hi, 'iou_median': float(np.median(ious)),
-           'dice_mean': dices.mean(), 'found': float(np.mean([p.any() for p in pred]))}
+    ious = np.array([M.iou(p, it[1]) for p, it in zip(pred, items)])[good]
+    dices = np.array([M.dice(p, it[1]) for p, it in zip(pred, items)])[good]
+    lo, hi = M.bootstrap_ci(np.mean, df.group.values[good], 1000, 0, ious)
+    res = {'n': int(good.sum()), 'iou_mean': ious.mean(), 'iou_lo': lo, 'iou_hi': hi,
+           'iou_median': float(np.median(ious)), 'dice_mean': dices.mean(),
+           'found': float(np.mean([p.any() for p, g in zip(pred, good) if g]))}
     return res, pred, items
 
 
@@ -368,12 +372,36 @@ def _segpix_job(root, row, seed, cache=NO_CACHE):
     return cache.fetch('segpix', files, {}, params, _segpix_compute, root, row, seed)
 
 
-def conj_segmenters(root, df, jobs, cache=NO_CACHE, timer=None, nested=False, full=True):
+def _segpix_ext_compute(root, row, seed):
+    t0 = time.perf_counter()
+    rgb = load_rgb(os.path.join(root, row['file']), WORK_SIZE)
+    gt = resize_to(load_mask(os.path.join(root, row['mask'])), rgb.shape[:2], nearest=True)
+    t1 = time.perf_counter()
+    return SB.image_samples(rgb, gt, seed), {'read': t1 - t0, 'features': time.perf_counter() - t1}
+
+
+def _segpix_ext_job(root, row, seed, cache=NO_CACHE):
+    files = {'image': os.path.join(root, row['file']), 'mask': os.path.join(root, row['mask'])}
+    params = {'seed': seed, 'work_size': WORK_SIZE, 'pix_per_image': SB.PIX_PER_IMAGE}
+    return cache.fetch('segpix_ext', files, {}, params, _segpix_ext_compute, root, row, seed)[0]
+
+
+def external_seg_samples(root, jobs, cache=NO_CACHE, idx=None):
+    """Пиксели внешних телефонных фото с масками конъюнктивы (anemia.external.seg_index). Пациентов Eyes-defy там
+    нет (сверка sha1 и миниатюр), Hb и меток риска нет — добавляются в обучение сегментатора (не модели риска).
+    Их IoU вне обучения — только --task seg_ext (фолды по группам). Нет индекса — пустой список."""
+    idx = EXT.seg_index(root) if idx is None else idx
+    return Parallel(n_jobs=jobs)(delayed(_segpix_ext_job)(root, r, 100000 + i, cache)
+                                 for i, r in enumerate(idx.to_dict('records')))
+
+
+def conj_segmenters(root, df, jobs, cache=NO_CACHE, timer=None, nested=False, full=True, external=True):
     """Сегментаторы конъюнктивы по маскам врачей → {набор фолдов, которых модель НЕ видела: модель}.
         (g,)   — маски снимков фолда g (OOF): тестовые снимки evaluate и обучающие признаки train_core;
         (f, g) — nested=True, только evaluate: маски обучающих снимков фолда g при оценке внешнего фолда f. Так маски
                  врачей тестового фолда f не влияют ни на одну маску, по которой учится модель риска фолда f;
         ()     — full=True: модель на всех снимках, только для новых фото (файл модели, predict).
+    external=True — в обучение каждой модели добавляются телефонные фото с масками (external_seg_samples).
     Hb и метки риска сегментатор не видит."""
     assert WORK_SIZE == SB.SEG_SIZE, 'сегментатор обучается на load_item (WORK_SIZE), применяется на SEG_SIZE'
     t0 = time.perf_counter()
@@ -383,14 +411,90 @@ def conj_segmenters(root, df, jobs, cache=NO_CACHE, timer=None, nested=False, fu
                   time.perf_counter() - t0)
     samples, fold_of = [x for x, _ in res], df.fold.astype(int).values
     folds = sorted(set(fold_of))
+    # испорченные маски (BAD_DOCTOR_MASKS) в обучение сегментатора не идут: как будто снимок в фолде -1
+    fold_of = np.where(df.patient_id.isin(BAD_DOCTOR_MASKS).values, -1, fold_of)
     keys = ([()] if full else []) + [(g,) for g in folds] + (
         [(f, g) for f in folds for g in folds if g != f] if nested else [])
     t0 = time.perf_counter()
-    models = Parallel(n_jobs=jobs)(delayed(SB.fit_samples)([x for x, g in zip(samples, fold_of) if g not in k])
-                                   for k in keys)
+    ext = external_seg_samples(root, jobs, cache) if external else []
+    if ext:
+        print(f'сегментатор конъюнктивы: + {len(ext)} телефонных фото с масками (external/)', flush=True)
+    models = Parallel(n_jobs=jobs)(delayed(SB.fit_samples)([x for x, g in zip(samples, fold_of) if g not in k and g >= 0]
+                                                           + ext) for k in keys)
     if timer is not None:
-        timer.add(f'сегментатор конъюнктивы {df.dataset.iloc[0]}: обучение {len(keys)} моделей', [], time.perf_counter() - t0)
+        timer.add(f'сегментатор конъюнктивы {df.dataset.iloc[0]}: обучение {len(keys)} моделей (+{len(ext)} внешних '
+                  'телефонных фото)', [], time.perf_counter() - t0)
     return dict(zip(keys, models))
+
+
+def _seg_test_item(root, row, kind):
+    if kind == 'ed':
+        return load_item(root, row, 'doctor')
+    rgb = load_rgb(os.path.join(root, row['file']), WORK_SIZE)
+    return rgb, resize_to(load_mask(os.path.join(root, row['mask'])), rgb.shape[:2], nearest=True)
+
+
+def _seg_scores(model, items):
+    """(IoU, Dice, нашёл) по снимкам; пустая разметка → None (IoU пусто/пусто = 1 завысил бы среднее)."""
+    out = []
+    for rgb, gt in items:
+        if not gt.any():
+            out.append(None)
+            continue
+        p = SB.conj_mask(model, rgb)
+        out.append((M.iou(p, gt), M.dice(p, gt), bool(p.any())))
+    return out
+
+
+def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
+    """Сегментатор ядра (SB.conj_mask, как в анализе фото) без и с телефонными фото external/ — IoU вне обучения:
+    Eyes-defy по фолдам манифеста, телефонные фото по GroupKFold их групп (почти одинаковые кадры в одном фолде).
+    Модель фолда f не видит ни снимков Eyes-defy фолда f, ни телефонных фото фолда f. → строки для истории."""
+    idx = EXT.seg_index(root)
+    if not len(idx):
+        print('нет <data>/external/index.csv с масками (python scripts/fetch_data.py --external phone_conj_masks) — '
+              'пропуск seg_ext')
+        return []
+    t0 = time.perf_counter()
+    ed_s = Parallel(n_jobs=jobs)(delayed(_segpix_job)(root, r, i, cache) for i, r in enumerate(df.to_dict('records')))
+    ex_s = external_seg_samples(root, jobs, cache, idx)
+    ed_items = Parallel(n_jobs=jobs)(delayed(_seg_test_item)(root, r, 'ed') for r in df.to_dict('records'))
+    ex_items = Parallel(n_jobs=jobs)(delayed(_seg_test_item)(root, r, 'ext') for r in idx.to_dict('records'))
+    if timer is not None:
+        timer.add('seg_ext: пиксели масок и тестовые снимки', [t for _, t in ed_s], time.perf_counter() - t0)
+    ed_s = [x for x, _ in ed_s]
+    good = ~df.patient_id.isin(BAD_DOCTOR_MASKS).values
+    ed_fold = df.fold.astype(int).values
+    ex_fold = np.zeros(len(idx), int)
+    for f, (_, te) in enumerate(GroupKFold(min(n_folds, idx.group.nunique())).split(idx, groups=idx.group)):
+        ex_fold[te] = f
+    folds = sorted(set(ed_fold))
+    jobs_list = []
+    for f in folds:
+        tr_ed = [x for x, g, ok in zip(ed_s, ed_fold, good) if g != f and ok]
+        tr_ex = [x for x, g in zip(ex_s, ex_fold) if g != f]
+        for arm, tr in (('Eyes-defy', tr_ed), ('Eyes-defy + телефонные', tr_ed + tr_ex)):
+            jobs_list.append((f, arm, tr))
+    models = Parallel(n_jobs=jobs)(delayed(SB.fit_samples)(tr) for _, _, tr in jobs_list)
+    scores = {}
+    for (f, arm, _), m in zip(jobs_list, models):
+        te_ed = [it for it, g, ok in zip(ed_items, ed_fold, good) if g == f and ok]
+        te_ex = [it for it, g in zip(ex_items, ex_fold) if g == f]
+        scores.setdefault((arm, 'eyes_defy'), []).extend(
+            zip(df.group.values[(ed_fold == f) & good], _seg_scores(m, te_ed)))
+        scores.setdefault((arm, 'phone_conj_masks'), []).extend(
+            zip(idx.group.values[ex_fold == f], _seg_scores(m, te_ex)))
+    rows = []
+    for (arm, test), v in scores.items():
+        v = [(g, sc) for g, sc in v if sc is not None]
+        groups = np.array([g for g, _ in v])
+        iou = np.array([s[0] for _, s in v])
+        lo, hi = M.bootstrap_ci(np.mean, groups, 1000, 0, iou)
+        rows.append({'task': 'seg_ext', 'dataset': test, 'method': f'сегментатор ядра · обучение: {arm}',
+                     'n': len(v), 'iou_mean': float(iou.mean()), 'iou_lo': lo, 'iou_hi': hi,
+                     'iou_median': float(np.median(iou)), 'dice_mean': float(np.mean([s[1] for _, s in v])),
+                     'found': float(np.mean([s[2] for _, s in v]))})
+    return rows
 
 
 DET_KEYS = ('crop', 'conj', 'sclera', 'iris', 'use', 'kind', 'notes', 'src_side', 'score')
@@ -544,6 +648,10 @@ def eval_external(T, F, S, key):
     T, F = CORE.usable(T, key), CORE.usable(F, key)
     if not len(T) or not len(F):
         return None, None, None
+    T0 = T[T.aug == 0]
+    n_cls = T0.drop_duplicates('group').anemic.value_counts()
+    if len(n_cls) < 2 or n_cls.min() < 2 * CORE.INNER_FOLDS:   # мало пациентов класса: вложенная CV порогов не соберётся
+        return None, None, None
     assert not set(T.group) & set(F.group), 'пациент теста в обучении'
     feats = CORE.feature_list(T.columns, key)
     B = CORE.fit_core(T, feats, key)
@@ -572,7 +680,7 @@ def eval_external(T, F, S, key):
     return r, O.assign(accepted=acc), base
 
 
-def run_country(root, df, jobs, cache=NO_CACHE, timer=None):
+def run_country(root, df, jobs, cache=NO_CACHE, timer=None, external=True):
     """Внешняя проверка внутри Eyes-defy: все пациенты одной страны → обучение, все пациенты другой → тест.
     Всё обучаемое видит только страну обучения: сегментатор конъюнктивы по маскам врачей, модель риска, её пороги,
     диапазон OOD, решение «показывать Hb». Маски обучающих снимков — сегментатором без их фолда (OOF внутри страны
@@ -584,7 +692,7 @@ def run_country(root, df, jobs, cache=NO_CACHE, timer=None):
         if dropped:
             print(f'{train_c}→{test_c}: копии снимков в обеих странах исключены из обеих частей: {len(dropped)} групп '
                   f'({", ".join(dropped[:5])})')
-        segs = conj_segmenters(root, A, jobs, cache, timer, nested=False, full=True)
+        segs = conj_segmenters(root, A, jobs, cache, timer, nested=False, full=True, external=external)
         JA = core_jobs(root, A, jobs, segs, cache, timer)
         JB = core_jobs(root, B, jobs, {(int(g),): segs[()] for g in set(B.fold)}, cache, timer)
         for key in CORE.specs_for('eyes_defy'):
@@ -687,7 +795,7 @@ def save_oof(O, cols, name, run_dir, oof_dir, backup_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data', default=os.environ.get('ANEMIA_DATA', 'data'))
-    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12', 'core', 'country'], default='all')
+    ap.add_argument('--task', choices=['all', 'seg', 'hb', 'v12', 'core', 'country', 'seg_ext'], default='all')
     ap.add_argument('--dataset', choices=['all', 'eyes_defy', 'phone'], default='all')
     ap.add_argument('--model', choices=['hgb', 'ridge', 'both'], default='both')
     ap.add_argument('--target-sens', type=float, default=0.80)
@@ -698,6 +806,8 @@ def main():
                     help='история в репозитории (по умолчанию results/metrics_history.csv)')
     ap.add_argument('--cache-dir', help='кэш признаков (по умолчанию <data>/cache/features)')
     ap.add_argument('--no-cache', action='store_true', help='не читать и не писать кэш признаков')
+    ap.add_argument('--no-external-seg', action='store_true',
+                    help='сегментатор только по маскам Eyes-defy (без телефонных фото external/, как до 2026-10-20)')
     ap.add_argument('--refresh-cache', action='store_true', help='пересчитать признаки и перезаписать кэш')
     a = ap.parse_args()
     if a.no_cache and a.refresh_cache:
@@ -734,6 +844,8 @@ def main():
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
     os.makedirs(res_dir, exist_ok=True)
     rows = []
+    n_ext = 0 if a.no_external_seg or a.task not in ('core', 'country') else len(EXT.seg_index(a.data))
+    seg_note = f' · сегментатор +{n_ext} тел. фото' if n_ext else ''   # строки с/без телефонных фото различимы
     for ds in (['eyes_defy', 'phone'] if a.dataset == 'all' else [a.dataset]):
         df = man[man.dataset == ds].reset_index(drop=True)
         if not len(df):
@@ -743,24 +855,32 @@ def main():
                 print(f'{ds}: проверка между странами только для Eyes-defy — пропуск')
                 continue
             print(f'[{time.time() - t0:5.0f} с] {ds}: проверка между странами (Индия ↔ Италия)...')
-            for direction, key, r, O, base in run_country(a.data, df, a.jobs, cache, timer):
+            for direction, key, r, O, base in run_country(a.data, df, a.jobs, cache, timer,
+                                                                   external=not a.no_external_seg):
                 name = f'{ds} {direction}'
                 if r is None:
-                    print(f'{name} · {key}: нет принятых снимков в одной из стран — пропуск')
+                    print(f'{name} · {key}: в одной из стран нет снимков для этой модели или для обучения мало пациентов / один класс — пропуск')
                     continue
                 rows.append({'task': 'country', 'dataset': name, 'method': f"{key} · core · обучение "
-                             f"{r['n_train']} пац., тест принято {r['n_accepted']}/{len(O)} (OOD {r['n_ood']})", **r})
+                             f"{r['n_train']} пац., тест принято {r['n_accepted']}/{len(O)} (OOD {r['n_ood']}){seg_note}", **r})
                 rows.append({'task': 'country', 'dataset': name, 'method': f"базовая: всегда «"
                              f"{'анемия' if base['const'] else 'норма'}» (частый класс страны обучения)", **base})
                 save_oof(O, ['group', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens', 'accepted'],
                          f"oof_{a.tag}_{ds}_{direction.replace('→', '_to_')}_{key}_country.csv", run_dir, res_dir,
                          backup_dir)
             continue
+        if a.task == 'seg_ext':
+            if ds != 'eyes_defy':   # телефонные фото с масками проверяются один раз, рядом с Eyes-defy
+                continue
+            print(f'[{time.time() - t0:5.0f} с] {ds}: сегментатор ядра без/с телефонными фото, IoU вне обучения...')
+            rows += run_seg_external(a.data, df, a.jobs, cache, timer)
+            continue
         if a.task == 'core':
             if not df.mask_conj.notna().all():
                 sys.exit(f'{ds}: у части снимков нет масок врачей — сегментатор конъюнктивы ядра обучить не на чем')
             print(f'[{time.time() - t0:5.0f} с] {ds}: сегментаторы конъюнктивы по маскам врачей (без тестового фолда)...')
-            segs = conj_segmenters(a.data, df, a.jobs, cache, timer, nested=True, full=False)
+            segs = conj_segmenters(a.data, df, a.jobs, cache, timer, nested=True, full=False,
+                                   external=not a.no_external_seg)
             print(f'[{time.time() - t0:5.0f} с] {ds}: маршрут анализа фото, отказы и признаки...')
             J = core_jobs(a.data, df, a.jobs, segs, cache, timer, nested=True)
             rc = route_counts(J, len(df))
@@ -772,7 +892,7 @@ def main():
                     print(f'{key}: анализ фото не оценит этой моделью ни одного снимка — пропуск')
                     continue
                 rows.append({'task': 'core', 'dataset': key, 'method': f"core · принято {r['n_accepted']}/{len(df)} "
-                             f"(этой моделью {r['n_routed']}, OOD {r['n_ood']})", **r})
+                             f"(этой моделью {r['n_routed']}, OOD {r['n_ood']}){seg_note}", **r})
                 save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens',
                              'accepted'], f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
             RUNS.write_json(os.path.join(run_dir, f'routes_{ds}.json'), rc)
@@ -813,8 +933,8 @@ def main():
                 rows.append({'task': 'hb', 'dataset': ds, 'method': method, **r})
                 save_oof(O, ['group', 'fold', 'hb_g_l', 'pred', 'score', 'thr', 'flag', 'anemic'],
                          f'oof_{a.tag}_{ds}_{src}_{mk}.csv', run_dir, res_dir, backup_dir)
-    if any(r['task'] in ('seg', 'hb') for r in rows):
-        print_table([r for r in rows if r['task'] in ('seg', 'hb')])
+    if any(r['task'] in ('seg', 'hb', 'seg_ext') for r in rows):
+        print_table([r for r in rows if r['task'] in ('seg', 'hb', 'seg_ext')])
     if any(r['task'] == 'core' for r in rows):
         print_core_table([r for r in rows if r['task'] == 'core'])
     if any(r['task'] == 'country' and 'share_low' in r for r in rows):
