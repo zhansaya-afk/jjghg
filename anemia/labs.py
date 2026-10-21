@@ -17,9 +17,30 @@ class WhoLimits:
     moderate: float  # moderate ≤ Hb < mild → умеренная; ниже → тяжёлая
 
 
-def who_limits(sex=None, age=None, pregnant=False):
-    """sex: 'M' / 'F' / None, age в годах (дробный для детей до 5 лет), pregnant: bool."""
-    if pregnant or (age is not None and age < 5):
+def norm_pregnant(v):
+    """Статус беременности из источника → True / False / None (неизвестно). Только из явного поля данных:
+    из пола, возраста или других признаков не выводится; пусто, NaN или непонятное значение → None."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, float) and v != v:
+        return None
+    s = str(v).strip().lower()
+    if s in ('1', '1.0', 'true', 'yes', 'y', 'да'):
+        return True
+    if s in ('0', '0.0', 'false', 'no', 'n', 'нет'):
+        return False
+    return None
+
+
+def is_pregnant(v):
+    """Для выбора нормы ВОЗ: беременность только подтверждённая. Неизвестный статус (None) → нормы небеременных,
+    как и раньше (пороги не меняются), но сам статус в данных остаётся None и в False не превращается."""
+    return norm_pregnant(v) is True
+
+
+def who_limits(sex=None, age=None, pregnant=None):
+    """sex: 'M' / 'F' / None, age в годах (дробный для детей до 5 лет), pregnant: True / False / None (неизвестно)."""
+    if is_pregnant(pregnant) or (age is not None and age < 5):
         return WhoLimits(110, 100, 70)
     if age is not None and age < 12:
         return WhoLimits(115, 110, 80)
@@ -30,7 +51,7 @@ def who_limits(sex=None, age=None, pregnant=False):
     return WhoLimits(120, 110, 80)
 
 
-def who_grade(hb_g_l, sex=None, age=None, pregnant=False):
+def who_grade(hb_g_l, sex=None, age=None, pregnant=None):
     lim = who_limits(sex, age, pregnant)
     if hb_g_l >= lim.normal:
         return 'norm'
@@ -41,7 +62,7 @@ def who_grade(hb_g_l, sex=None, age=None, pregnant=False):
     return 'severe'
 
 
-def is_anemic(hb_g_l, sex=None, age=None, pregnant=False):
+def is_anemic(hb_g_l, sex=None, age=None, pregnant=None):
     return hb_g_l < who_limits(sex, age, pregnant).normal
 
 
@@ -76,13 +97,13 @@ def hb_to_g_l(value, unit=None):
     return g_l
 
 
-def lab_hb_report(value, unit=None, sex=None, age=None, pregnant=False):
+def lab_hb_report(value, unit=None, sex=None, age=None, pregnant=None):
     """Интерпретация готового лабораторного Hb по нормам ВОЗ 2011. Никак не связана с оценкой по фото:
     это отдельный путь, и цифры фото-модели здесь не используются. → dict."""
     hb = hb_to_g_l(value, unit)
     lim = who_limits(sex, age, pregnant)
     grade = who_grade(hb, sex, age, pregnant)
-    who = ('беременные' if pregnant else 'дети до 5 лет' if age is not None and age < 5 else
+    who = ('беременные' if is_pregnant(pregnant) else 'дети до 5 лет' if age is not None and age < 5 else
            'дети 5–11 лет' if age is not None and age < 12 else 'дети 12–14 лет' if age is not None and age < 15 else
            'мужчины ≥ 15 лет' if sex == 'M' else 'женщины ≥ 15 лет' if sex == 'F' else 'пол не указан: нормы женщин')
     return {'source': 'лабораторный анализ', 'hb_g_l': round(hb, 1), 'grade': grade, 'grade_ru': GRADE_RU[grade],

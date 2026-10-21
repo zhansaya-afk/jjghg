@@ -6,14 +6,14 @@ import numpy as np
 from .augment import STRESS_CONDITIONS, apply_illuminant, random_relight
 from .color import roi_features
 from .io import load_mask, load_rgb, resize_to
-from .labs import who_limits
+from .labs import is_pregnant, who_limits
 
 WORK_SIZE = 256        # длинная сторона снимка для признаков (как в v11)
 N_RELIGHT = 3          # обучающих копий при другом свете на снимок (как в v11)
 
 
 def load_item(root, row, mask_source):
-    """→ (rgb, маска конъюнктивы). mask_source: 'full' — весь кадр (CP-AnemiC уже вырезан), 'doctor' — маска врача."""
+    """→ (rgb, маска конъюнктивы). mask_source: 'full' — весь кадр (уже вырезанная ткань), 'doctor' — маска врача."""
     rgb = load_rgb(os.path.join(root, row['image']), WORK_SIZE)
     if mask_source == 'full':
         return rgb, np.ones(rgb.shape[:2], bool)
@@ -26,7 +26,7 @@ def row_meta(row):
     age = row['age'] if row['age'] == row['age'] else None
     sex = row['sex'] if isinstance(row['sex'], str) else None
     return {'group': row['group'], 'fold': int(row['fold']), 'hb_g_l': float(row['hb_g_l']),
-            'anemic': bool(row['anemic']), 'normal_thr': who_limits(sex, age, bool(row['pregnant'])).normal,
+            'anemic': bool(row['anemic']), 'normal_thr': who_limits(sex, age, is_pregnant(row['pregnant'])).normal,
             'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
 
 

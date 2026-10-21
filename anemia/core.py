@@ -33,8 +33,8 @@ OOD_MAX = 0.30           # как в v12: больше 30% признаков д
 INNER_FOLDS = 4
 RISK_LEVELS = ('низкий', 'средний', 'высокий')
 
-SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка; взрослые — снимок глаза,
-    # дети — уже вырезанная конъюнктива. У взрослых — отдельная модель на каждый набор найденных тканей:
+SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка (снимок глаза взрослого;
+    # детской модели нет — CP-AnemiC исключён 2026-10-19). Отдельная модель на каждый набор найденных тканей:
     # недостающая ткань не заменяется нулями или признаками другой ткани
     'eyes_defy': {'data': 'eyes_defy', 'prefixes': ('c_', 's_', 'w_'), 'need': ('c_',), 'sex': True,
                   'tissues': ('conj', 'sclera'), 'title': 'взрослые (Eyes-defy-anemia), конъюнктива + склера'},
@@ -42,8 +42,6 @@ SPECS = {   # модель → датасет манифеста, признак
                        'tissues': ('conj',), 'title': 'взрослые (Eyes-defy-anemia), только конъюнктива'},
     'eyes_defy_sclera': {'data': 'eyes_defy', 'prefixes': ('s_',), 'need': ('s_',), 'sex': True,
                          'tissues': ('sclera',), 'title': 'взрослые (Eyes-defy-anemia), только склера'},
-    'cp_anemic': {'data': 'cp_anemic', 'prefixes': ('c_',), 'need': ('c_',), 'sex': False,
-                  'tissues': ('conj',), 'title': 'дети 6–59 мес (CP-AnemiC)'},
 }
 
 
@@ -136,16 +134,20 @@ def apply_core(B, X):
 
 
 # ------------------------------------------------------------------ проверка на фолдах манифеста
-def cross_validate(F, feats, dataset, S=None, seed=0):
+def cross_validate(F, feats, dataset, S=None, seed=0, train_by_fold=None):
     """OOF по фолдам манифеста: модель и все её пороги обучаются на 4 фолдах, применяются к пятому.
     S — признаки тех же снимков при 8 стресс-условиях света (group, cond): риск по ним считает модель того фолда,
-    где пациент был тестовым. → (OOF-таблица исходных снимков, стресс-таблица или None)."""
+    где пациент был тестовым. train_by_fold — {фолд f: обучающие строки}, если признаки обучающих снимков зависят
+    от тестового фолда (маски сегментатора, не видевшего f); иначе обучение — строки F остальных фолдов.
+    → (OOF-таблица исходных снимков, стресс-таблица или None)."""
     O = F[F.aug == 0].reset_index(drop=True)
     cols = {k: np.full(len(O), np.nan) for k in ('p', 'level', 'hb_pred', 'ood', 'hb_ok', 'thr_sens', 'hb_hw')}
     stress = []
     for f in sorted(O.fold.unique()):
         te = np.flatnonzero(O.fold.values == f)
-        B = fit_core(F[F.fold != f], feats, dataset, seed)
+        T = F[F.fold != f] if train_by_fold is None else train_by_fold[f]
+        assert not set(T.group) & set(O.group.values[te]), 'пациент теста в обучении'
+        B = fit_core(T, feats, dataset, seed)
         p, lv, hbp, ood = apply_core(B, O[feats].values[te])
         for k, v in (('p', p), ('level', lv), ('hb_pred', hbp), ('ood', ood)):
             cols[k][te] = v
@@ -175,6 +177,7 @@ def core_metrics(O, S=None):
     flag = p >= O.thr_sens.values
     r['sens'], r['sens_lo'], r['sens_hi'] = M.wilson(int((flag & anem).sum()), int(anem.sum()))
     r['spec'], r['spec_lo'], r['spec_hi'] = M.wilson(int((~flag & ~anem).sum()), int((~anem).sum()))
+    r.update(M.binary_report(flag, anem, g))       # бинарный ответ — тот же порог thr_sens (вложенная CV на train)
     r['mae'] = M.mae(O.hb_pred.values, O.hb_g_l.values)
     r['hb_shown'] = float(O.hb_ok.mean())
     r['hb_range_cover'] = float((np.abs(O.hb_pred.values - O.hb_g_l.values) <= O.hb_hw.values).mean())

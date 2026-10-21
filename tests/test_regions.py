@@ -73,7 +73,7 @@ def test_conj_closeup_without_iris_is_not_rejected():
     assert regions.quality(r['crop'], r['conj'], r['sclera'], 1000) == []
 
 
-def test_cutout_conj_like_cp_anemic():
+def test_cutout_conj():
     img = np.zeros((200, 300, 3), np.float32)
     m = np.zeros((200, 300), np.uint8)
     cv2.ellipse(m, (150, 60), (130, 110), 0, 20, 160, 1, -1)
