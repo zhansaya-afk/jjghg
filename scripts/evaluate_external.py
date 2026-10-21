@@ -6,10 +6,9 @@
 
 Что считается (снимки — через тот же analyze_photo, что в приложении; пол и возраст неизвестны):
     все наборы — сколько снимков принято (status ok) и на каком шаге отказ;
-    binary     — по группам (серия кадров = один голос): AUC P(анемия) против метки набора, чувствительность и
-                 специфичность ответа «риск не низкий» и «риск высокий» с 95% ДИ Уилсона;
     seg        — сегментатор конъюнктивы модели на всём фото против маски набора: IoU / Dice, доля «нашёл».
-Метки «анемия / нет» внешних наборов — от авторов набора, порог Hb неизвестен; Eyes-defy-копии исключены.
+Наборы из anemia/external.py EXCLUDED (2026-10-21: guptajanavi — проверка «анемия / нет», welldanyogia — приём
+снимков) не оцениваются; их строки в старом index.csv пропускаются. Eyes-defy-копии исключены.
 Результаты по снимкам — только id (без имён файлов) — в <data>/results/external/<run_id>/ (вне git).
 """
 
@@ -30,9 +29,6 @@ from anemia import runs as RUNS  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
 from anemia import external as EXT  # noqa: E402
 from anemia.io import load_mask, load_rgb, resize_to  # noqa: E402
-
-RISK_ORDER = {"низкий": 0, "средний": 1, "высокий": 2}
-
 
 def _one(root, row, model_path, landmarker):
     B = PR.load_bundle(model_path)
@@ -71,12 +67,19 @@ def run(root, idx, model_path, jobs, landmarker):
     return pd.concat([idx.reset_index(drop=True), pd.DataFrame(res)], axis=1)
 
 
+def active_rows(idx, sources=None):
+    """Строки индекса для оценки: только наборы из SOURCES (исключённые — пропуск с причиной), без копий Eyes-defy."""
+    if sources:
+        EXT.check_keys(sources)
+    gone = sorted(set(idx.source) & set(EXT.EXCLUDED))
+    for key in gone:
+        print(f"пропущен {key}: исключён {EXT.EXCLUDED[key]['date']} — {EXT.EXCLUDED[key]['why']}")
+    keep = idx.source.isin(sources or list(EXT.SOURCES)) & ~idx.ed_copy.astype(bool)
+    return idx[keep].reset_index(drop=True)
+
+
 def pct(k, n):
     return f"{k}/{n} ({k / n:.0%})" if n else "—"
-
-
-def ci(p, lo, hi):
-    return "—" if not np.isfinite(p) else f"{p:.2f} [{lo:.2f}–{hi:.2f}]"
 
 
 def report(R):
@@ -93,44 +96,6 @@ def report(R):
             + " |"
         )
     out = ["## Приём снимков", ""] + lines + [""]
-    b = R[(R.use == "binary") & (R.status == "ok") & R.label.notna()]
-    if len(b):
-        G = (
-            b.assign(lvl=b.risk.map(RISK_ORDER))
-            .groupby("group")
-            .agg(
-                y=("label", "max"),
-                p=("p_anemia", "median"),
-                lvl=("lvl", "median"),
-                n=("id", "size"),
-            )
-        )
-        y = G.y.astype(bool).values
-        auc = M.auc(G.p, y) if 0 < y.sum() < len(y) else float("nan")
-        auc_ci = (
-            M.bootstrap_ci(M.auc, np.arange(len(G)), 1000, 0, G.p.values, y)
-            if np.isfinite(auc)
-            else (np.nan,) * 2
-        )
-        out += [
-            "## Метка набора «анемия / нет» против ответа модели (по группам)",
-            "",
-            f"Групп с принятыми снимками: {len(G)} (анемия {int(y.sum())}, нет {int((~y).sum())}); "
-            f"снимков {len(b)}. AUC P(анемия): {ci(auc, *auc_ci)}.",
-            "",
-            "| Ответ «анемия» | TP | FP | FN | TN | Чувствительность | Специфичность |",
-            "|---|---|---|---|---|---|---|",
-        ]
-        for name, flag in (
-            ("риск не низкий", G.lvl.values >= 1),
-            ("риск высокий", G.lvl.values >= 2),
-        ):
-            r = M.binary_report(flag, y)
-            out.append(
-                f"| {name} | {r['tp']} | {r['fp']} | {r['fn']} | {r['tn']} | {ci(r['rec'], r['rec_lo'], r['rec_hi'])} | "
-                f"{ci(r['spec'], r['spec_lo'], r['spec_hi'])} |"
-            )
-        out.append("")
     seg = R[R.use == "seg"]
     s = seg[seg["iou"].notna()] if "iou" in seg else seg.iloc[:0]
     if len(seg):
@@ -177,9 +142,10 @@ def main():
         "ignore", message="Only one class is present"
     )  # бутстрэп AUC на крошечных группах
     idx = pd.read_csv(os.path.join(a.data, "external", "index.csv"))
-    idx = idx[
-        ~idx.ed_copy & (idx.source.isin(a.sources) if a.sources else True)
-    ].reset_index(drop=True)
+    try:
+        idx = active_rows(idx, a.sources)
+    except ValueError as e:
+        sys.exit(f"evaluate_external: {e}")
     model = a.model or PR.default_model_path()
     B = PR.load_bundle(model)
     print(

@@ -1,17 +1,15 @@
 """Внешние наборы фото глаза с Kaggle. Hb в них нет — модель риска на них НЕ обучается (порог ВОЗ без Hb, пола и
 возраста не посчитать, а смешивание с Eyes-defy дало бы утечку и завышенные цифры). Зачем они:
-    binary — фото глаза с меткой «анемия / нет»: внешняя проверка ответа модели на чужих людях и камерах;
-    route  — фото без меток: сколько снимков продукт принимает и почему отказывает (другие телефоны и страны);
     seg    — фото глаза с телефона и маски конъюнктивы: обучение сегментатора века (не модели риска) и его IoU
              вне обучения (scripts/evaluate.py --task seg_ext, фолды по группам).
+Исключённые наборы (EXCLUDED) не скачиваются, не индексируются и не оцениваются; причины — там же.
 Копии Eyes-defy (COPIES) не скачиваются; файлы, совпавшие с Eyes-defy по sha1 или по миниатюре, помечаются ed_copy
-и нигде не используются. Путь к файлу (в indonesia_phone в имени — ФИО) есть только в локальном
-<data>/external/index.csv (вне git); id, отчёты и per_image.csv — без имён: id = источник + начало sha1.
+и нигде не используются. Путь к файлу есть только в локальном <data>/external/index.csv (вне git); id, отчёты и
+per_image.csv — без имён: id = источник + начало sha1.
 """
 
 import glob
 import os
-import re
 
 import numpy as np
 import pandas as pd
@@ -25,19 +23,6 @@ GROUP_MAD = 0.03  # серия кадров одного глаза: цепоч�
 ED_COPY_MAD = 0.02  # миниатюра ближе 2% к фото Eyes-defy — пересжатая копия (между разными пациентами ED ≥ 0,065)
 
 SOURCES = {
-    "kaggle_conj_binary": {
-        "ref": "guptajanavi/palpebral-conjunctiva-to-detect-anaemia",
-        "use": "binary",
-        "licence": "не указана",
-        "what": "183 фото глаза 224×224, метка в имени файла (img_1_* анемия, img_2_* нет); много дублей (кадры видео); "
-        "пиксели те же, что turna1 в архиве проекта (md/datasets/conj_binary_turna1), файлы пересжаты",
-    },
-    "indonesia_phone": {
-        "ref": "welldanyogia/anemia-dataset",
-        "use": "route",
-        "licence": "не указана",
-        "what": "209 фото глаза с телефона (оттянутое веко), 2 больницы Индонезии, без меток; имена файлов — ФИО",
-    },
     "phone_conj_masks": {
         "ref": "mdraselsarker/conjunctiva-segmentation-dataset",
         "use": "seg",
@@ -45,11 +30,38 @@ SOURCES = {
         "what": "83 фото глаза с телефона + маски конъюнктивы (Roboflow)",
     },
 }
+EXCLUDED = {  # решение команды 2026-10-21 (аудит datasets_audit/2026-10-21_candidates_audit.md)
+    "kaggle_conj_binary": {
+        "ref": "guptajanavi/palpebral-conjunctiva-to-detect-anaemia",
+        "date": "2026-10-21",
+        "why": "класс совпадает с источником снимка (анемия — разнородные картинки из интернета, среди них рисунок; "
+        "нет — кадры одного видео), Hb и порога нет, лицензия не указана; прежние цифры по нему недействительны",
+    },
+    "indonesia_phone": {
+        "ref": "welldanyogia/anemia-dataset",
+        "date": "2026-10-21",
+        "why": "в именах файлов ФИО пациентов, лицензия не указана, права на использование не подтверждены; "
+        "отключён до подтверждения прав и обезличенной разметки",
+    },
+}
 COPIES = {  # проверено 2026-10-20: каждый файл совпал по sha1 с файлом Eyes-defy (scripts/eyes_defy.sha1)
     "kpriyadharcini/anaemia": "122 из 122 фото — побайтные копии Eyes-defy",
     "abood92/eye-segmentation": "434 из 434 файлов (217 фото + 217 масок) — побайтные копии Eyes-defy",
     "abhit007pandey/eye-anemia": "архив того же размера, что Eyes-defy (666 269 625 байт)",
 }
+
+
+def check_keys(keys):
+    """Ключи наборов для скачивания и индекса; исключённые и неизвестные — ValueError с причиной."""
+    for key in keys:
+        if key in EXCLUDED:
+            e = EXCLUDED[key]
+            raise ValueError(
+                f"набор {key} ({e['ref']}) исключён {e['date']}: {e['why']}"
+            )
+        if key not in SOURCES:
+            raise ValueError(f"неизвестный набор {key}; доступны: {', '.join(SOURCES)}")
+    return list(keys)
 
 
 def kaggle_url(ref):
@@ -74,29 +86,9 @@ def _images(raw):
 
 def list_source(key, raw):
     """Файлы набора → [{file, label, site, mask}] (пути абсолютные). label: 1 анемия, 0 нет, None нет метки."""
+    check_keys([key])
     rows = []
-    if key == "kaggle_conj_binary":
-        for f in _images(raw):
-            m = re.match(r"img_([12])_\d+", os.path.basename(f))
-            rows.append(
-                {
-                    "file": f,
-                    "label": None if m is None else int(m.group(1) == "1"),
-                    "site": None,
-                    "mask": None,
-                }
-            )
-    elif key == "indonesia_phone":
-        for f in _images(raw):
-            rows.append(
-                {
-                    "file": f,
-                    "label": None,
-                    "site": os.path.basename(os.path.dirname(f)),
-                    "mask": None,
-                }
-            )
-    elif key == "phone_conj_masks":
+    if key == "phone_conj_masks":
         for f in _images(raw):
             if f"{os.sep}images{os.sep}" not in f:
                 continue
@@ -151,7 +143,7 @@ def build_index(root, keys=None, eyes_defy_sha1=(), eyes_defy_thumbs=None):
         else np.stack(eyes_defy_thumbs)
     )
     parts = []
-    for key in keys or SOURCES:
+    for key in check_keys(keys or SOURCES):
         raw = os.path.join(root, "external", key, "raw")
         if not os.path.isdir(raw):
             continue
@@ -239,7 +231,7 @@ def seg_index(root):
 
 
 def safe_text(text, paths):
-    """Сообщение без путей к файлам (в именах файлов indonesia_phone — ФИО)."""
+    """Сообщение без путей к файлам (в именах файлов внешних наборов бывают ФИО)."""
     text = str(text or "")
     for p in paths:
         if p:

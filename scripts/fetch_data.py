@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import zipfile
 
 import pandas as pd
@@ -180,7 +181,7 @@ def fetch_external(out, keys=None, zips=None):
     import sys
     sys.path.insert(0, os.path.dirname(HERE))
     from anemia import external as EXT
-    keys = keys or list(EXT.SOURCES)
+    keys = EXT.check_keys(keys or list(EXT.SOURCES))   # исключённый или неизвестный набор → ValueError с причиной
     for ref, why in EXT.COPIES.items():
         print(f'пропущен {ref}: {why}')
     os.makedirs(os.path.join(out, 'external'), exist_ok=True)
@@ -215,7 +216,8 @@ if __name__ == '__main__':
     ap.add_argument('--relabel', action='store_true',
                     help='пересобрать eyes_defy_anemia/labels.csv из уже распакованных файлов (без скачивания)')
     ap.add_argument('--external', nargs='*', metavar='KEY',
-                    help='внешние наборы без Hb (anemia/external.py SOURCES); без ключей — все')
+                    help='внешние наборы без Hb (anemia/external.py SOURCES); без ключей — все; '
+                         'исключённые (EXCLUDED) не скачиваются')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     if a.eyes_defy or a.eyes_defy_zip:
@@ -223,5 +225,8 @@ if __name__ == '__main__':
     elif a.relabel:
         write_eyes_defy_labels(a.out)
     if a.external is not None:
-        fetch_external(a.out, a.external)
+        try:
+            fetch_external(a.out, a.external)
+        except ValueError as e:
+            sys.exit(f'fetch_data: {e}')
 

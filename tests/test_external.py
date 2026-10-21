@@ -1,10 +1,12 @@
 """Внешние наборы без Hb (anemia/external.py), роли масок Eyes-defy и исключённые маски (аудит данных 2026-10-19)."""
 
 import os
+import subprocess
 import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
 
 from anemia import external as EXT
@@ -67,52 +69,106 @@ def _img(path, seed, size=64):
     Image.fromarray(rng.integers(0, 255, (size, size, 3), np.uint8)).save(path)
 
 
-def test_build_index(tmp_path):
-    raw = tmp_path / "external" / "kaggle_conj_binary" / "raw"
-    raw.mkdir(parents=True)
-    _img(raw / "img_1_0.jpg", 0)
-    _img(raw / "img_2_0.jpg", 1)
-    (raw / "img_2_1.jpg").write_bytes(
-        (raw / "img_2_0.jpg").read_bytes()
-    )  # побайтный дубль
-    _img(raw / "img_1_5.jpg", 2)
-    ph = tmp_path / "external" / "indonesia_phone" / "raw" / "images" / "RS_X"
-    ph.mkdir(parents=True)
-    _img(ph / "Ny. Fulan Binti.jpg", 3)
+def _seg_set(tmp_path, names, seeds):
     pm = tmp_path / "external" / "phone_conj_masks" / "raw" / "d" / "train"
-    (pm / "images").mkdir(parents=True)
-    (pm / "masks").mkdir()
-    _img(pm / "images" / "e1.jpg", 4)
+    (pm / "images").mkdir(parents=True, exist_ok=True)
+    (pm / "masks").mkdir(exist_ok=True)
     m = np.zeros((64, 64), np.uint8)
     m[16:32, 16:48] = 255
-    Image.fromarray(m).save(pm / "masks" / "e1.png")
-    ed_sha = sha1_file(raw / "img_1_5.jpg")  # «копия Eyes-defy»
+    for n, s in zip(names, seeds):
+        _img(pm / "images" / f"{n}.jpg", s)
+        Image.fromarray(m).save(pm / "masks" / f"{n}.png")
+    return pm
+
+
+def _excluded_on_disk(tmp_path):
+    """Старые папки исключённых наборов в <data>/external (как в Colab после прошлых прогонов)."""
+    raw = tmp_path / "external" / "kaggle_conj_binary" / "raw"
+    raw.mkdir(parents=True)
+    _img(raw / "img_1_0.jpg", 10)
+    ph = tmp_path / "external" / "indonesia_phone" / "raw" / "images" / "RS_X"
+    ph.mkdir(parents=True)
+    _img(ph / "Ny. Fulan Binti.jpg", 11)
+
+
+def test_build_index(tmp_path):
+    pm = _seg_set(tmp_path, ["e1", "e2", "e3"], [4, 5, 6])
+    (pm / "images" / "e4.jpg").write_bytes(
+        (pm / "images" / "e1.jpg").read_bytes()
+    )  # побайтный дубль
+    _excluded_on_disk(tmp_path)
+    ed_sha = sha1_file(pm / "images" / "e3.jpg")  # «копия Eyes-defy»
     idx = EXT.build_index(str(tmp_path), eyes_defy_sha1=[ed_sha])
-    b = idx[idx.source == "kaggle_conj_binary"]
-    assert len(b) == 3  # дубль убран
-    assert sorted(b.label.tolist()) == [0, 1, 1]
-    assert b.set_index("sha1").loc[ed_sha, "ed_copy"]
-    p = idx[idx.source == "indonesia_phone"].iloc[0]
-    assert pd.isna(p.label) and p.site == "RS_X"
-    assert "Fulan" not in p.id  # ФИО не попадает в id
+    assert set(idx.source) == {"phone_conj_masks"}  # исключённые папки на диске не читаются
+    assert len(idx) == 3  # дубль убран
+    assert idx.set_index("sha1").loc[ed_sha, "ed_copy"]
     assert not idx.file.str.startswith(str(tmp_path)).any()  # пути относительные
-    seg = idx[idx.source == "phone_conj_masks"].iloc[0]
-    assert seg["mask"].endswith("e1.png") and abs(seg.mask_frac - 0.125) < 0.01
-    s = EXT.summary(idx)
-    k = s.loc["kaggle_conj_binary"]
-    assert k["снимков"] == 3 and k["групп_анемия"] == 2 and k["групп_нет"] == 1
+    seg = idx.iloc[0]
+    assert seg["mask"].endswith(".png") and abs(seg.mask_frac - 0.125) < 0.01
+    assert EXT.summary(idx).loc["phone_conj_masks", "снимков"] == 3
 
 
 def test_build_index_ed_thumb_copy(tmp_path):
-    raw = tmp_path / "external" / "kaggle_conj_binary" / "raw"
-    raw.mkdir(parents=True)
-    _img(raw / "img_1_0.jpg", 0)
-    _img(raw / "img_2_0.jpg", 1)
+    pm = _seg_set(tmp_path, ["e1", "e2"], [0, 1])
     ed = [
-        EXT.thumb(raw / "img_1_0.jpg")
+        EXT.thumb(pm / "images" / "e1.jpg")
     ]  # пересжатая копия: sha1 другой, миниатюра та же
-    idx = EXT.build_index(str(tmp_path), eyes_defy_thumbs=ed).set_index("label")
-    assert idx.loc[1, "ed_copy"] and not idx.loc[0, "ed_copy"]
+    idx = EXT.build_index(str(tmp_path), eyes_defy_thumbs=ed)
+    assert idx.ed_copy.tolist() == [True, False]
+
+
+def test_excluded_sources():
+    assert set(EXT.EXCLUDED) == {"kaggle_conj_binary", "indonesia_phone"}
+    assert not set(EXT.EXCLUDED) & set(EXT.SOURCES)
+    refs = {e["ref"] for e in EXT.EXCLUDED.values()}
+    assert refs == {
+        "guptajanavi/palpebral-conjunctiva-to-detect-anaemia",
+        "welldanyogia/anemia-dataset",
+    }
+    assert all(e["why"] and e["date"] == "2026-10-21" for e in EXT.EXCLUDED.values())
+
+
+def test_excluded_keys_refused(tmp_path):
+    _excluded_on_disk(tmp_path)
+    for key in EXT.EXCLUDED:
+        with pytest.raises(ValueError, match="исключён"):
+            EXT.check_keys([key])
+        with pytest.raises(ValueError, match="исключён"):
+            EXT.build_index(str(tmp_path), keys=[key])
+        with pytest.raises(ValueError, match="исключён"):  # отказ до скачивания: zip не нужен
+            fetch_data.fetch_external(str(tmp_path), [key])
+    with pytest.raises(ValueError, match="неизвестный"):
+        EXT.check_keys(["нет_такого"])
+    assert not (tmp_path / "external" / "kaggle_conj_binary.zip").exists()
+
+
+def test_fetch_cli_excluded_message(tmp_path):
+    script = os.path.join(os.path.dirname(fetch_data.__file__), "fetch_data.py")
+    r = subprocess.run(
+        [sys.executable, script, "--out", str(tmp_path), "--external", "indonesia_phone"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert r.returncode != 0
+    assert "исключён 2026-10-21" in r.stderr and "ФИО" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def test_evaluate_external_skips_excluded(capsys):
+    import evaluate_external as EE
+
+    idx = pd.DataFrame(
+        {
+            "source": ["kaggle_conj_binary", "indonesia_phone", "phone_conj_masks", "phone_conj_masks"],
+            "ed_copy": [False, False, False, True],
+        }
+    )
+    out = EE.active_rows(idx)
+    assert out.source.tolist() == ["phone_conj_masks"]  # исключённые и копия Eyes-defy — мимо
+    assert "пропущен indonesia_phone" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="исключён"):
+        EE.active_rows(idx, ["kaggle_conj_binary"])
 
 
 def test_near_groups_merges_frames():
