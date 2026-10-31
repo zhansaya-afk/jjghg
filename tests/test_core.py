@@ -181,7 +181,7 @@ def test_model_follows_found_tissues(monkeypatch):
     img, _, _ = synthetic_eye()
     monkeypatch.setattr(PR, 'quality', lambda *a: [])          # синтетика: проверяется маршрут, а не качество
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det({'sclera'}))
-    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg: det)   # маршрут моделей; сегментатор — test_eye_location
+    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg, **kw: det)   # маршрут моделей; сегментатор — test_eye_location
     full['conj_seg'] = with_s['conj_seg'] = 'stub'
     r = PR.analyze_photo(img, sex='F', age=30, bundle=full, landmarker=None)
     assert r['stage'] == 'no_model' and r['risk'] is None          # модели «только склера» нет — не подменяем

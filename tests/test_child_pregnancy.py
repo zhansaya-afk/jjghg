@@ -20,7 +20,7 @@ def adult_route(monkeypatch):
     """Синтетика: обе ткани «найдены», проверяется только выбор модели по возрасту."""
     monkeypatch.setattr(PR, 'quality', lambda *a: [])
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det({'conj', 'sclera'}))
-    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg: det)
+    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg, **kw: det)
     return _bundle()
 
 
