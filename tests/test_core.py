@@ -206,3 +206,55 @@ def test_cross_validate_train_by_fold():
     assert np.allclose(O.p.values, O2.p.values)
     with pytest.raises(AssertionError):
         CORE.cross_validate(F, feats, 'eyes_defy', train_by_fold={f: F for f in train})
+
+
+# ------------------------------------------------------------------ калибровка, пороги зон, согласование с Hb
+def test_platt_calibration_fixes_overconfidence():
+    rng = np.random.default_rng(0)
+    y = rng.random(2000) < 0.4
+    true_p = np.where(y, rng.beta(4, 3, 2000), rng.beta(3, 4, 2000))
+    over = 1 / (1 + np.exp(-4 * np.log(true_p / (1 - true_p))))       # переуверенная модель: logit × 4
+    cal = CORE.fit_platt(over, y)
+    assert 0 < cal[0] < 1                                               # наклон сжимает переуверенные P
+    assert CORE.calibration_metrics(CORE.calibrate(cal, over), y)['brier'] < CORE.calibration_metrics(over, y)['brier']
+    p = np.linspace(0.01, 0.99, 50)
+    assert np.all(np.diff(CORE.calibrate(cal, p)) > 0)                  # монотонна: зоны по рангам не меняются
+    assert CORE.calibrate(None, p) is not None and np.allclose(CORE.calibrate(None, p), p)
+    assert CORE.fit_platt(p, np.zeros(50, bool)) == (1.0, 0.0)          # один класс — без калибровки
+
+
+def test_fit_core_low_threshold_is_sensitivity_threshold():
+    F, _ = _synthetic(120)
+    B = CORE.fit_core(F, ['c_x', 'c_z', 's_x', 'male'], 'eyes_defy')
+    assert B['cal'] is not None and B['t_lo'] == B['thr_sens'] and B['t_lo'] <= B['t_hi']
+    p, lv, _, _ = CORE.apply_core(B, F[F.aug == 0][B['feats']].values)
+    assert ((lv == 0) == (p < B['t_lo'])).all() and ((lv == 2) == (p >= B['t_hi'])).all()
+
+
+def test_apply_core_old_bundle_without_calibration():
+    F, _ = _synthetic()
+    B = CORE.fit_core(F, ['c_x', 'c_z', 's_x', 'male'], 'eyes_defy')
+    old = {k: v for k, v in B.items() if k != 'cal'}
+    X = F[F.aug == 0][B['feats']].values
+    assert np.allclose(CORE.apply_core(old, X)[0], CORE._p_anemia(B['cls'], B['prior'], X))
+
+
+def test_reconcile_whole_hb_range_below_who_raises_to_high():
+    lv, up = CORE.reconcile([1, 0, 1, 2, 1], [90, 90, 115, 90, 90], 18, [True, True, True, True, False],
+                            [120, 120, 120, 120, 120])
+    # 90 ± 18 → 70–110 < 120: поднят; 115 ± 18 → 95–135: нет; уже высокий — без изменений; Hb не показан — нет
+    assert lv.tolist() == [2, 2, 1, 2, 1] and up.tolist() == [True, True, False, False, False]
+    assert CORE.hb_interval(90, 18) == (70, 110)
+    assert CORE.reconcile([1], [105], 15, [True], [120])[0][0] == 1       # 90–120: граница = норма → не поднят
+
+
+def test_cross_validate_reports_calibration_and_raised():
+    F, S = _synthetic(100)
+    F = F.assign(who_normal=120.0)
+    O, _ = CORE.cross_validate(F, ['c_x', 'c_z', 's_x', 'male'], 'eyes_defy', S.assign(who_normal=120.0))
+    assert {'p_raw', 'level_p', 'raised'} <= set(O.columns)
+    assert (O.level >= O.level_p).all()
+    r = CORE.core_metrics(O)
+    assert {'brier', 'brier_raw', 'ece', 'zsens', 'zspec', 'zsens_p', 'n_raised'} <= set(r)
+    t = CORE.reliability(O.p.values, O.anemic.values)
+    assert t.n.sum() == len(O)
