@@ -22,7 +22,7 @@ from . import core as CORE
 from . import segment_baseline as SB
 from . import v12_model as V12
 from .io import resize_max
-from .labs import is_pregnant
+from .labs import is_pregnant, who_limits
 from . import regions as R
 from .regions import detect_regions, quality
 
@@ -572,6 +572,19 @@ def _zoom_conj(rgb, det, seg, H, W):
     return None, log
 
 
+def conj_source(det0, det):
+    """Строка диагностики: какая маска конъюнктивы идёт в признаки. В расчёт идёт только маска сегментатора века
+    (learned_conj, на вырезке det['crop']); пороговая маска regions (det0) нужна лишь для поиска глаза. Числа
+    seg_steps — на кадре сегментатора SEG_SIZE, а не на вырезке, поэтому с пикселями вырезки их не сравнивать."""
+    m = det.get('conj')
+    used = int(m.sum()) if m is not None and 'conj' in det.get('use', ()) else 0
+    h, w = det['crop'].shape[:2]
+    h0, w0 = det0['crop'].shape[:2]
+    return (f'маска конъюнктивы в расчёте: сегментатор века — {used} px на вырезке {w}x{h} '
+            f'({100 * used / (h * w):.1f}% кадра){"" if used else " (нет — оценки по конъюнктиве не будет)"}; '
+            f'пороговая маска поиска глаза — {int(det0["conj"].sum())} px на вырезке {w0}x{h0}, в расчёт НЕ идёт')
+
+
 def _small_irises(img):
     """Кандидаты в мелкую радужку [((cx, cy, r), контраст края)], лучшие первыми. Окружности Хафа всех трёх
     порогов (find_iris останавливается на первом пороге, где нашлись хоть какие-то окружности, и при сдвиге или
@@ -701,15 +714,16 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
             + (str(tuple(round(v) for v in det0['iris'])) if det0.get('iris') is not None else 'нет'),
             f'поиск тканей (пороги): {sorted(det0["use"]) or "ничего"}; конъюнктива {int(det0["conj"].sum())} px, '
             f'склера {int(det0["sclera"].sum())} px; заметки: {det0["notes"] or "-"}',
-            'сегментатор века на вырезке: ' + (str(det['seg_steps']) if 'seg_steps' in det else
+            f'сегментатор века, шаги на его кадре {SB.SEG_SIZE} px (не пиксели вырезки): ' + (str(det['seg_steps']) if 'seg_steps' in det else
                                                'не запускался (тканей нет или вырезка ткани)')]
     if ('conj' not in det['use'] and det0['kind'] != 'вырезанная ткань' and det0['eye'] is not None
             and det0.get('iris') is not None and det0['src_side'] == max(img_hw)):
         z, log = _zoom_conj(rgb, det0, bundle['conj_seg'], *img_hw)
         diag += log
         det = z or det
-    r['diag'] = diag
     crop, conj, sclera = det['crop'], det['conj'], det['sclera']
+    diag.append(conj_source(det0, det))
+    r['diag'] = diag
     ts = tissue_status(crop, det)
     good = tuple(t for t in ('conj', 'sclera') if ts[t] == 'пригодна')
     r.update(crop=crop, conj=conj, sclera=sclera, kind=det['kind'], eye=det['eye'], tissue_status=ts,
@@ -754,6 +768,10 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         r['issues'].append('мало чистой ткани для признаков цвета (блики, тени, ресницы)')
         return r
     p, lv, hb, ood = (v[0] for v in CORE.apply_core(B, x[None]))
+    lv_p = int(lv)
+    if B['hb_ok']:                          # согласование с Hb: весь диапазон ниже нормы ВОЗ → не ниже «высокого»
+        normal = who_limits(sex, age, pregnant).normal
+        lv, up = (int(v[0]) for v in CORE.reconcile([lv], [hb], B['hb_halfwidth'], True, [normal]))
     if ood > CORE.OOD_MAX:
         r['status'], r['stage'] = 'unreliable', 'ood'
         r['issues'].append(f'{ood * 100:.0f}% признаков цвета далеко вне диапазона обучающих снимков '
@@ -767,16 +785,28 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
                                            'на свет по белку глаза)',
                          'eyes_defy_sclera': 'оценено только по цвету склеры (конъюнктива непригодна); у этой '
                                              'модели своя, отдельно проверенная точность — см. evaluate'}[key])
-    low = (f'≤ {B["t_lo"]:.2f} — низкий' if np.isfinite(B['t_lo']) else
-           'уровня «низкий» у этой модели нет (на обучающих пациентах не нашлось зоны, где здоровых '
-           f'≥ {B["zone_target"]:.0%})')
-    high = (f'≥ {B["t_hi"]:.2f} — высокий' if np.isfinite(B['t_hi']) else 'уровня «высокий» у этой модели нет')
-    r['reasons'].append(f'P(анемия) = {p:.2f}; пороги модели: {low}, {high} (подобраны вложенной CV на обучающих пациентах '
-                        f'с целью ≥ {B["zone_target"]:.0%} верных; на невиданных пациентах точность ниже — см. evaluate)')
+    cal = ('калибрована (Platt, вложенная CV на обучающих пациентах)' if B.get('cal') is not None else
+           'НЕ калибрована: файл модели старше кода — перезапустите ячейку Я1')
+    if 'cal' in B:
+        low = (f'< {B["t_lo"]:.2f} — низкий (так «средний + высокий» находят ≥ {B["low_sens_target"]:.0%} больных)'
+               if np.isfinite(B['t_lo']) else 'уровня «низкий» у этой модели нет')
+    else:
+        low = (f'≤ {B["t_lo"]:.2f} — низкий' if np.isfinite(B['t_lo']) else 'уровня «низкий» у этой модели нет')
+    high = (f'≥ {B["t_hi"]:.2f} — высокий (≥ {B["zone_target"]:.0%} больных)' if np.isfinite(B['t_hi'])
+            else 'уровня «высокий» у этой модели нет')
+    r['reasons'].append(f'P(анемия) = {p:.2f}, {cal}; пороги модели: {low}, {high} (подобраны вложенной CV на '
+                        'обучающих пациентах; на невиданных пациентах — см. evaluate)')
     if B['hb_ok']:
         hw = B['hb_halfwidth']
-        lo, hi = 5 * np.floor((hb - hw) / 5), 5 * np.ceil((hb + hw) / 5)
+        lo, hi = CORE.hb_interval(hb, hw)
         r['hb_range'] = (float(lo), float(hi))
+        if lv > lv_p:
+            r['risk'] = CORE.RISK_LEVELS[lv]
+            r['reasons'].append(f'по P уровень «{CORE.RISK_LEVELS[lv_p]}», но весь диапазон Hb {lo:.0f}–{hi:.0f} г/л ниже '
+                                f'нормы ВОЗ {normal:.0f} г/л → уровень поднят до «высокий»')
+        elif lv == 2 and lo >= normal:
+            r['reasons'].append(f'модели расходятся: по P «высокий», а диапазон Hb {lo:.0f}–{hi:.0f} г/л не ниже нормы '
+                                f'ВОЗ {normal:.0f} г/л; уровень не понижается (скрининг) — нужен анализ крови')
         r['hb_note'] = (f'экспериментально: на вложенной CV обучающих пациентов в 80% случаев реальный Hb был '
                         f'в пределах ±{hw:.0f} г/л от прогноза (MAE {B["hb_mae_cv"]:.0f} г/л против {B["hb_mae_const_cv"]:.0f} у константы)')
     else:

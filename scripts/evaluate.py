@@ -58,7 +58,7 @@ from anemia.cache import TIMING_KEYS, FeatureCache, empty_timings, file_sha1, so
 from anemia.features import N_RELIGHT, WORK_SIZE, feature_rows, load_item, row_meta  # noqa: E402
 from anemia.hb_models import cross_validate  # noqa: E402
 from anemia.io import load_mask, load_rgb, resize_to  # noqa: E402
-from anemia.labs import is_pregnant  # noqa: E402
+from anemia.labs import is_pregnant, who_limits  # noqa: E402
 from anemia.regions import detect_regions  # noqa: E402
 
 HISTORY = os.path.join(ROOT, 'results', 'metrics_history.csv')
@@ -262,7 +262,8 @@ def _with_meta(row, rows, srows):
     meta = {'group': row['group'], 'fold': int(row['fold']), 'anemic': bool(row['anemic']),
             'hb_g_l': float(row['hb_g_l']),
             'y': V12.hb_class(row['hb_g_l'] / 10, *V12.who_thresholds(sex, age, is_pregnant(row['pregnant']))),
-            'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5}
+            'male': 1.0 if sex == 'M' else 0.0 if sex == 'F' else 0.5,
+            'who_normal': float(who_limits(sex, age, row['pregnant']).normal)}   # для согласования риска с Hb
     return [{**meta, **r} for r in rows], [{**meta, **r} for r in srows]
 
 
@@ -656,9 +657,11 @@ def eval_external(T, F, S, key):
     feats = CORE.feature_list(T.columns, key)
     B = CORE.fit_core(T, feats, key)
     O = F[F.aug == 0].reset_index(drop=True)
-    p, lv, hbp, ood = CORE.apply_core(B, O[feats].values)
-    O = O.assign(p=p, level=lv, hb_pred=hbp, ood=ood, hb_ok=B['hb_ok'], thr_sens=B['thr_sens'],
-                 hb_hw=B['hb_halfwidth'])
+    p, lv_p, hbp, ood = CORE.apply_core(B, O[feats].values)
+    who = O.who_normal.values if 'who_normal' in O else np.full(len(O), -np.inf)   # нет нормы — не согласуем
+    lv, up = CORE.reconcile(lv_p, hbp, B['hb_halfwidth'], B['hb_ok'], who)
+    O = O.assign(p=p, p_raw=CORE._p_anemia(B['cls'], B['prior'], O[feats].values), level=lv, level_p=lv_p,
+                 raised=up, hb_pred=hbp, ood=ood, hb_ok=B['hb_ok'], thr_sens=B['thr_sens'], hb_hw=B['hb_halfwidth'])
     acc = O.ood.values <= CORE.OOD_MAX
     if not acc.any():
         return None, O.assign(accepted=acc), None
@@ -666,7 +669,9 @@ def eval_external(T, F, S, key):
     if S is not None and len(S):
         S = S[S.group.isin(set(O.group[acc]))]
         if len(S):
-            ps, ls, _, _ = CORE.apply_core(B, S[feats].values)
+            ps, ls, hbs, _ = CORE.apply_core(B, S[feats].values)
+            if 'who_normal' in S:
+                ls, _ = CORE.reconcile(ls, hbs, B['hb_halfwidth'], B['hb_ok'], S.who_normal.values)
             SP = S[['group', 'cond', 'anemic']].assign(p=ps, level=ls)
     t0 = T[T.aug == 0]
     r = CORE.core_metrics(O[acc], SP)
@@ -720,6 +725,20 @@ def print_binary_table(rows):
 
 
 def print_core_table(rows):
+    print('\nКалибровка и зоны риска (OOF, принятые снимки). Brier/ECE — ниже лучше; Brier константы (доля больных) — '
+          'опорный. Чувств. «средний+высокий» и спец. «низкий» — цели ≥ 80% и ≥ 70%; «по P» — до согласования с Hb.')
+    h2 = ['Датасет', 'n', 'Brier сырой → калибр. (константа)', 'ECE сырой → калибр.',
+          'Чувств. «средн.+высок.», %', 'Спец. «низкий», %', 'По P: чувств. / спец., %', 'Поднято до «высокий» по Hb (из них больных)']
+    print('| ' + ' | '.join(h2) + ' |')
+    print('|' + '---|' * len(h2))
+    for r in rows:
+        if 'brier' not in r:
+            continue
+        br = (f"{r['brier_raw']:.3f} → " if 'brier_raw' in r else '') + f"{r['brier']:.3f} ({r['brier_ref']:.3f})"
+        ec = (f"{r['ece_raw']:.3f} → " if 'ece_raw' in r else '') + f"{r['ece']:.3f}"
+        cells = [r['dataset'], r['n'], br, ec, fmt(r, 'zsens', 0, True), fmt(r, 'zspec', 0, True),
+                 f"{fmt(r, 'zsens_p', 0, True)} / {fmt(r, 'zspec_p', 0, True)}", f"{r['n_raised']} ({r['raised_anemic']})"]
+        print('| ' + ' | '.join(str(c) for c in cells) + ' |')
     head = ['Датасет', 'n', 'AUC', 'Низкий / средний / высокий, %', 'Верно среди уверенных, %',
             'Больных среди «высокий», %', 'Здоровых среди «низкий», %', 'Больных в «низкий»',
             'Чувств. / спец. @0.80, %', 'MAE Hb, г/л', 'Hb показан, %', 'Hb в диапазоне, %', 'OOD, %', 'Свет: уровень меняется, %']
@@ -893,8 +912,12 @@ def main():
                     continue
                 rows.append({'task': 'core', 'dataset': key, 'method': f"core · принято {r['n_accepted']}/{len(df)} "
                              f"(этой моделью {r['n_routed']}, OOD {r['n_ood']}){seg_note}", **r})
-                save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'level', 'hb_pred', 'ood', 'thr_sens',
-                             'accepted'], f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
+                save_oof(O, ['group', 'fold', 'hb_g_l', 'anemic', 'p', 'p_raw', 'level', 'level_p', 'raised',
+                             'hb_pred', 'hb_hw', 'who_normal', 'ood', 'thr_sens', 'accepted'],
+                         f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
+                acc = O.accepted.values
+                pd.concat([CORE.reliability(O[c].values[acc], O.anemic.values[acc]).assign(p=c)
+                           for c in ('p_raw', 'p')]).to_csv(os.path.join(run_dir, f'reliability_{key}.csv'), index=False)
             RUNS.write_json(os.path.join(run_dir, f'routes_{ds}.json'), rc)
             continue
         if a.task in ('all', 'v12'):
