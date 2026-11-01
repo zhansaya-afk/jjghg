@@ -20,6 +20,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from . import anatomy as AN
 from . import core as CORE
+from . import eyes as EYES
 from . import segment_baseline as SB
 from . import v12_model as V12
 from .io import resize_max
@@ -675,10 +676,135 @@ def tissue_route(det):
 TISSUE_RU = {'conj': 'конъюнктива', 'sclera': 'склера'}
 
 
+def face_eyes(rgb, landmarker):
+    """Глаза на фото лица по точкам MediaPipe → [{side, poly, iris, box, W}] в пикселях исходного фото
+    (контур глаза, радужка (cx, cy, r) или None, рамка EYES.eye_box, ширина глаза). Лица нет — []."""
+    if not landmarker:
+        return []
+    img = resize_max(rgb, V12.DETECT_SIDE)
+    k = rgb.shape[1] / img.shape[1]
+    out = []
+    for c in R.face_eye_crops(img, landmarker):
+        poly = np.asarray(c['eye_poly'], float) * k
+        ir = None if c['iris'] is None else tuple(float(v) * k for v in c['iris'])
+        out.append({'side': c['how'].split(', ')[-1], 'poly': poly, 'iris': ir, 'W': EYES.eye_width(poly),
+                    'box': EYES.eye_box(poly, rgb.shape)})
+    return out
+
+
+def _eye_crop(rgb, e, down):
+    box = EYES.eye_box(e['poly'], rgb.shape, down)
+    x0, y0, x1, y1 = box
+    crop = R._prepare(rgb[y0:y1, x0:x1])
+    s = EYES.crop_scale(box, crop.shape)
+    iris = None if e['iris'] is None else (*EYES.to_crop([e['iris'][:2]], box, s)[0], e['iris'][2] * s)
+    cv2.setRNGSeed(0)
+    r = R._analyze_crop(crop, True, True, iris=iris, kind='глаз на фото лица')
+    r['src_side'] = max(x1 - x0, y1 - y0)
+    r = _trim_to_eye(r) if iris is not None else r
+    return r, box, s, EYES.to_crop(e['poly'], box, s), iris
+
+
+def _landmark_iris_contrast(crop, iris):
+    """Контраст «тёмный круг на светлом» (R._iris_score) у радужки из точек лица; нет радужки → −1. У настоящего
+    глаза край радужки контрастный; MediaPipe иногда «находит лицо» внутри крупного плана одного глаза, и тогда круг
+    лежит внутри тёмной радужки или на коже — контраста нет (Eyes-defy: ≤ 14, телефонные крупные планы: ≤ 18)."""
+    if iris is None:
+        return -1.0
+    m = R.color_maps(crop)
+    return float(R._iris_score(cv2.GaussianBlur(m['L'], (0, 0), 1.5), m['C'], *iris))
+
+
+def analyze_eye(rgb, e, seg, limits=AN.LIMITS):
+    """Один глаз фото лица → результат как у learned_conj + eye_box (рамка на фото), eye_scale, eye_side, eye_log.
+    Порядок: вырезка из исходного фото → пороговый поиск тканей с радужкой из точек лица → сегментатор века и
+    анатомия этапа A → маски только внутри зон глаза (EYES.zones). Точки лица веко не подтверждают: нет маски века
+    сегментатора или она вне зоны нижнего века → отказ по этому глазу. Веко у нижнего края рамки → рамка ниже,
+    ещё одна попытка."""
+    side = e['side']
+    if e['W'] < EYES.MIN_EYE_PX:
+        d = {'crop': None, 'use': set(), 'notes': [(f'{side}: ширина {e["W"]:.0f} px < {EYES.MIN_EYE_PX} px — '
+                                                     'глаз слишком мелкий, снимите ближе')], 'eye_side': side,
+             'eye_box': e['box'], 'eye_log': [f'{side}: {e["W"]:.0f} px — мелкий, пропуск']}
+        return d
+    log = []
+    for down in (EYES.BOX_DOWN, EYES.BOX_DOWN_RETRY):
+        r, box, s, poly_c, iris_c = _eye_crop(rgb, e, down)
+        con = _landmark_iris_contrast(r['crop'], iris_c)
+        if con < IRIS_CONTRAST:          # «лицо» внутри одного крупного глаза: точки радужки на радужке или коже
+            d = _rejected(dict(r, eye_box=box, eye_scale=s, eye_side=side),
+                          f'{side}: по точкам лица радужка не видна (контраст края {con:.0f} < {IRIS_CONTRAST}) — '
+                          'похоже, лицо найдено ошибочно (например, внутри крупного плана глаза)')
+            d['eye_log'] = log + [f'{side}: контраст радужки по точкам лица {con:.0f} < {IRIS_CONTRAST} — отказ']
+            return d
+        z = learned_conj(r, seg, force=True, limits=limits)
+        st = z.get('seg_steps') or {}
+        cut = st.get('raw', 0) - st.get('без нижнего края', 0)
+        log.append(f'{side}: рамка x {box[0]}–{box[2]}, y {box[1]}–{box[3]} px фото (вниз {down} W); '
+                   f'сегментатор {st}')
+        if down == EYES.BOX_DOWN and st.get('raw') and cut > 0.3 * st['raw']:
+            log.append(f'{side}: веко у нижнего края рамки ({cut} px отброшено) — рамка ниже')
+            continue
+        break
+    z = dict(z, eye_box=box, eye_scale=s, eye_side=side, eye=f'лицо в кадре, {side} по точкам MediaPipe')
+    if 'conj' in z['use']:
+        cz, sz = EYES.zones(z['crop'].shape, poly_c, iris_c)
+        conj, scl, ok, lost_c, lost_s = EYES.constrain(z['conj'], z['sclera'], cz, sz)
+        log.append(f'{side}: вне зоны нижнего века {lost_c:.0%} маски века, вне глазной щели {lost_s:.0%} склеры')
+        if not ok:
+            z = _rejected(z, f'{side}: маска века на {lost_c:.0%} вне области нижнего века по контуру глаза')
+        else:
+            an = AN.check(conj, None, limits)
+            if not an['conj_ok'] or not an['conj'].any():
+                z = _rejected(z, f'{side}: после ограничения зоной глаза веко не прошло анатомию: '
+                                 + (an['conj_why'] or 'маски не осталось'))
+            else:
+                use = set(z['use'])
+                if 'sclera' in use and (lost_s > EYES.ZONE_LOST_MAX or not scl.any()):
+                    use.discard('sclera')
+                    scl = np.zeros_like(scl)
+                    z['notes'] = list(z['notes']) + [f'склера ({side}) вне глазной щели ({lost_s:.0%}) — не используется']
+                z = dict(z, conj=an['conj'], sclera=scl if 'sclera' in use else np.zeros_like(scl), use=use)
+    z['eye_log'] = log + [f'{side}: ' + ('принят: ' + ', '.join(sorted(TISSUE_RU[t] for t in z['use']))
+                                             if 'conj' in z['use'] else 'отказ — ' + (z['notes'][-1] if z['notes'] else
+                                                                                      'веко не найдено'))]
+    return z
+
+
+def _eye_summary(z):
+    return {'side': z['eye_side'], 'box': z['eye_box'], 'accepted': 'conj' in z['use'],
+            'tissues': sorted(z['use']), 'why': '' if 'conj' in z['use'] else (z['notes'][-1] if z['notes'] else '')}
+
+
 def find_tissues(rgb, seg, lm=None, limits=AN.LIMITS):
-    """Маски тканей фото так же, как в analyze_photo: глаз (_detect) → сегментатор века с анатомией (learned_conj) →
-    при отказе на всём кадре повторный поиск века на рамке глаза (_zoom_conj). → (det0 — поиск глаза, det — итог,
-    diag — строки диагностики). limits=None — без анатомии (как до 2026-10-31), только для сравнения."""
+    """Маски тканей фото так же, как в analyze_photo → (det0 — поиск глаза, det — итог, diag — диагностика).
+    1) Фото лица (MediaPipe нашёл лицо): каждый глаз отдельно (analyze_eye). Принят хотя бы один — берётся глаз
+       с большей площадью века на исходном фото; det['eyes'] — итог по каждому глазу.
+    2) Лица нет или ни один глаз не принят — прежний маршрут макроснимка (_closeup_route, как на Eyes-defy).
+    limits=None — без анатомии этапа A (как до 2026-10-31), только для сравнения."""
+    diag, eyes = [], []
+    faces = face_eyes(rgb, lm) if lm else []
+    if faces:
+        res = [analyze_eye(rgb, e, seg, limits) for e in faces]
+        for z in res:
+            diag += z['eye_log']
+        eyes = [_eye_summary(z) for z in res]
+        ok = [z for z in res if 'conj' in z['use']]
+        if ok:
+            det = max(ok, key=lambda z: z['conj'].sum() / z['eye_scale'] ** 2)
+            det['eyes'] = eyes
+            diag.append(f'фото лица: оценка по глазу «{det["eye_side"]}» (больше площадь века на фото); '
+                        + '; '.join(f'{e["side"]}: {"принят" if e["accepted"] else "отказ"}' for e in eyes))
+            return det, det, diag
+        diag.append('фото лица: ни один глаз не принят — прежний маршрут макроснимка')
+    det0, det, d2 = _closeup_route(rgb, seg, lm, limits)
+    det['eyes'] = eyes
+    return det0, det, diag + d2
+
+
+def _closeup_route(rgb, seg, lm=None, limits=AN.LIMITS):
+    """Прежний маршрут (до 2026-10-31 — find_tissues): глаз (_detect) → сегментатор века с анатомией → при отказе
+    на всём кадре повторный поиск века на рамке глаза (_zoom_conj). Им проходят все снимки Eyes-defy."""
     img_hw = resize_max(rgb, V12.DETECT_SIDE).shape[:2]
     det0 = _detect(rgb, lm)                 # ориентация — как есть (EXIF учтён)
     det = det1 = learned_conj(det0, seg, limits=limits)
@@ -723,7 +849,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
          'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
-         'sclera': None, 'disclaimer': DISCLAIMER, 'diag': []}
+         'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None}
     if child_refused(age):
         r['status'], r['stage'], r['model'] = 'unreliable', 'age', 'нет (младше 5 лет)'
         r['issues'].append(CHILD_REFUSAL)
@@ -755,6 +881,10 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
     det0, det, diag = find_tissues(rgb, bundle['conj_seg'], lm)
     crop, conj, sclera = det['crop'], det['conj'], det['sclera']
     r['diag'] = diag
+    if det.get('eyes'):                     # фото лица: рамки глаз и маски — и на всём фото (overlay_photo)
+        prev = resize_max(rgb, V12.DETECT_SIDE)
+        r.update(eyes=det['eyes'], eye_box=det.get('eye_box') if 'conj' in det['use'] else None,
+                 photo_preview=prev, preview_scale=prev.shape[1] / rgb.shape[1], photo_shape=rgb.shape[:2])
     ts = tissue_status(crop, det)
     good = tuple(t for t in ('conj', 'sclera') if ts[t] == 'пригодна')
     r.update(crop=crop, conj=conj, sclera=sclera, kind=det['kind'], eye=det['eye'], tissue_status=ts,
@@ -854,6 +984,9 @@ def format_result(r):
     if r['kind']:
         lines.append(f"На снимке: {r['kind']}; глаз: {r['eye'] or 'не найден'}")
         lines += [f"  {TISSUE_RU[t]}: {v}" for t, v in r['tissue_status'].items()]
+    for e in r.get('eyes') or []:            # фото лица: каждый глаз проверен отдельно
+        lines.append(f"  {e['side']}: " + ('принят (' + ', '.join(TISSUE_RU[t] for t in e['tissues']) + ')'
+                                           if e['accepted'] else 'отказ — ' + (e['why'] or 'веко не найдено')))
     if r['status'] == 'ok':
         lines.append(f"РИСК АНЕМИИ: {r['risk'].upper()} — {RISK_TEXT[r['risk']]}")
         if r['hb_range']:
@@ -868,6 +1001,27 @@ def format_result(r):
         lines += ['Диагностика:'] + [f'  {x}' for x in r['diag']] + [f"  итог: {r['status']} / этап {r['stage']}"]
     lines.append(r['disclaimer'])
     return '\n'.join(lines)
+
+
+def overlay_photo(r):
+    """Всё фото лица (уменьшенное): рамки глаз (зелёная — глаз принят, красная — отказ) и маски выбранного глаза,
+    перенесённые из вырезки на фото (EYES.paste_mask) → uint8 RGB или None (не фото лица)."""
+    if r.get('photo_preview') is None:
+        return None
+    vis = (np.clip(r['photo_preview'], 0, 1) * 255).astype(np.uint8).copy()
+    k = r['preview_scale']
+    for e in r['eyes']:
+        x0, y0, x1, y1 = (round(v * k) for v in e['box'])
+        cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 200, 0) if e['accepted'] else (220, 0, 0), 2)
+    if r.get('eye_box') is not None:
+        for m, col in ((r['conj'], (0, 255, 0)), (r['sclera'], (0, 160, 255))):
+            if m is None or not m.any():
+                continue
+            full = EYES.paste_mask(m, r['eye_box'], r['photo_shape'])
+            small = cv2.resize(full.astype(np.uint8), (vis.shape[1], vis.shape[0]), interpolation=cv2.INTER_NEAREST)
+            cnts, _ = cv2.findContours(small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(vis, cnts, -1, col, 2)
+    return vis
 
 
 def overlay(r):
