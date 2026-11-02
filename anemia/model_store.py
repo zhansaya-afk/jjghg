@@ -13,15 +13,26 @@ import urllib.request
 
 REPO = 'zhansaya-afk/jjghg'
 FORMAT = 1
+# Модули, от которых зависят признаки и обучающая выборка модели: изменился любой → модель несовместима (Я1 заново).
+# anatomy.py (с 2026-11-02): отказы и обрезка маски века этапа A решают, какие снимки и маски идут в признаки
+# при обучении (evaluate.eye_route → predict.learned_conj → anatomy.check). eyes.py и crop_quality.py не входят:
+# они работают только при анализе фото (поиск глаза на фото лица, допуск по качеству), обучающих признаков и
+# весов не меняют — их правка переобучения не требует.
 FEATURE_MODULES = ('color.py', 'io.py', 'regions.py', 'segment_baseline.py', 'v12_model.py', 'core.py', 'selective.py',
-                   'metrics.py')
+                   'metrics.py', 'anatomy.py')
+# Ручная версия кода признаков обучения вне FEATURE_MODULES (функции predict.py, scripts/evaluate.py, features.py,
+# labs.py, по которым строятся признаки, метки и маски обучения; список — сторож в tests/test_model_store.py).
+# Сторож упал → проверить, меняет ли правка признаки; меняет → FEATURE_REV += 1 (старые модели отклоняются, Я1
+# заново). Тексты отказов, диагностика, UI её не меняют. Входит в code_version → поле 'code' метки (формат тот же).
+FEATURE_REV = 1
 PUBLIC_DATASETS = ('eyes_defy',)        # модели только этих датасетов можно публиковать (лицензия данных)
 TIMEOUT = 60
 
 
-def code_version():
-    pkg = os.path.dirname(os.path.abspath(__file__))
-    h = hashlib.sha1()
+def code_version(pkg=None):
+    """sha1 FEATURE_REV и модулей FEATURE_MODULES (12 знаков); pkg — папка пакета (по умолчанию эта)."""
+    pkg = pkg or os.path.dirname(os.path.abspath(__file__))
+    h = hashlib.sha1(f'FEATURE_REV={FEATURE_REV}'.encode() + b'\0')
     for name in FEATURE_MODULES:
         with open(os.path.join(pkg, name), 'rb') as f:
             h.update(name.encode() + b'\0' + f.read())

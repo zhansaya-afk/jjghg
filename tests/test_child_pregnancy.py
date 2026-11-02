@@ -109,3 +109,50 @@ def test_phone_pregnancy_column(tmp_path):
 
 def test_cp_anemic_not_loaded():
     assert set(D.LOADERS) == {'eyes_defy', 'phone'}
+
+
+# ------------------------------------------------------------------ возраст строкой и некорректный (2026-11-02)
+@pytest.mark.parametrize('age,want', [(30, 30.0), (4.5, 4.5), (np.int64(40), 40.0), ('30', 30.0), (' 4,5 ', 4.5),
+                                      ('5', 5.0), (None, None), ('', None), ('  ', None)])
+def test_parse_age(age, want):
+    assert PR.parse_age(age) == want
+
+
+@pytest.mark.parametrize('age', ['abc', '30 лет', 'nan', 'inf', -1, '-1', 200, float('nan'), True, [30], {}])
+def test_parse_age_invalid(age):
+    with pytest.raises(ValueError, match='возраст не распознан'):
+        PR.parse_age(age)
+
+
+@pytest.mark.parametrize('age,want', [(30, False), ('30', False), (5, False), ('5', False), (None, False), ('', False),
+                                      (4, True), ('4', True), (0.5, True), ('4,9', True),
+                                      ('abc', True), (-1, True), (float('nan'), True)])
+def test_child_refused_any_input(age, want):
+    assert PR.child_refused(age) is want                          # никогда не падает
+
+
+@pytest.mark.parametrize('age', ['30', '17', ' 45 '])
+def test_string_age_uses_adult_model(adult_route, age):
+    img, _, _ = synthetic_eye()
+    r = PR.analyze_photo(img, sex='F', age=age, bundle=adult_route, landmarker=None)
+    assert r['stage'] != 'age' and r['model'] == adult_route['models']['eyes_defy']['title']
+
+
+@pytest.mark.parametrize('age', ['4', '0,5'])
+def test_string_age_under_5_refused(adult_route, age):
+    img, _, _ = synthetic_eye()
+    r = PR.analyze_photo(img, sex='F', age=age, bundle=adult_route, landmarker=None)
+    assert r['stage'] == 'age' and r['risk'] is None and 'младше 5 лет' in r['issues'][0]
+
+
+@pytest.mark.parametrize('age', ['abc', -3, float('nan'), 500])
+def test_invalid_age_refused_safely(monkeypatch, age):
+    """Нераспознанный возраст — понятный отказ без риска и Hb, до загрузки модели (модель взрослых не подставляется)."""
+    def no_model(*a, **k):
+        raise AssertionError('модель не должна загружаться')
+    monkeypatch.setattr(PR, 'load_bundle', no_model)
+    img, _, _ = synthetic_eye()
+    r = PR.analyze_photo(img, sex='F', age=age)
+    assert r['status'] == 'unreliable' and r['stage'] == 'age'
+    assert r['risk'] is None and r['p_anemia'] is None and r['hb_range'] is None
+    assert 'возраст не распознан' in r['issues'][0] and 'возраст не распознан' in PR.format_result(r)

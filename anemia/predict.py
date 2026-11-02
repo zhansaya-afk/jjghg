@@ -33,6 +33,7 @@ MODEL_FILE = 'hemavision_core.joblib'
 MIN_SIDE = 24            # px по короткой стороне (вырезы ткани бывают 171×34 — так было в исключённом CP-AnemiC);
                          # мелкую ткань ловит quality()
 CHILD_MIN_AGE = 5        # лет; моложе — модели нет (CP-AnemiC исключён 2026-10-19): отказ, модель взрослых не подставляем
+AGE_MAX = 120            # лет, как в anemia.api; больше — возраст не распознан
 CHILD_REFUSAL = ('для детей младше 5 лет оценка по фото не проводится: модели, проверенной на детях, нет '
                  '(нормы ВОЗ и вид конъюнктивы у них другие) — сдайте общий анализ крови (Hb)')
 STATUS_RU = {'ok': 'оценка выполнена', 'retake': 'переснимите фото', 'unreliable': 'оценка ненадёжна'}
@@ -116,7 +117,7 @@ def frame_issues(rgb):
 
 
 # ------------------------------------------------------------------ модель
-_BUNDLES = {}
+_BUNDLES = {}             # абсолютный путь → (подпись файла _file_sig, модель)
 
 
 def default_model_path():
@@ -124,22 +125,35 @@ def default_model_path():
     return os.path.join(base, MODEL_FILE)
 
 
-def load_bundle(path=None):
-    """Модель из scripts/train_core.py (кэшируется в памяти)."""
-    path = path or default_model_path()
-    if path not in _BUNDLES:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f'нет модели {path}: сначала python scripts/train_core.py')
-        import joblib
+def _file_sig(path):
+    """Подпись файла модели: (inode, размер, время изменения в нс). Новая модель по тому же пути (Я1 в той же
+    сессии: перезапись или замена файла) меняет её."""
+    st = os.stat(path)
+    return st.st_ino, st.st_size, st.st_mtime_ns
 
-        from .model_store import check_compat
-        b = joblib.load(path)
-        why = check_compat(b.get('compat'))
-        if why:
-            raise RuntimeError(f'модель {path} не подходит к текущему коду ({why}): запустите ячейку Я1 '
-                               '(python scripts/train_core.py)')
-        _BUNDLES[path] = b
-    return _BUNDLES[path]
+
+def load_bundle(path=None):
+    """Модель из scripts/train_core.py. Кэш в памяти — по пути и подписи файла: файл перезаписан или заменён →
+    модель читается заново и снова проверяется на совместимость; файла нет → ошибка, а не старая модель из памяти."""
+    path = os.path.abspath(path or default_model_path())
+    if not os.path.exists(path):
+        _BUNDLES.pop(path, None)
+        raise FileNotFoundError(f'нет модели {path}: сначала python scripts/train_core.py')
+    sig = _file_sig(path)
+    hit = _BUNDLES.get(path)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    _BUNDLES.pop(path, None)
+    import joblib
+
+    from .model_store import check_compat
+    b = joblib.load(path)
+    why = check_compat(b.get('compat'))
+    if why:
+        raise RuntimeError(f'модель {path} не подходит к текущему коду ({why}): запустите ячейку Я1 '
+                           '(python scripts/train_core.py)')
+    _BUNDLES[path] = (sig, b)
+    return b
 
 
 def _sex(sex):
@@ -149,9 +163,40 @@ def _sex(sex):
     return 'M' if s[:1] in ('M', 'М') else 'F' if s[:1] in ('F', 'Ж', 'W') else None
 
 
+def parse_age(age):
+    """Возраст → число лет (float) или None (не указан: None или пустая строка). Строка с числом ('30', ' 4,5 ')
+    — как число. Не число, bool, NaN/бесконечность, < 0 или > AGE_MAX → ValueError с понятным текстом."""
+    if age is None:
+        return None
+    if isinstance(age, (bool, np.bool_)):
+        raise ValueError(f'возраст не распознан: {age!r}')  # noqa: TRY004 — один тип ошибки для любого ввода
+    if isinstance(age, str):
+        txt = age.strip().replace(',', '.')
+        if not txt:
+            return None
+        try:
+            v = float(txt)
+        except ValueError:
+            raise ValueError(f'возраст не распознан: {age!r}') from None
+    else:
+        try:
+            v = float(age)
+        except (TypeError, ValueError):
+            raise ValueError(f'возраст не распознан: {age!r}') from None
+    if not np.isfinite(v) or not 0 <= v <= AGE_MAX:
+        raise ValueError(f'возраст не распознан: {age!r} (нужно число лет от 0 до {AGE_MAX})')
+    return v
+
+
 def child_refused(age):
-    """Возраст младше 5 лет → оценки по фото нет (True). Возраст не указан → модель взрослых, как раньше."""
-    return age is not None and age < CHILD_MIN_AGE
+    """Возраст младше 5 лет → оценки по фото нет (True). Возраст не указан → модель взрослых, как раньше.
+    Строка с числом ('30') — как число. Нераспознанный возраст ('abc', -1, NaN) → тоже True: модель взрослых
+    подставляется, только если возраст не указан или это число ≥ 5 лет."""
+    try:
+        v = parse_age(age)
+    except ValueError:
+        return True
+    return v is not None and v < CHILD_MIN_AGE
 
 
 def pick_model(bundle, age):
@@ -903,7 +948,8 @@ def _closeup_route(rgb, seg, lm=None, limits=AN.LIMITS):
 # ------------------------------------------------------------------ главный вход
 def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmarker='auto'):
     """Фото глаза (оттянутое нижнее веко) → dict. Уже вырезанная ткань не оценивается (stage 'mismatch'),
-    ребёнок младше 5 лет — тоже (stage 'age', до загрузки модели и разбора фото). pregnant: True / False / None.
+    ребёнок младше 5 лет или нераспознанный возраст — тоже (stage 'age', до загрузки модели и разбора фото).
+    age — число лет, строка с числом ('30') или None (не указан). pregnant: True / False / None.
         status   — 'ok' | 'retake' (снимок непригоден) | 'unreliable' (снимок не похож на обучающие / нет модели);
         stage    — где остановились: 'frame' (кадр технически непригоден), 'no_eye' (глаз не найден), 'no_tissue'
                    (глаз есть, тканей нет), 'quality' (ткани найдены, качество недостаточно), 'no_model' (для
@@ -921,6 +967,12 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
          'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
          'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None}
+    try:
+        age = parse_age(age)                # дальше возраст — число или None (нормы ВОЗ, подростки)
+    except ValueError as e:
+        r['status'], r['stage'], r['model'] = 'unreliable', 'age', 'нет (возраст не распознан)'
+        r['issues'].append(f'{e} — укажите возраст числом лет')
+        return r
     if child_refused(age):
         r['status'], r['stage'], r['model'] = 'unreliable', 'age', 'нет (младше 5 лет)'
         r['issues'].append(CHILD_REFUSAL)
