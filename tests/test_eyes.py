@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pytest
 
+from anemia import crop_quality as CQ
 from anemia import eyes as EYES
 from anemia import predict as PR
 from anemia import regions as R
@@ -206,11 +207,92 @@ def test_false_face_without_iris_contrast_falls_back_to_old_route(monkeypatch):
     assert 'eye_side' not in det
 
 
-def test_small_eyes_skipped():
-    e = {'side': 'правый глаз', 'poly': eye_poly(300, 300, 40), 'iris': (300, 300, 8), 'W': 40.0,
-         'box': EYES.eye_box(eye_poly(300, 300, 40), (PH, PW))}
+def test_tiny_eyes_skipped_before_segmentation():
+    w = CQ.LIMITS['lid_w_clean'] - 5                         # глаз уже самой узкой допустимой полосы века
+    e = {'side': 'правый глаз', 'poly': eye_poly(300, 300, w), 'iris': (300, 300, 4), 'W': float(w),
+         'box': EYES.eye_box(eye_poly(300, 300, w), (PH, PW))}
     z = PR.analyze_eye(face_photo()[0], e, RedSeg())
-    assert z['use'] == set() and 'мелкий' in z['eye_log'][-1]
+    assert z['use'] == set() and 'мало реальных пикселей' in z['notes'][-1]
+
+
+# ---------------------------------------------------------------- качество по исходным пикселям, каждый глаз
+def scaled(rgb, k):
+    """Фото лица в k раз меньше (точки лица — в долях кадра, поэтому FakeLandmarker тот же)."""
+    return cv2.resize(rgb, (round(PW * k), round(PH * k)), interpolation=cv2.INTER_AREA)
+
+
+def jpeg(img, q):
+    _, b = cv2.imencode('.jpg', (np.clip(img, 0, 1)[..., ::-1] * 255 + 0.5).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, q])
+    return cv2.imdecode(b, 1)[..., ::-1].astype(np.float32) / 255
+
+
+@pytest.mark.parametrize('k', [1.0, 0.6, 0.4])
+def test_small_but_sharp_eyes_accepted_at_any_resolution(k):
+    rgb = scaled(face_photo()[0], k)                           # k = 0,4: глаз 48 px, веко ~43 px
+    _, det, diag = PR.find_tissues(rgb, RedSeg(), FakeLandmarker(landmarks()), file_q='lossless')
+    assert any(e['accepted'] for e in det['eyes']), [e['why'] for e in det['eyes']]
+    assert not any('размыт' in e['why'] for e in det['eyes'])
+    assert any('увеличение ×' in x and 'только для сегментатора' in x for x in diag)
+    up = [float(x.split('увеличение ×')[1].split(' ')[0]) for x in diag if 'увеличение ×' in x]
+    assert k > 0.5 or max(up) > 2                              # мелкий глаз действительно увеличивался
+
+
+def test_large_defocused_eyes_refused_both(monkeypatch):
+    rgb = cv2.GaussianBlur(face_photo()[0], (0, 0), 6)        # крупное, но расфокусированное фото
+    bundle = {'models': {'eyes_defy': {'title': 'тест'}}, 'conj_seg': RedSeg()}
+    monkeypatch.setattr(PR, 'ADULT_MODEL', defaultdict(lambda: 'нет модели'))
+    r = PR.analyze_photo(rgb, sex='F', age=30, bundle=bundle, landmarker=FakeLandmarker(landmarks()))
+    assert r['eyes'] and not any(e['accepted'] for e in r['eyes'])
+    assert all('размыт' in e['why'] for e in r['eyes'])
+    assert r['status'] != 'ok' and r['risk'] is None and r['hb_range'] is None
+    assert r['stage'] in ('no_eye', 'no_tissue', 'quality')    # «переснимите», а не «нет модели»
+
+
+def test_one_eye_blurred_other_used():
+    rgb, _ = face_photo()
+    rgb[:, :450] = cv2.GaussianBlur(rgb, (0, 0), 6)[:, :450]   # правый глаз (слева на фото) — не в фокусе
+    _, det, _ = PR.find_tissues(rgb, RedSeg(), FakeLandmarker(landmarks()))
+    sides = {e['side']: e for e in det['eyes']}
+    assert not sides['правый глаз']['accepted'] and 'размыт' in sides['правый глаз']['why']
+    assert sides['левый глаз']['accepted'] and det['eye_side'] == 'левый глаз'
+
+
+def test_first_choice_eye_fails_quality_second_eye_checked(monkeypatch):
+    rgb, _ = face_photo()
+    cx, cy = EYES_AT['правый']
+    wide = lid_band(cx, cy, w=EW * 1.3)                         # у правого глаза веко шире — раньше выбирался он
+    rgb[wide] = (0.78, 0.22, 0.26)
+    rgb[:, :450] = cv2.GaussianBlur(rgb, (0, 0), 6)[:, :450]   # но он размыт
+    bundle = {'models': {'eyes_defy': {'title': 'тест'}}, 'conj_seg': RedSeg()}
+    monkeypatch.setattr(PR, 'ADULT_MODEL', defaultdict(lambda: 'нет модели'))
+    r = PR.analyze_photo(rgb, sex='F', age=30, bundle=bundle, landmarker=FakeLandmarker(landmarks()))
+    acc = {e['side']: e['accepted'] for e in r['eyes']}
+    assert acc == {'правый глаз': False, 'левый глаз': True}
+    assert r['stage'] == 'no_model'                             # дошли до модели: «переснимите» из-за правого глаза нет
+    assert r['eye'].endswith('левый глаз по точкам MediaPipe')
+
+
+@pytest.mark.parametrize(('k', 'q', 'ok'), [(1.0, 95, True), (0.4, 95, False), (0.8, 75, False), (0.6, 60, False)])
+def test_jpeg_file_quality_sets_needed_lid_pixels(monkeypatch, k, q, ok):
+    """Один и тот же резкий глаз: без сжатия веко 43 px хватает, а в JPEG — нет (сжатие размывает цвет тонкой
+    полосы); качество берётся из таблиц квантования самого файла."""
+    data = cv2.imencode('.jpg', (scaled(face_photo()[0], k)[..., ::-1] * 255).astype(np.uint8),
+                        [cv2.IMWRITE_JPEG_QUALITY, q])[1].tobytes()
+    bundle = {'models': {'eyes_defy': {'title': 'тест'}}, 'conj_seg': RedSeg()}
+    monkeypatch.setattr(PR, 'ADULT_MODEL', defaultdict(lambda: 'нет модели'))
+    r = PR.analyze_photo(data, sex='F', age=30, bundle=bundle, landmarker=FakeLandmarker(landmarks()))
+    assert f'файл: JPEG качества {q}' in r['diag']
+    assert any(e['accepted'] for e in r['eyes']) == ok
+    if not ok:
+        assert r['stage'] == 'quality' and r['risk'] is None and r['hb_range'] is None
+        assert any('мало реальных пикселей' in e['why'] and f'JPEG качества {q}' in e['why'] for e in r['eyes'])
+
+
+def test_jpeg_small_face_refused_for_lack_of_detail():
+    rgb = jpeg(scaled(face_photo()[0], 0.5), 25)                # мелкое сжатое фото: пикселей мало, блоки JPEG
+    _, det, _ = PR.find_tissues(rgb, RedSeg(), FakeLandmarker(landmarks()))
+    assert det['eyes'] and not any(e['accepted'] for e in det['eyes'])
+    assert any('мало реальных пикселей' in e['why'] or 'сжатием' in e['why'] for e in det['eyes'])
 
 
 # ---------------------------------------------------------------- прежний маршрут не меняется
