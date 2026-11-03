@@ -38,7 +38,9 @@ def photo_line(f):
         return f"По фото риск анемии {ph['risk']}" + (
             f" ({reason})." if reason else "."
         )
-    if ph.get("status") == "unreliable":
+    if ph.get("stage") == "ood" or (
+        ph.get("status") == "unreliable" and not ph.get("reason")
+    ):
         return "Фото оценить нельзя: снимок не похож на те, на которых училась система."
     return (
         f"Фото оценить нельзя: {(ph.get('reason') or 'снимок не подошёл').rstrip('.')}."
@@ -312,6 +314,12 @@ SLOTS = {
     "lab_advice": lab_advice,
     "lab_vs_photo": lab_vs_photo,
     "lab_missing": lab_missing,
+    # фото — скрининг; анализ — измерение, но диагноз и причину всё равно определяет врач
+    "not_diagnosis": lambda f, q: (
+        "Это скрининг, не диагноз."
+        if f.get("photo")
+        else "Диагноз и причину ставит только врач."
+    ),
     "exact_note": lambda f, q: (
         "Точное значение покажет только анализ крови."
         if not f.get("lab")
@@ -385,7 +393,9 @@ PHOTO_HOWTO = (
 
 def retake(f):
     ph = f.get("photo") or {}
-    if ph.get("status") == "unreliable":
+    if ph.get("stage") == "ood" or (
+        ph.get("status") == "unreliable" and not ph.get("reason")
+    ):
         why = (
             "Снимок не похож на те, на которых училась система (другой свет, ракурс или камера), поэтому оценка "
             "ненадёжна, и цифру по нему назвать нельзя."

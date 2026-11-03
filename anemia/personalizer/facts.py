@@ -57,6 +57,9 @@ def photo_facts(result):
         out["hb_interval_g_l"] = list(_get(result, "hb_range"))
     if out["tissue"] is None and _get(result, "tissues"):
         out["tissue"] = _TISSUE.get(tuple(_get(result, "tissues")))
+    if out["reason"] is None and out["status"] != "ok" and _get(result, "issues"):
+        # сырой dict analyze_photo: причина — первая проблема снимка, без совета после «—»
+        out["reason"] = str(_get(result, "issues")[0]).split(" — ")[0].rstrip(".")
     if out["status"] != "ok":
         out.update(
             risk="не определён", p_anemia=None, hb_interval_g_l=None, tissue=None

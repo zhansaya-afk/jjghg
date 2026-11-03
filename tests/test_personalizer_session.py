@@ -1,0 +1,138 @@
+"""Ячейка Я5: диалог персонализатора на поддельном вводе и сам код ячейки из блокнота."""
+
+import builtins
+import json
+from pathlib import Path
+
+import pytest
+
+from anemia.personalizer.session import chat, from_notebook, yes_no
+from anemia.personalizer_eval import violations
+
+NB = Path(__file__).resolve().parents[1] / "notebooks" / "colab_train.ipynb"
+PHOTO = {  # как возвращает predict.analyze_photo
+    "status": "ok",
+    "stage": "ok",
+    "risk": "высокий",
+    "p_anemia": 0.81,
+    "hb_range": (92.0, 112.0),
+    "tissues": ["conj", "sclera"],
+    "issues": [],
+    "reasons": [],
+}
+BAD = {"status": "retake", "stage": "no_eye", "risk": None, "hb_range": None, "tissues": [],
+       "issues": ["глаз не найден — снимите глаз с оттянутым нижним веком"]}  # fmt: skip
+WOMAN = {"sex": "F", "age": 32, "pregnant": False}
+
+
+def run(answers, *args, **kw):
+    said, it = [], iter(answers)
+    out = chat(*args, ask=lambda p: next(it, ""), say=said.append, **kw)
+    return out, [s for s in said if s]
+
+
+def test_yes_no():
+    assert [yes_no(x) for x in ("Да", "нет", "иә", "жоқ", "", "не знаю")] == [
+        True,
+        False,
+        True,
+        False,
+        None,
+        None,
+    ]
+
+
+def test_full_conversation_uses_survey_and_stays_safe():
+    out, said = run(
+        ["нет", "да", "да", "нет", "нет", "Какие анализы сдать?", ""],
+        PHOTO,
+        None,
+        WOMAN,
+    )
+    assert out["survey"] == {"red_flag": False, "weakness": True, "blood_loss": True, "meat_fish": False,
+                             "family_thalassemia": False}  # fmt: skip
+    assert "высокий" in said[0]  # сначала объяснение результата фото
+    after = said[2]  # после опроса: подсказки по ответам + анализы
+    assert (
+        "месячные" in after and "B12" in after and "общий анализ крови" in after.lower()
+    )
+    assert any("ферритин" in s for s in said[3:])
+    for s in said:
+        assert not violations(s, out["facts"]), s
+
+
+def test_red_flag_in_survey_stops_with_urgent():
+    out, said = run(["да"], PHOTO, None, WOMAN)
+    assert out["survey"] == {"red_flag": True}  # остальное не спрашивается
+    assert any("103" in s for s in said) and "сначала обратитесь" in said[-1]
+
+
+def test_child_refused_without_survey():
+    child = {"status": "unreliable", "stage": "age", "risk": None, "issues": []}
+    out, said = run([], child, None, {"sex": "F", "age": 3})
+    assert out["survey"] is None and "5 лет" in said[0]
+
+
+def test_bad_photo_asks_retake_with_reason():
+    _, said = run(["", "", "", "", ""], BAD, None, WOMAN)
+    assert said[0].startswith("Снимок не подошёл (глаз не найден)")
+
+
+def test_lab_only_and_kazakh():
+    lab = {"hb_g_l": 104}
+    out, said = run(["жоқ", "иә", "жоқ", "иә", "жоқ", ""], None, lab, WOMAN, lang="kk")
+    assert "104" in said[0]
+    assert out["survey"]["weakness"] is True
+
+
+def test_no_interactive_input_ends_cleanly():
+    def eof(prompt):
+        raise EOFError
+
+    said = []
+    out = chat(PHOTO, None, WOMAN, ask=eof, say=said.append, survey=False)
+    assert out["history"] and "диагноз" in said[-1]
+
+
+def test_from_notebook_refuses_mixed_profiles():
+    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет",
+          "lab": {"hb_g_l": 104}, "Пол_анализ": "Мужской", "Возраст_анализ": 32, "Беременность_анализ": "Нет"}  # fmt: skip
+    said = []
+    assert from_notebook(ns, "Фото и анализ", say=said.append) is None
+    assert "различаются" in said[0]
+    said = []
+    assert from_notebook({}, "Фото (Я2)", say=said.append) is None and "Я2" in said[0]
+
+
+def _ya5_source():
+    nb = json.loads(NB.read_text(encoding="utf-8"))
+    cells = [
+        c
+        for c in nb["cells"]
+        if c["cell_type"] == "code" and "Ячейка Я5" in "".join(c["source"])
+    ]
+    assert (
+        len(cells) == 1 and nb["cells"][-1] is cells[0]
+    )  # Я5 — последняя ячейка, остальные не тронуты
+    return "".join(cells[0]["source"])
+
+
+def test_ya5_cell_runs_on_ya2_variables(monkeypatch, capsys):
+    answers = iter(["нет", "нет", "нет", "да", "нет", "Что такое ферритин?", ""])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers, ""))
+    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    exec(compile(_ya5_source(), "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
+    out = capsys.readouterr().out
+    assert "По фото риск анемии высокий" in out and "Ферритин" in out
+
+
+@pytest.mark.parametrize("what", ["Анализ крови (Я3)", "Фото и анализ"])
+def test_ya5_cell_without_ya3_says_what_to_run(what, capsys):
+    src = _ya5_source().replace(
+        "Что_объяснить = 'Фото (Я2)'", f"Что_объяснить = {what!r}"
+    )
+    exec(  # noqa: S102 — код ячейки блокнота
+        compile(src, "Я5", "exec"),
+        {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"},
+    )
+    assert "Я3" in capsys.readouterr().out
