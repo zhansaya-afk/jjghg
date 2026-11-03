@@ -31,6 +31,7 @@ accuracy, precision (PPV), recall (= чувствительность), спец
 """
 import argparse
 import datetime as dt
+import functools
 import os
 import subprocess
 import sys
@@ -50,6 +51,7 @@ from anemia import core as CORE  # noqa: E402
 from anemia import metrics as M  # noqa: E402
 from anemia import predict as PR  # noqa: E402
 from anemia import segment_baseline as SB  # noqa: E402
+from anemia import seg_metrics as SM  # noqa: E402
 from anemia import v12_model as V12  # noqa: E402
 from anemia import runs as RUNS  # noqa: E402
 from anemia import external as EXT  # noqa: E402
@@ -436,31 +438,62 @@ def _seg_test_item(root, row, kind):
     return rgb, resize_to(load_mask(os.path.join(root, row['mask'])), rgb.shape[:2], nearest=True)
 
 
+def _seg_one(model, rgb, gt, limits=None):
+    """Маска сегментатора ядра на снимке с эталоном gt → None (эталон пуст) или
+    (статус, маска для метрик, принята, причина, (IoU, Dice, нашёл) по прежнему правилу «отказ = пустая маска»).
+    Пустая маска сегментатора — статус ok (ошибка сегментации, в метриках нулём); непустая, отклонённая
+    анатомией (limits, AN.check), — refused, маска для метрик — отклонённая (только диагностика)."""
+    if not gt.any():
+        return None
+    raw = SB.conj_mask(model, rgb)
+    p, status, accepted, why = raw, 'ok', bool(raw.any()), ''
+    if not raw.any():
+        why = 'сегментатор не нашёл веко'
+    elif limits is not None:
+        an = AN.check(raw, None, limits)
+        if an['conj_ok']:
+            p = an['conj']
+        else:
+            status, accepted, why = 'refused', False, an['conj_why']
+    old = p if accepted else np.zeros_like(raw)
+    return status, p, accepted, why, (M.iou(old, gt), M.dice(old, gt), bool(old.any()))
+
+
 def _seg_scores(model, items, limits=None):
     """(IoU, Dice, нашёл) по снимкам; пустая разметка → None (IoU пусто/пусто = 1 завысил бы среднее).
-    limits — с анатомией (AN.check): остаётся главная полоса века, не прошла проверку → пустая маска (отказ)."""
+    limits — с анатомией (AN.check): остаётся главная полоса века, не прошла проверку → пустая маска (отказ).
+    Правило строк истории seg_ext — без изменений (отказ и пустая маска = IoU 0)."""
     out = []
     for rgb, gt in items:
-        if not gt.any():
-            out.append(None)
-            continue
-        p = SB.conj_mask(model, rgb)
-        if limits is not None and p.any():
-            an = AN.check(p, None, limits)
-            p = an['conj'] if an['conj_ok'] else np.zeros_like(p)
-        out.append((M.iou(p, gt), M.dice(p, gt), bool(p.any())))
+        r = _seg_one(model, rgb, gt, limits)
+        out.append(None if r is None else r[4])
     return out
+
+
+def _seg_record(arm, dataset, image_id, group, fold, gt, res):
+    """Строка seg_per_image.csv задачи seg_ext по результату _seg_one (None — пустой эталон → no_gt)."""
+    if res is None:
+        return SM.image_record('seg_ext', arm, dataset, image_id, group, fold, 'no_gt', gt=gt,
+                               why='эталонная маска пуста')
+    status, p, accepted, why, _ = res
+    stage = 'anatomy' if status == 'refused' else ('accepted' if accepted else 'empty_mask')
+    return SM.image_record('seg_ext', arm, dataset, image_id, group, fold, status, pred=p, gt=gt, accepted=accepted,
+                           why=why, stage=stage)
 
 
 def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
     """Сегментатор ядра (SB.conj_mask, как в анализе фото) без и с телефонными фото external/ — IoU вне обучения:
     Eyes-defy по фолдам манифеста, телефонные фото по GroupKFold их групп (почти одинаковые кадры в одном фолде).
-    Модель фолда f не видит ни снимков Eyes-defy фолда f, ни телефонных фото фолда f. → строки для истории."""
+    Модель фолда f не видит ни снимков Eyes-defy фолда f, ни телефонных фото фолда f.
+    → (строки для истории — прежнее правило «отказ = 0»; строки seg_per_image.csv по каждому снимку и варианту;
+    ошибка сборки строк seg_per_image.csv или None). Ошибка в отчётных строках не прерывает строки истории: строки
+    отчёта тогда не возвращаются, причина — третьим значением. Имя варианта в строках отчёта — без «(отказ = пустая
+    маска)»: там отказ отделён от пустой маски (статус и этап); имя в истории прежнее."""
     idx = EXT.seg_index(root)
     if not len(idx):
         print('нет <data>/external/index.csv с масками (python scripts/fetch_data.py --external phone_conj_masks) — '
               'пропуск seg_ext')
-        return []
+        return [], [], None
     t0 = time.perf_counter()
     ed_s = Parallel(n_jobs=jobs)(delayed(_segpix_job)(root, r, i, cache) for i, r in enumerate(df.to_dict('records')))
     ex_s = external_seg_samples(root, jobs, cache, idx)
@@ -485,20 +518,35 @@ def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
     # анатомия: пределы по маскам врачей только обучающих фолдов (Eyes-defy и телефонных) этой модели
     ed_st = [AN.image_stats(gt, None) for _, gt in ed_items]
     ex_st = [AN.image_stats(gt, None) for _, gt in ex_items]
-    scores = {}
+    scores, records, rec_error = {}, [], None
+    ex_ids = idx['id'].values if 'id' in idx else idx.group.values      # id индекса, не имя файла (бывают ФИО)
     for (f, arm, _), m in zip(jobs_list, models):
         te_ed = [it for it, g, ok in zip(ed_items, ed_fold, good) if g == f and ok]
         te_ex = [it for it, g in zip(ex_items, ex_fold) if g == f]
-        arms = [(arm, None)]
+        arms = [(arm, None, arm)]                       # (имя в истории, пределы анатомии, имя в seg_per_image.csv)
         if arm == 'Eyes-defy + телефонные':
             lim = AN.fit_limits([x for x, g, ok in zip(ed_st, ed_fold, good) if g != f and ok]
                                 + [x for x, g in zip(ex_st, ex_fold) if g != f])
-            arms.append((arm + ' + анатомия (отказ = пустая маска)', lim))
-        for name, lim in arms:
-            scores.setdefault((name, 'eyes_defy'), []).extend(
-                zip(df.group.values[(ed_fold == f) & good], _seg_scores(m, te_ed, lim)))
-            scores.setdefault((name, 'phone_conj_masks'), []).extend(
-                zip(idx.group.values[ex_fold == f], _seg_scores(m, te_ex, lim)))
+            arms.append((arm + ' + анатомия (отказ = пустая маска)', lim, arm + ' + анатомия'))
+        sel_ed, sel_ex = (ed_fold == f) & good, ex_fold == f
+        for name, lim, rec_name in arms:
+            method = f'сегментатор ядра · обучение: {rec_name}'
+            for ds_name, items, ids, groups in (
+                    ('eyes_defy', te_ed, df.patient_id.values[sel_ed], df.group.values[sel_ed]),
+                    ('phone_conj_masks', te_ex, ex_ids[sel_ex], idx.group.values[sel_ex])):
+                res = [_seg_one(m, rgb, gt, lim) for rgb, gt in items]
+                scores.setdefault((name, ds_name), []).extend(zip(groups, [None if r is None else r[4] for r in res]))
+                if rec_error is None:
+                    try:
+                        records += [_seg_record(method, ds_name, i_, g_, f, gt, r)
+                                    for (_, gt), r, i_, g_ in zip(items, res, ids, groups)]
+                    except Exception as e:  # noqa: BLE001 — отчётные строки не должны срывать строки истории
+                        rec_error, records = f'seg_ext: {type(e).__name__}: {e}', []
+            bad = (ed_fold == f) & ~good       # испорченные маски врачей: не учим и не меряем, но в CSV видны
+            if rec_error is None:
+                records += [SM.image_record('seg_ext', method, 'eyes_defy', i_, g_, f, 'no_gt',
+                                            why='маска врача в списке испорченных (BAD_DOCTOR_MASKS)')
+                            for i_, g_ in zip(df.patient_id.values[bad], df.group.values[bad])]
     rows = []
     for (arm, test), v in scores.items():
         v = [(g, sc) for g, sc in v if sc is not None]
@@ -510,7 +558,7 @@ def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
                      'iou_median': float(np.median(iou)), 'dice_mean': float(np.mean([s[1] for _, s in v])),
                      'found': float(np.mean([s[2] for _, s in v])),
                      'iou_found': float(np.mean([s[0] for _, s in v if s[2]])) if any(s[2] for _, s in v) else np.nan})
-    return rows
+    return rows, records, rec_error
 
 
 DET_KEYS = ('crop', 'conj', 'sclera', 'iris', 'use', 'kind', 'notes', 'src_side', 'score')
@@ -629,6 +677,95 @@ def core_jobs(root, df, jobs, segs, cache=NO_CACHE, timer=None, nested=False, li
         timer.add(f'core {df.dataset.iloc[0]}: поиск тканей + маска сегментатора + отказы + признаки',
                   [t for *_, t in res], time.perf_counter() - t0)
     return [{'i': i, 'role': role, **x} for i, role, x, _ in res]
+
+
+IOU_TOL = 1e-9   # допуск сверки IoU двух проходов: одна формула (M.iou) на одних масках — разница только округления
+
+
+class SegConsistencyError(RuntimeError):
+    """Проход метрик масок (core_seg_records) разошёлся с маршрутом _core_job: seg_per_image.csv не пишется."""
+
+
+def _core_seg_one(root, row, seg, cache, limits):
+    """Тот же снимок, что в _core_job (роль test): шаг 1 из кэша, eye_route с тем же сегментатором и пределами →
+    (строка seg_per_image.csv, модель маршрута, IoU по правилу _crop_iou). Сырая маска сегментатора (до анатомии)
+    считается отдельно: только по ней видно, была маска пустой (ok, ошибка сегментации) или отклонена (refused) —
+    отклонённую маску _rejected обнуляет. Этап отказа (SM.REFUSED_STAGES) — по шагам eye_route: _inconsistent
+    шага 1 → запуск сегментатора (условие learned_conj) → AN.check сырой маски → _inconsistent после сегментатора
+    (конъюнктивы нет в det['use']) → tissue_route (качество; модель без конъюнктивы)."""
+    path = os.path.join(root, row['image'])
+    det0, _ = cache.fetch('v12det', {'image': path}, {}, {'detect_side': V12.DETECT_SIDE}, _det_compute, path)
+    det, key, why = eye_route(det0, seg, limits)
+    conj_used = key is not None and 'conj' in CORE.SPECS[key]['tissues']
+    iou_route = _crop_iou(root, row, det['crop'], det['conj'], conj_used)
+    w0 = PR._inconsistent(det0)                     # те же условия запуска сегментатора, что в eye_route/learned_conj
+    d1 = PR._rejected(det0, w0) if w0 else det0
+    ran = bool(d1['use']) and d1['kind'] != 'вырезанная ткань'
+    raw = SB.conj_mask(seg, d1['crop']) if ran else None
+    arm = 'маршрут анализа фото' + (' без анатомии' if limits is None else ' + анатомия')
+    rec = functools.partial(SM.image_record, 'core', arm, row['dataset'], row['patient_id'], row['group'], row['fold'])
+    if not isinstance(row.get('mask_conj'), str) or row['patient_id'] in BAD_DOCTOR_MASKS:
+        return rec('no_gt', why='нет годной маски врача'), key, iou_route
+    gt = resize_to(load_mask(os.path.join(root, row['mask_conj'])), det['crop'].shape[:2], nearest=True)
+    if not gt.any():
+        return rec('no_gt', gt=gt, why='маска врача пуста на вырезке'), key, iou_route
+    if conj_used:
+        r = rec('ok', pred=det['conj'], gt=gt, accepted=True, stage='accepted' if ran else 'accepted_no_segmenter')
+    elif ran and not raw.any():
+        r = rec('ok', pred=raw, gt=gt, why=why or 'сегментатор не нашёл веко')   # ошибка сегментации, не отказ
+    else:
+        if w0:
+            stage = 'before_seg_inconsistent'
+        elif not ran:
+            stage = 'not_segmented'
+        elif limits is not None and not AN.check(raw, None, limits)['conj_ok']:   # conj_ok от склеры не зависит
+            stage = 'anatomy'
+        elif 'conj' not in det['use']:
+            stage = 'after_seg_inconsistent'
+        else:
+            stage = 'quality' if key is None else 'no_conj_model'
+        diag = det['conj'] if det['conj'] is not None and det['conj'].any() else raw
+        r = rec('refused', pred=diag, gt=gt, why=why or f'оценка без конъюнктивы (модель {key})', stage=stage)
+    return r, key, iou_route
+
+
+def _core_seg_batch(root, items, seg, cache, limits):
+    return [(i, *_core_seg_one(root, row, seg, cache, limits)) for i, row in items]
+
+
+def core_seg_records(root, df, segs, limits, J, jobs=1, cache=NO_CACHE, tol=IOU_TOL):
+    """Строки seg_per_image.csv задачи core по тестовым снимкам (роль test) без изменения _core_job.
+    Утечки нет по построению: снимок фолда g размечается сегментатором segs[(g,)] (не видел фолда g) и пределами
+    анатомии limits[(g,)] (только обучающие фолды) — теми же, что в core_jobs. Сверка: модель маршрута и IoU
+    (правило _crop_iou, отказ = 0) у каждого снимка совпадают с результатом _core_job с допуском tol; иначе
+    SegConsistencyError и строк нет."""
+    T = sorted((x for x in J if x['role'] == 'test'), key=lambda x: x['i'])
+    if [x['i'] for x in T] != list(range(len(df))):
+        raise SegConsistencyError(f'тестовых снимков {len(T)} из {len(df)}: каждый снимок должен быть ровно один раз')
+    recs = df.to_dict('records')
+    per_key = limits is not None and 'wfrac_min' not in limits
+    batches = {}
+    for x in T:
+        batches.setdefault((int(recs[x['i']]['fold']),), []).append((x['i'], recs[x['i']]))
+    missing = [k for k in batches if k not in segs or (per_key and k not in limits)]
+    if missing:
+        raise SegConsistencyError(f'нет сегментатора или пределов анатомии без фолдов {missing}')
+    out = Parallel(n_jobs=jobs)(delayed(_core_seg_batch)(root, items, segs[k], cache, limits[k] if per_key else limits)
+                                for k, items in batches.items())
+    got = {i: (r, key, iou) for b in out for i, r, key, iou in b}
+    bad = []
+    for x in T:
+        r, key, iou = got[x['i']]
+        a = x.get('iou')
+        same = (a is None) == (iou is None) and (a is None or abs(float(a) - float(iou)) <= tol)
+        if not same or key != x['key']:
+            bad.append(f"{r['id']}: IoU {a} / {iou}, модель {x['key']} / {key}")
+        elif r['status'] == 'ok' and r['accepted'] and abs(float(r['iou']) - float(iou)) > tol:
+            bad.append(f"{r['id']}: IoU строки {r['iou']} / маршрута {iou}")
+    if bad:
+        raise SegConsistencyError(f'метрики масок разошлись с маршрутом _core_job у {len(bad)} снимков '
+                                  f'(допуск IoU {tol:g}): ' + '; '.join(bad[:10]))
+    return [got[x['i']][0] for x in T]
 
 
 def route_counts(J, n):
@@ -825,6 +962,73 @@ def fmt(r, k, nd=1, pct=False):
     return s
 
 
+def _f(v, d=3):
+    return '—' if v is None or pd.isna(v) else f'{v:.{d}f}'
+
+
+def print_seg_summary(S, limit=15):
+    """Сводка seg_summary.csv: средние по ok (пустые маски — нулями), precision — по ok с непустой маской."""
+    head = ['Задача · вариант', 'Набор', 'Страна', 'ok / отказ / нет эталона', 'Пустых масок', 'Отказы по этапам',
+            'IoU [ДИ]', 'Dice', 'Precision', 'Recall', 'P / R суммарно']
+    print('\nМетрики масок конъюнктивы (seg_summary.csv): средние по снимкам ok, отказы и снимки без эталона — '
+          'отдельно')
+    print('| ' + ' | '.join(head) + ' |')
+    print('|' + '---|' * len(head))
+    for r in S.head(limit).to_dict('records'):
+        print('| ' + ' | '.join([
+            f"{r['task']} · {r['arm']}", r['dataset'], r['country'], f"{r['n_ok']} / {r['n_refused']} / {r['n_no_gt']}",
+            f"{r['n_pred_empty']}",
+            ', '.join(f'{st} {r[f"n_{st}"]}' for st in SM.REFUSED_STAGES if r.get(f'n_{st}')) or '—',
+            f"{_f(r['iou_mean'])} [{_f(r['iou_lo'])}–{_f(r['iou_hi'])}]", _f(r['dice_mean']),
+            f"{_f(r['precision_mean'])} (n={r['n_precision']})", _f(r['recall_mean']),
+            f"{_f(r['precision_pooled'])} / {_f(r['recall_pooled'])}"]) + ' |')
+    if len(S) > limit:
+        print(f'… ещё {len(S) - limit} строк — в seg_summary.csv')
+
+
+def seg_pass(ds, fn, *args):
+    """Второй проход метрик масок набора ds → (строки, None) или ([], (статус, причина)): 'stopped' — расхождение
+    с маршрутом (SegConsistencyError), 'failed' — любая другая ошибка. Исключений наружу нет: отчёт масок не
+    прерывает оценку моделей и запись истории."""
+    try:
+        return fn(*args), None
+    except SegConsistencyError as e:
+        return [], ('stopped', f'{ds}: {e}')
+    except Exception as e:  # noqa: BLE001 — сбой отчёта масок не должен оставить run.json в статусе running
+        return [], ('failed', f'{ds}: второй проход: {type(e).__name__}: {e}')
+
+
+SEG_FILES = ('seg_per_image.csv', 'seg_summary.csv')
+
+
+def write_seg_metrics(run_dir, records, error=None, error_status='stopped'):
+    """seg_per_image.csv + seg_summary.csv в папку запуска → запись для run.json (None — записей нет).
+    error — причина, по которой файлов быть не должно: error_status 'stopped' — расхождение проходов
+    (SegConsistencyError), 'failed' — другая ошибка второго прохода. Тогда файлы не пишутся (во всём запуске, по
+    всем наборам), причина печатается и попадает в run.json. Ошибка при сводке или записи — то же ('failed'), уже
+    записанные файлы этого запуска удаляются. Исключений наружу нет: остальной отчёт evaluate.py дописывается."""
+    if error is not None:
+        print(f'\n⚠️ {" и ".join(SEG_FILES)} НЕ записаны: {error}')
+        return {'status': error_status, 'why': error}
+    if not records:
+        return None
+    paths = [os.path.join(run_dir, f) for f in SEG_FILES]
+    try:
+        P = SM.records_frame(records)
+        S = SM.summarize(P)
+        for frame, path in zip((P, S), paths):
+            frame.to_csv(path, index=False)
+        print_seg_summary(S)
+    except Exception as e:  # noqa: BLE001 — сбой отчёта масок не должен оставить run.json в статусе running
+        for path in paths:
+            if os.path.exists(path):
+                os.remove(path)
+        why = f'запись метрик масок: {type(e).__name__}: {e}'
+        print(f'\n⚠️ {" и ".join(SEG_FILES)} НЕ записаны: {why}')
+        return {'status': 'failed', 'why': why}
+    return {'status': 'done', 'files': list(SEG_FILES), 'n_rows': len(P), 'iou_tol': IOU_TOL}
+
+
 def print_table(rows):
     head = ['Датасет', 'Метод', 'n', 'MAE, г/л', 'Bland–Altman: смещение [LoA]', 'AUC', 'Чувств., %', 'Спец., %',
             'Чувств. Hb<100, %', 'Свет: ±г/л медиана (p90)', 'IoU', 'Dice', 'Найдено, %']
@@ -923,6 +1127,9 @@ def main():
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
     os.makedirs(res_dir, exist_ok=True)
     rows = []
+    # метрики масок по снимкам (seg_ext, core) → seg_per_image.csv; seg_error = (статус, причина): после первой
+    # ошибки второй проход в следующих наборах не запускается, и файлов нет во всём запуске
+    seg_records, seg_error = [], None
     n_ext = 0 if a.no_external_seg or a.task not in ('core', 'country') else len(EXT.seg_index(a.data))
     seg_note = f' · сегментатор +{n_ext} тел. фото' if n_ext else ''   # строки с/без телефонных фото различимы
     for ds in (['eyes_defy', 'phone'] if a.dataset == 'all' else [a.dataset]):
@@ -952,7 +1159,12 @@ def main():
             if ds != 'eyes_defy':   # телефонные фото с масками проверяются один раз, рядом с Eyes-defy
                 continue
             print(f'[{time.time() - t0:5.0f} с] {ds}: сегментатор ядра без/с телефонными фото, IoU вне обучения...')
-            rows += run_seg_external(a.data, df, a.jobs, cache, timer)
+            r_rows, r_recs, r_err = run_seg_external(a.data, df, a.jobs, cache, timer)
+            rows += r_rows
+            if r_err is not None and seg_error is None:
+                seg_error, seg_records = ('failed', r_err), []
+            elif seg_error is None:
+                seg_records += r_recs
             continue
         if a.task == 'core':
             if not df.mask_conj.notna().all():
@@ -969,6 +1181,13 @@ def main():
             J = core_jobs(a.data, df, a.jobs, segs, cache, timer, nested=True, limits=lims)
             rc = route_counts(J, len(df))
             print(f'{ds}: маршрут анализа фото (тестовые маски): ' + ', '.join(f'{k} {v}' for k, v in rc.items()))
+            if seg_error is None:
+                t_seg = time.perf_counter()
+                recs, seg_error = seg_pass(ds, core_seg_records, a.data, df, segs, lims, J, a.jobs, cache)
+                seg_records = [] if seg_error else seg_records + recs
+                if timer is not None:
+                    timer.add(f'core {ds}: метрики масок по снимкам (повтор маршрута, только предсказание)', [],
+                              time.perf_counter() - t_seg)
             for key in CORE.specs_for(ds):   # у взрослых — модель на каждый набор тканей, одни и те же фолды
                 print(f'[{time.time() - t0:5.0f} с] {key}: ядро HemaVision...')
                 r, O = run_core(df, J, key)
@@ -1023,6 +1242,8 @@ def main():
                          f'oof_{a.tag}_{ds}_{src}_{mk}.csv', run_dir, res_dir, backup_dir)
     if any(r['task'] in ('seg', 'hb', 'seg_ext') for r in rows):
         print_table([r for r in rows if r['task'] in ('seg', 'hb', 'seg_ext')])
+    err_status, err_why = seg_error or ('stopped', None)
+    seg_meta = write_seg_metrics(run_dir, seg_records, err_why, err_status)
     if any(r['task'] == 'core' for r in rows):
         print_core_table([r for r in rows if r['task'] == 'core'])
     if any(r['task'] == 'country' and 'share_low' in r for r in rows):
@@ -1043,7 +1264,7 @@ def main():
         append_history(rows, a.tag, commit, a.history, backup_dir=backup_dir)
         print(f'\nСтрок дописано: {len(rows)} → {a.history} и {os.path.join(res_dir, "metrics_history.csv")}')
     meta.update(status='done', finished=dt.datetime.now().isoformat(timespec='seconds'), total_s=round(total, 2),
-                timings=timer.rows, n_rows=len(rows),
+                timings=timer.rows, n_rows=len(rows), seg_metrics=seg_meta,
                 history=None if a.no_history else [a.history, os.path.join(res_dir, 'metrics_history.csv')])
     RUNS.write_json(os.path.join(run_dir, 'run.json'), meta)
     print(f'Результаты запуска: {run_dir}')
