@@ -5,6 +5,7 @@
 объясняет то, что вернули predict.analyze_photo (Я2) и labs.lab_hb_report (Я3).
 """
 
+from .context import dialog_facts, new_facts_note
 from .engine import answer
 from .facts import build_facts
 from .survey import questions_for, to_survey
@@ -72,8 +73,10 @@ def chat(
     history = []
 
     def reply(question, shown=None):
+        before = dialog_facts(facts, history)
         out = answer(question, facts, history, **kw)
-        say(out["text"])
+        note = new_facts_note(before, out["facts"]) if lang == "ru" else ""
+        say(out["text"] + (f"\n{note}" if note else ""))
         history.append(
             {"role": "user", "text": shown if shown is not None else question}
         )

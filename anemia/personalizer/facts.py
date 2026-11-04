@@ -16,6 +16,7 @@ MODEL_CARD = {
     "specificity_pct": 71,
     "auc": 0.86,
     "patients": 193,
+    "anemic": 86,  # tp + fn той же строки (72 + 14)
     "dataset": "Eyes-defy: взрослые, Италия и Индия, снимки с насадки",
 }
 PHOTO_KEYS = (
@@ -143,6 +144,7 @@ def survey_no(facts, key):
     return ((facts.get("survey") or {}).get(key)) is False
 
 
+MMOL_G_L = 16.11  # 1 ммоль/л Hb (мономер) = 16,11 г/л, как в labs.py
 _NUM = re.compile(r"(?<![\w.,])(\d{1,3})(?:[.,](\d))?(?!\d|[.,]\d)")
 _HB_WORD = re.compile(
     r"гемогл|гемаглоб|\bhb\b|\bhgb\b|\bнв\b|гемоглобин", re.IGNORECASE
@@ -178,13 +180,15 @@ def _last(rx, text):
 
 
 def hb_from_question(question, facts):
-    """Число Hb из вопроса (если анализа в карточке нет): (г/л, был ли это г/дл) или None.
-    3–25 → г/дл (×10), 30–250 → г/л; возраст, недели, проценты и числа других показателей
-    («ферритин 8», «MCV 75», «давление 120») игнорируются."""
+    """Число Hb из вопроса (если анализа в карточке нет): (г/л, единица в вопросе) или None.
+    Единица: «г/л»; «г/дл» — число 3–25 (×10); «ммоль/л» — если так написано (×16,11, как labs.py).
+    Возраст, недели, проценты и числа других показателей («ферритин 8», «MCV 75», «давление 120»)
+    игнорируются."""
     for m in _NUM.finditer(question or ""):
         whole, dec = int(m.group(1)), m.group(2)
         tail = question[m.end() : m.end() + 12].lower().lstrip(" ,.")
-        if tail.startswith(_OTHER_UNIT):
+        mmol = tail.startswith(("ммоль", "mmol"))
+        if tail.startswith(_OTHER_UNIT) and not mmol:
             continue
         head = question[max(0, m.start() - 30) : m.start()]
         if _last(_OTHER_WORD, head) > _last(
@@ -192,10 +196,12 @@ def hb_from_question(question, facts):
         ):  # «ферритин 8», «MCV 75» — не гемоглобин
             continue
         v = whole + (int(dec) / 10 if dec else 0)
+        if mmol and 2 <= v < 16:
+            return round(v * MMOL_G_L), "ммоль/л"
         if 3 <= v < 25:
-            return round(v * 10), True
+            return round(v * 10), "г/дл"
         if 30 <= v <= 250 and not dec:
-            return round(v), False
+            return round(v), "г/л"
     return None
 
 

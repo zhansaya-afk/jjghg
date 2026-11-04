@@ -136,3 +136,20 @@ def test_ya5_cell_without_ya3_says_what_to_run(what, capsys):
         {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"},
     )
     assert "Я3" in capsys.readouterr().out
+
+
+def test_chat_remembers_said_facts_until_the_end():
+    out, said = run(
+        ["", "", "", "", "", "Я вегетарианка", "Какие анализы сдать?", ""],
+        PHOTO,
+        None,
+        WOMAN,
+    )
+    note = [s for s in said if s.startswith("Железо есть")]
+    assert (
+        note and "Учту до конца этого разговора: вы не едите мясо или рыбу." in note[0]
+    )
+    assert (
+        "B12" in said[-2]
+    )  # анализы с учётом сказанного; карточка разговора не меняется
+    assert out["facts"]["survey"].get("meat_fish") is None

@@ -8,6 +8,7 @@ import re
 
 from ..personalizer_eval import violations
 from . import texts as T
+from .context import asks_dose, context_query, dialog_facts, is_follow_up
 from .facts import build_facts, hb_from_question, photo_ok
 from .retrieve import SLOT, default_retriever, load_kb
 from .router import lang_of, needs_retake, route
@@ -49,6 +50,10 @@ NOT_ABOUT_NUMBER = {
     "serious",
     "next_steps",
 }
+# «Я беременна, опасна ли анемия для малыша?»: общий ответ про опасность без беременности — мимо
+PREGNANT_Q = re.compile(r"беремен|жду\s+(?:реб[её]нка|малыша)", re.IGNORECASE)
+GENERAL_FOR_PREGNANCY = {"serious", "what_is_anemia"}
+AGE_Q = re.compile(r"\bмне\s+\d{1,3}\s*(?:лет|год)", re.IGNORECASE)
 SAFE_FALLBACK = (
     "Не могу ответить на это надёжно. Это скрининг, не диагноз: покажите результат врачу-терапевту, он подскажет, "
     "какие анализы нужны."
@@ -83,15 +88,24 @@ def _kk(mode, why, question, facts):
     return "answer", T.kk_explain(facts, question)
 
 
-def rules_answer(question, facts, history=None, retriever=None):
-    """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang'}."""
+def rules_answer(question, facts, history=None, retriever=None, force=None):
+    """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang', 'why'}.
+    force=(режим, причина) — маршрут уже решён снаружи (например, «А сколько?» после вопроса о железе)."""
     q = (question or "").strip()
     lang = lang_of(q)
     mode, why = route(q, facts, history)
+    if force and mode != "urgent":
+        mode, why = force
     sources = []
     if lang == "kk":
         mode, text = _kk(mode, why, q, facts)
-        return {"text": tidy(text), "mode": mode, "sources": sources, "lang": lang}
+        return {
+            "text": tidy(text),
+            "mode": mode,
+            "sources": sources,
+            "lang": lang,
+            "why": why,
+        }
     if mode == "urgent":
         text = T.urgent(facts, why)
     elif mode == "child":
@@ -123,9 +137,23 @@ def rules_answer(question, facts, history=None, retriever=None):
         else:
             hits = (retriever or default_retriever("ru")).search(q, k=1)
             fr = hits[0][0] if hits and hits[0][1] >= THRESHOLD else None
+            if (
+                fr is not None
+                and fr.id in GENERAL_FOR_PREGNANCY
+                and PREGNANT_Q.search(q)
+            ):
+                fr = _fragment("pregnancy")
         if hb_from_question(q, facts) and (fr is None or fr.id in NOT_ABOUT_NUMBER):
             # «у меня 9,2», «гемоглобин 160 это много?»: отвечать про число; есть фото → сравнить с ним
             fr = _fragment("photo_vs_lab" if photo_ok(facts) else LAB)
+        if fr is not None and fr.id == LAB and facts.get("photo") and facts.get("lab"):
+            fr = _fragment(
+                "photo_vs_lab"
+            )  # есть и фото, и анализ: объяснить анализ рядом с фото
+        if fr is None and AGE_Q.search(q):
+            fr = _fragment(
+                "age_scope"
+            )  # «Мне 16 лет, это считается?» — подходит ли проверка по возрасту
         if fr is None and q and ABOUT_PHOTO.search(q) and not needs_retake(q, facts):
             fr = _fragment(
                 EXPLAIN
@@ -149,14 +177,45 @@ def rules_answer(question, facts, history=None, retriever=None):
         if retake and mode != "retake":
             # общий вопрос при непригодном снимке: ответ + напоминание переснять
             text = text + " " + T.RETAKE_NOTE
-    return {"text": tidy(text), "mode": mode, "sources": sources, "lang": lang}
+    return {
+        "text": tidy(text),
+        "mode": mode,
+        "sources": sources,
+        "lang": lang,
+        "why": why,
+    }
 
 
 def answer(question, facts, history=None, *, engine="rules", llm=None, retriever=None):
     """Ответ на вопрос по карточке фактов. engine='llm' + llm=callable(messages)→str: модель только
-    переформулирует ответ режима rules; при любом нарушении стража остаётся ответ режима rules."""
-    base = rules_answer(question, facts, history, retriever)
-    out = dict(base, engine="rules", guard={})
+    переформулирует ответ режима rules; при любом нарушении стража остаётся ответ режима rules.
+
+    Память разговора (только history этого запуска): уточнение «А для мужчин?» ищется вместе с прошлым
+    вопросом (out['context']); сказанное о себе («я вегетарианка») меняет советы (out['facts'])."""
+    q = (question or "").strip()
+    facts = dialog_facts(facts, history, q)
+    cq = context_query(q, history)
+    force = ("answer", "dose") if asks_dose(q, cq) else None
+    base = rules_answer(cq, facts, history, retriever, force)
+    lost = base["why"] is None and base["mode"] in ("out_of_scope", "dont_know")
+    if cq == q and lost:
+        wq = context_query(
+            q, history, weak=True
+        )  # «А ферритин?» сам не нашёлся → как уточнение
+        if wq != q:
+            alt = rules_answer(wq, facts, history, retriever)
+            if alt["mode"] not in ("out_of_scope", "dont_know"):
+                base, cq = alt, wq
+            elif (
+                is_follow_up(q) and base["lang"] == "ru"
+            ):  # «А для мужчин?» без прошлого вопроса
+                base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
+        elif is_follow_up(q) and base["lang"] == "ru":
+            base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
+    question = cq
+    out = dict(
+        base, engine="rules", guard={}, context=cq if cq != q else None, facts=facts
+    )
     if (
         engine == "llm"
         and llm is not None
@@ -198,5 +257,4 @@ def personalize(
     result=None, lab=None, profile=None, survey=None, question=None, history=None, **kw
 ):
     """Результат ядра (api.Result / analyze_photo) и/или анализ крови → ответ персонализатора."""
-    facts = build_facts(result, lab, profile, survey)
-    return dict(answer(question, facts, history, **kw), facts=facts)
+    return answer(question, build_facts(result, lab, profile, survey), history, **kw)

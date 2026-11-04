@@ -242,6 +242,11 @@ def _question_numbers(q):
             out.add(int(m.group(1)) * 10 + int(m.group(2)))
         elif 3 <= int(m.group(1)) < 25:  # «у меня 9» (г/дл) → 90 г/л
             out.add(int(m.group(1)) * 10)
+    if re.search(
+        r"ммоль|mmol", q or "", re.IGNORECASE
+    ):  # 6,2 ммоль/л → 100 г/л (×16,11, как labs.py)
+        for m in re.finditer(r"(\d{1,2})(?:[.,](\d))?", q):
+            out.add(round((int(m.group(1)) + int(m.group(2) or 0) / 10) * 16.11))
     return out
 
 

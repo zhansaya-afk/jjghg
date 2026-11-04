@@ -109,10 +109,12 @@ def test_out_of_scope():
 @pytest.mark.parametrize(
     "q,want",
     [
-        ("У меня 115, это нормально?", (115, False)),
-        ("гемоглабин 9,5 это норм?", (95, True)),
-        ("Мне 25 лет, гемоглобин 118", (118, False)),
-        ("Ферритин 8, гемоглобин 125", (125, False)),
+        ("У меня 115, это нормально?", (115, "г/л")),
+        ("гемоглабин 9,5 это норм?", (95, "г/дл")),
+        ("У меня гемоглобин 6,2 ммоль/л", (100, "ммоль/л")),
+        ("рост 160 мм", None),
+        ("Мне 25 лет, гемоглобин 118", (118, "г/л")),
+        ("Ферритин 8, гемоглобин 125", (125, "г/л")),
         ("Сдала анализ, ферритин 8", None),
         ("B12 200", None),
         ("давление 120 на 80", None),
@@ -204,6 +206,10 @@ def test_every_kb_fragment_is_well_formed():
     for fr in kb:
         assert fr.examples, fr.id
         assert set(SLOT.findall(fr.body)) <= set(T.SLOTS), fr.id
+        # {doctor} — дательный падеж («покажите врачу-терапевту»): «с {doctor}», «принимает {doctor}» — ошибка
+        assert not re.search(
+            r"(?:\bс|принимает|назначает|решает|определяет)\s+\{doctor\}", fr.body
+        ), fr.id
 
 
 def test_kb_examples_do_not_copy_holdout_questions():
