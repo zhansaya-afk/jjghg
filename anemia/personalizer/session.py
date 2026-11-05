@@ -8,6 +8,8 @@
 from .context import dialog_facts, new_facts_note
 from .engine import answer
 from .facts import build_facts
+from .kbtools import explain
+from .retrieve import default_retriever, load_kb
 from .survey import questions_for, to_survey
 
 YES = {"да", "д", "ага", "есть", "бывает", "yes", "y", "иә", "ия", "иа", "+", "1"}
@@ -59,9 +61,11 @@ def chat(
     survey=True,
     lang="ru",
     max_turns=30,
+    debug=False,
     **kw,
 ):
-    """Полный разговор. → {'facts', 'survey', 'history'}. kw уходят в engine.answer (engine='llm', llm=...)."""
+    """Полный разговор. → {'facts', 'survey', 'history'}. kw уходят в engine.answer (engine='llm', llm=...).
+    debug=True — под каждым ответом строка «🔎 как найден ответ» (тема, сходство, правило)."""
     # input / print берутся в момент вызова, а не при определении функции (их подменяют тесты)
     ask = ask or (lambda prompt: input(prompt))
     say = say or (lambda text: print(text))
@@ -77,6 +81,8 @@ def chat(
         out = answer(question, facts, history, **kw)
         note = new_facts_note(before, out["facts"]) if lang == "ru" else ""
         say(out["text"] + (f"\n{note}" if note else ""))
+        if debug:
+            say(explain(out))
         history.append(
             {"role": "user", "text": shown if shown is not None else question}
         )
@@ -123,11 +129,13 @@ def chat(
 
 
 def from_notebook(
-    ns, what="Фото (Я2)", survey=True, lang="ru", ask=None, say=None, **kw
+    ns, what="Фото (Я2)", survey=True, lang="ru", ask=None, say=None, debug=False, **kw
 ):
     """Ячейка Я5: берёт результат Я2 (r, Пол, Возраст, Беременность) и/или Я3 (lab, Пол_анализ, …) из
     переменных блокнота ns. Если профили Я2 и Я3 различаются — не смешивает их, а просит исправить."""
     say = say or (lambda text: print(text))
+    load_kb.cache_clear()  # правки kb/ru.md в этом сеансе Colab вступают в силу без перезапуска
+    default_retriever.cache_clear()
     use_photo, use_lab = "Фото" in what, "нализ" in what
     photo = ns.get("r") if use_photo else None
     blood = ns.get("lab") if use_lab else None
@@ -155,5 +163,6 @@ def from_notebook(
         say=say,
         survey=survey,
         lang=lang,
+        debug=debug,
         **kw,
     )

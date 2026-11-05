@@ -89,22 +89,31 @@ def _kk(mode, why, question, facts):
 
 
 def rules_answer(question, facts, history=None, retriever=None, force=None):
-    """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang', 'why'}.
-    force=(режим, причина) — маршрут уже решён снаружи (например, «А сколько?» после вопроса о железе)."""
+    """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang', 'why', 'trace'}.
+    force=(режим, причина) — маршрут уже решён снаружи (например, «А сколько?» после вопроса о железе).
+    trace — как найден ответ: правило маршрутизатора или лучшие темы поиска со сходством (для Я5 и Я6)."""
     q = (question or "").strip()
     lang = lang_of(q)
     mode, why = route(q, facts, history)
     if force and mode != "urgent":
         mode, why = force
     sources = []
+    trace = {
+        "rule": (why or mode) if (mode or why) else None,
+        "search": [],
+        "notes": [],
+    }
+    note = trace["notes"].append
     if lang == "kk":
         mode, text = _kk(mode, why, q, facts)
+        note("казахский: готовый шаблон")
         return {
             "text": tidy(text),
             "mode": mode,
             "sources": sources,
             "lang": lang,
             "why": why,
+            "trace": trace,
         }
     if mode == "urgent":
         text = T.urgent(facts, why)
@@ -134,8 +143,10 @@ def rules_answer(question, facts, history=None, retriever=None, force=None):
         mode = "answer"
         if not q:
             fr = _fragment(EXPLAIN)
+            note("пустой вопрос: объяснение результата")
         else:
-            hits = (retriever or default_retriever("ru")).search(q, k=1)
+            hits = (retriever or default_retriever("ru")).search(q, k=3)
+            trace["search"] = [(h.id, round(sc, 2)) for h, sc in hits]
             fr = hits[0][0] if hits and hits[0][1] >= THRESHOLD else None
             if (
                 fr is not None
@@ -143,24 +154,27 @@ def rules_answer(question, facts, history=None, retriever=None, force=None):
                 and PREGNANT_Q.search(q)
             ):
                 fr = _fragment("pregnancy")
+                note("в вопросе беременность: тема pregnancy вместо общей")
         if hb_from_question(q, facts) and (fr is None or fr.id in NOT_ABOUT_NUMBER):
             # «у меня 9,2», «гемоглобин 160 это много?»: отвечать про число; есть фото → сравнить с ним
             fr = _fragment("photo_vs_lab" if photo_ok(facts) else LAB)
+            note(f"в вопросе число Hb: тема {fr.id}")
         if fr is not None and fr.id == LAB and facts.get("photo") and facts.get("lab"):
-            fr = _fragment(
-                "photo_vs_lab"
-            )  # есть и фото, и анализ: объяснить анализ рядом с фото
+            # есть и фото, и анализ: объяснить анализ рядом с фото
+            fr = _fragment("photo_vs_lab")
+            note("есть и фото, и анализ: тема photo_vs_lab")
         if fr is None and AGE_Q.search(q):
-            fr = _fragment(
-                "age_scope"
-            )  # «Мне 16 лет, это считается?» — подходит ли проверка по возрасту
+            # «Мне 16 лет, это считается?» — подходит ли проверка по возрасту
+            fr = _fragment("age_scope")
+            note("в вопросе возраст: тема age_scope")
         if fr is None and q and ABOUT_PHOTO.search(q) and not needs_retake(q, facts):
-            fr = _fragment(
-                EXPLAIN
-            )  # вопрос про «мой риск / результат», не нашёлся дословно → объяснить результат
+            # вопрос про «мой риск / результат», не нашёлся дословно → объяснить результат
+            fr = _fragment(EXPLAIN)
+            note("вопрос про результат: тема explain_result")
         retake = needs_retake(q, facts)
         if retake and (fr.id in ABOUT_RESULT if fr else ABOUT_PHOTO.search(q)):
             mode, text = "retake", T.retake(facts)
+            note("снимок непригоден: «переснимите»")
         elif fr is None:
             mode, text = "dont_know", T.DONT_KNOW
         else:
@@ -174,6 +188,7 @@ def rules_answer(question, facts, history=None, retriever=None, force=None):
             ):
                 # фрагмент — почти одни факты, а их нет (например, анализа нет) → общее объяснение
                 text, sources = fill(_fragment(EXPLAIN).body, facts, q), [EXPLAIN]
+                note(f"для темы {fr.id} нет данных: общее объяснение результата")
         if retake and mode != "retake":
             # общий вопрос при непригодном снимке: ответ + напоминание переснять
             text = text + " " + T.RETAKE_NOTE
@@ -183,6 +198,7 @@ def rules_answer(question, facts, history=None, retriever=None, force=None):
         "sources": sources,
         "lang": lang,
         "why": why,
+        "trace": trace,
     }
 
 
@@ -198,20 +214,26 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
     force = ("answer", "dose") if asks_dose(q, cq) else None
     base = rules_answer(cq, facts, history, retriever, force)
     lost = base["why"] is None and base["mode"] in ("out_of_scope", "dont_know")
+    clarify = False
     if cq == q and lost:
-        wq = context_query(
-            q, history, weak=True
-        )  # «А ферритин?» сам не нашёлся → как уточнение
-        if wq != q:
-            alt = rules_answer(wq, facts, history, retriever)
-            if alt["mode"] not in ("out_of_scope", "dont_know"):
-                base, cq = alt, wq
-            elif (
-                is_follow_up(q) and base["lang"] == "ru"
-            ):  # «А для мужчин?» без прошлого вопроса
-                base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
+        # «А ферритин?» сам не нашёлся → как уточнение прошлого вопроса
+        wq = context_query(q, history, weak=True)
+        alt = rules_answer(wq, facts, history, retriever) if wq != q else None
+        if alt and alt["mode"] not in ("out_of_scope", "dont_know"):
+            base, cq = alt, wq
         elif is_follow_up(q) and base["lang"] == "ru":
-            base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
+            clarify = True  # «А для мужчин?» без прошлого вопроса
+    if clarify:
+        base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
+        base["trace"] = dict(
+            base["trace"],
+            notes=[*base["trace"]["notes"], "уточнение без прошлого вопроса"],
+        )
+    if force:
+        base["trace"] = dict(
+            base["trace"],
+            notes=[*base["trace"]["notes"], "«сколько» после вопроса о лекарстве"],
+        )
     question = cq
     out = dict(
         base, engine="rules", guard={}, context=cq if cq != q else None, facts=facts

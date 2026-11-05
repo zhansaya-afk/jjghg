@@ -104,17 +104,21 @@ def test_from_notebook_refuses_mixed_profiles():
     assert from_notebook({}, "Фото (Я2)", say=said.append) is None and "Я2" in said[0]
 
 
-def _ya5_source():
+def _cell(title):
     nb = json.loads(NB.read_text(encoding="utf-8"))
-    cells = [
+    code = [c for c in nb["cells"] if c["cell_type"] == "code"]
+    cells = [c for c in code if title in "".join(c["source"])]
+    # Я5 и Я6 — последние ячейки блокнота, остальные не тронуты
+    assert len(cells) == 1 and [code[-2], code[-1]] == [
         c
-        for c in nb["cells"]
-        if c["cell_type"] == "code" and "Ячейка Я5" in "".join(c["source"])
+        for c in code
+        if "Ячейка Я5" in "".join(c["source"]) or "Ячейка Я6" in "".join(c["source"])
     ]
-    assert (
-        len(cells) == 1 and nb["cells"][-1] is cells[0]
-    )  # Я5 — последняя ячейка, остальные не тронуты
     return "".join(cells[0]["source"])
+
+
+def _ya5_source():
+    return _cell("Ячейка Я5")
 
 
 def test_ya5_cell_runs_on_ya2_variables(monkeypatch, capsys):
@@ -153,3 +157,29 @@ def test_chat_remembers_said_facts_until_the_end():
         "B12" in said[-2]
     )  # анализы с учётом сказанного; карточка разговора не меняется
     assert out["facts"]["survey"].get("meat_fish") is None
+
+
+def test_ya5_cell_shows_how_answer_was_found(monkeypatch, capsys):
+    answers = iter(["Пью чай после обеда, это плохо?", ""])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers, ""))
+    src = (
+        _ya5_source()
+        .replace("Опрос = True", "Опрос = False")
+        .replace(
+            "Показывать_как_найден_ответ = False", "Показывать_как_найден_ответ = True"
+        )
+    )
+    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
+    out = capsys.readouterr().out
+    assert "🔎 поиск: тема" in out and "порога 0,40" in out
+
+
+def test_ya6_cell_checks_the_knowledge_base(capsys):
+    src = _cell("Ячейка Я6").replace(
+        "Мои_вопросы = ''", "Мои_вопросы = 'можно ли кофе | сколько таблеток пить'"
+    )
+    exec(compile(src, "Я6", "exec"), {})  # noqa: S102 — код ячейки блокнота
+    out = capsys.readouterr().out
+    assert "Итог: ✅ ошибок нет" in out and "экзамен dev: пройдено 58/58" in out
+    assert "тема tea" in out and "правило: доза" in out
