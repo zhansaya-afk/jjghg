@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "ruff>=0.6"]
 data = ["kagglehub>=0.2"]
+app = ["gradio>=6,<7"]       # app/collect.py: сбор своих фото
 
 [tool.setuptools]
 packages = ["anemia"]
