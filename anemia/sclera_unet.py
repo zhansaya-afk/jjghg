@@ -224,16 +224,160 @@ def _closeup_frame(rgb):
     return R._prepare(resize_max(rgb, DETECT_SIDE))
 
 
-def shadow(r, rgb, model, post="clean+grow"):
+# ---- Шаг 1 диагностики (2026-11-05): анатомические ограничения и TTA, только теневой режим, по умолчанию ВЫКЛ ----
+# Причина: сеть обучена на синтетике без вывернутого века; на телефонных фото (mdraselsarker, 83 шт., 2026-11-05) в среднем
+# 30% маски — внутри конъюнктивы разметки (косвенный показатель, segmentation_audit/2026-11-05_sclera_unet_diag).
+# Ограничения ничего не обучают и не имеют подбираемых порогов: вычитаются конъюнктива (маска pipeline r['conj']),
+# всё ниже её верхнего края (внутренняя сторона века) и диск радужки.
+
+
+def _views(h, w, hflip=True, landscape=True):
+    """[(имя, прямое, обратное)] для TTA. Обратное переводит карту, посчитанную на преобразованном кадре,
+    в координаты исходного. landscape: портретный кадр поворачивается на 90° против часовой (np.rot90)."""
+    v = [("id", lambda a: a, lambda a: a)]
+    if hflip:
+        v.append(("hflip", lambda a: a[:, ::-1], lambda a: a[:, ::-1]))
+    if landscape and h > w:
+        v.append(("rot90", lambda a: np.rot90(a, 1), lambda a: np.rot90(a, -1)))
+        if hflip:
+            v.append(
+                (
+                    "rot90+hflip",
+                    lambda a: np.rot90(a, 1)[:, ::-1],
+                    lambda a: np.rot90(a[:, ::-1], -1),
+                )
+            )
+    return v
+
+
+def check_views(h, w, hflip=True, landscape=True):
+    """Проверка обратного преобразования на сетке индексов: inv(fwd(I)) == I попиксельно для каждого вида.
+    → список видов, прошедших проверку (непрошедшие в усреднение не идут)."""
+    idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
+    ok = []
+    for name, fwd, inv in _views(h, w, hflip, landscape):
+        back = inv(fwd(idx))
+        if back.shape == idx.shape and np.array_equal(back, idx):
+            ok.append(name)
+    return ok
+
+
+def prob_full(model, x):
+    """Вероятность сети, растянутая до размера x (линейно)."""
+    p = model.prob_small(np.ascontiguousarray(x, np.float32))
+    return cv2.resize(
+        p.astype(np.float32), (x.shape[1], x.shape[0]), interpolation=cv2.INTER_LINEAR
+    )
+
+
+def prob_tta(model, x, hflip=True, landscape=True):
+    """Среднее вероятностей видов TTA на сетке prob_small исходного кадра. → (карта, имена видов).
+    prob_small сжимает весь кадр в фиксированный размер, поэтому отражение и поворот коммутируют с ним:
+    карта каждого вида после обратного преобразования лежит на той же сетке, что и у вида id. Вид идёт в
+    среднее, только если его обратное преобразование прошло check_views на этой сетке."""
+    h, w = x.shape[:2]
+    p0 = model.prob_small(np.ascontiguousarray(x, np.float32))
+    sh, sw = p0.shape
+    good = set(
+        check_views(sh, sw, hflip, landscape)
+    )  # та же ориентация, что у x: те же виды
+    used, acc = [], np.zeros((sh, sw), np.float32)
+    for name, fwd, inv in _views(h, w, hflip, landscape):
+        if name not in good:
+            continue
+        p = (
+            p0
+            if name == "id"
+            else model.prob_small(np.ascontiguousarray(fwd(x), np.float32))
+        )
+        p = np.ascontiguousarray(inv(p))
+        if p.shape != (sh, sw):
+            continue
+        acc += p
+        used.append(name)
+    return acc / max(len(used), 1), used
+
+
+def predict_tta(model, x, post="clean+grow", hflip=True, landscape=True):
+    """Как ScleraModel.predict (тот же порог на сетке сети и тот же _up), но по средней вероятности видов TTA.
+    С одним видом id совпадает с predict попиксельно."""
+    p, used = prob_tta(model, x, hflip, landscape)
+    m = _up(p > model.cfg["thr"], x.shape)
+    if post in ("clean", "clean+grow"):
+        m = clean(x, m)
+    if post == "clean+grow":
+        m = clean(x, grow(x, m))
+    return m, used
+
+
+def _lid_one(comp, out):
+    cols = np.flatnonzero(comp.any(0))
+    top = np.argmax(comp[:, cols], 0).astype(np.float32)
+    xs = np.arange(cols[0], cols[-1] + 1)
+    t = np.interp(xs, cols, top)
+    out[:, xs] |= np.arange(comp.shape[0])[:, None] >= np.ceil(t)[None, :]
+
+
+def lid_region(conj):
+    """Внутренняя сторона нижнего века: в каждом столбце от верхнего края конъюнктивы вниз. Край считается
+    отдельно для каждой связной части, в пределах её столбцов (без интерполяции через промежутки между частями).
+    Допущение: кадр стоит вертикально (EXIF учтён), конъюнктива — нижнее веко."""
+    if conj is None:
+        raise ValueError("lid_region: нужна маска конъюнктивы")
+    out = np.zeros(conj.shape, bool)
+    n, lab = cv2.connectedComponents(conj.astype(np.uint8), connectivity=8)
+    for k in range(1, n):
+        _lid_one(lab == k, out)
+    return out
+
+
+def iris_disk(shape, iris):
+    out = np.zeros(shape, bool)
+    if iris is None:
+        return out
+    cx, cy, rr = iris
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+    return (xx - cx) ** 2 + (yy - cy) ** 2 < rr**2
+
+
+def anatomy_exclusion(shape, conj=None, iris=None):
+    """Где склеры быть не может: конъюнктива ∪ ниже её верхнего края ∪ диск радужки. → (bool, части).
+    Область ниже края исключается, только если конъюнктива ниже центра радужки (иначе кадр повёрнут или это не нижнее веко)."""
+    has = conj is not None and conj.any()
+    below = has and (
+        iris is None or np.nonzero(conj)[0].mean() > iris[1]
+    )  # веко ниже центра радужки
+    parts = {
+        "conj": conj.astype(bool) if conj is not None else np.zeros(shape, bool),
+        "lid": lid_region(conj) if below else np.zeros(shape, bool),
+        "iris": iris_disk(shape, iris),
+    }
+    return parts["conj"] | parts["lid"] | parts["iris"], parts
+
+
+def constrain(mask, conj=None, iris=None):
+    """Маска U-Net без областей, где склеры быть не может (anatomy_exclusion). Ничего не добавляет."""
+    ex, _ = anatomy_exclusion(mask.shape, conj, iris)
+    return mask & ~ex
+
+
+def shadow(r, rgb, model, post="clean+grow", limits=False, tta=False):
     """r — результат analyze_photo, rgb — то же фото (predict.load_photo). → dict или None (вырезки нет).
-    mask — bool размера r['crop']; route; validated; frac; agree_iou с r['sclera'] (find_sclera); note."""
+    mask — bool размера r['crop']; route; validated; frac; agree_iou с r['sclera'] (find_sclera); note.
+    limits=True — вычесть конъюнктиву r['conj'], всё ниже её верхнего края и радужку (find_iris на вырезке);
+    tta=True — среднее по hflip и (для портрета) повороту в альбом. Оба по умолчанию выключены: поведение
+    как в PR #22."""
     crop = r.get("crop")
     if crop is None:
         return None
     frame = _closeup_frame(rgb)
     closeup = frame.shape == crop.shape and float(np.abs(frame - crop).max()) < 1e-5
+    views = ["id"]
     if closeup:
-        full = model.predict(rgb, post=post)
+        if tta:
+            full, views = predict_tta(model, rgb, post=post)
+        else:
+            full = model.predict(rgb, post=post)
         mask = (
             cv2.resize(
                 full.astype(np.uint8),
@@ -244,8 +388,24 @@ def shadow(r, rgb, model, post="clean+grow"):
         )
         route, validated = "крупный план: U-Net на полном фото", True
     else:
-        mask = model.predict(np.asarray(crop, np.float32), post=post)
+        x = np.asarray(crop, np.float32)
+        if tta:
+            mask, views = predict_tta(model, x, post=post)
+        else:
+            mask = model.predict(x, post=post)
         route, validated = "вырезка (лицо / приближение): U-Net на r['crop']", False
+    removed, iris, limits_note = None, None, None
+    if limits:
+        from anemia import regions as R
+
+        conj = r.get("conj") if "conj" in (r.get("tissues") or []) else None
+        if conj is None:
+            limits_note = "ограничение по конъюнктиве не применено: конъюнктива не прошла проверку pipeline"
+        # параметры find_iris по умолчанию (крупный план); на маршрутах лицо/приближение не проверено
+        iris = R.find_iris(np.asarray(crop, np.float32))
+        _, parts = anatomy_exclusion(mask.shape, conj, iris)
+        removed = {k: int((mask & v).sum()) for k, v in parts.items()}
+        mask = mask & ~(parts["conj"] | parts["lid"] | parts["iris"])
     ref = r.get("sclera")
     agree = None
     if ref is not None and (mask | ref).any():
@@ -262,6 +422,11 @@ def shadow(r, rgb, model, post="clean+grow"):
         "agree_iou": agree,
         "post": post,
         "note": note,
+        "limits": limits,
+        "removed_px": removed,
+        "limits_note": limits_note,
+        "iris": iris,
+        "tta_views": views,
     }
 
 
