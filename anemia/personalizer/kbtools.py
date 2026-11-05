@@ -1,8 +1,9 @@
 """Инструменты для тех, кто дополняет базу знаний (kb/ru.md) без программирования.
 
 explain(out) — «как найден ответ» одной-двумя строками (галочка в Я5).
-check_kb()  — ячейка Я6 и scripts/check_kb.py: формат файла, запреты в текстах, копии отложенных вопросов
-              экзамена, экзамен целиком и «какую тему находит мой вопрос». Инструкция — kb/README.md.
+check_kb()  — ячейка Я6 и scripts/check_kb.py: формат файла, запреты в текстах, копии проверочных вопросов
+              (экзамен и замер поиска), экзамен целиком, замер поиска на A и «какую тему находит мой вопрос».
+              Инструкция — kb/README.md.
 """
 
 import re
@@ -27,6 +28,7 @@ RULES = {
     "drug": "выбор препарата → препараты не называем",
     "diagnosis": "просьба поставить диагноз",
     "language": "не русский и не казахский язык",
+    "other_analyte": "вопрос о другом анализе (сахар, холестерин…) → «не моя тема»",
     "out_of_scope": "в вопросе нет слов про анемию, анализы, питание или самочувствие → «не моя тема»",
 }
 # карточки фактов, на которых проверяется каждый текст базы (подставляются в {слоты})
@@ -159,7 +161,8 @@ def text_problems(fragments):
 
 
 def example_problems(fragments, holdout_questions, dev_questions=()):
-    """Формулировки q:, которые совпадают с отложенными вопросами экзамена (ошибка) или повторяются (предупреждение).
+    """Формулировки q:, которые совпадают с проверочными вопросами — отложенными экзамена и замера поиска
+    (ошибка) — или повторяются (предупреждение).
     Дословные вопросы dev разрешены: dev — для разработки (как в tests/test_personalizer.py)."""
 
     def norm(s):
@@ -190,7 +193,7 @@ def example_problems(fragments, holdout_questions, dev_questions=()):
                 errors.append(
                     (
                         fr.id,
-                        f"«{e}» почти совпадает с отложенным вопросом экзамена — уберите, иначе экзамен нечестный",
+                        f"«{e}» почти совпадает с проверочным вопросом (экзамен или замер поиска) — уберите, иначе проверка нечестная",
                     )
                 )
     return errors, warnings
@@ -198,7 +201,13 @@ def example_problems(fragments, holdout_questions, dev_questions=()):
 
 def check_kb(path=None, questions="", exam=True, say=print):
     """Проверка базы знаний. → True, если ошибок нет. Экзамен и «мои вопросы» — по рабочему файлу kb/ru.md."""
-    from ..personalizer_eval import load_cases, run, summary
+    from ..personalizer_eval import (
+        load_cases,
+        load_search_questions,
+        run,
+        search_score,
+        summary,
+    )
 
     path = Path(path) if path else KB_FILE
     live = path.resolve() == KB_FILE.resolve()
@@ -229,9 +238,11 @@ def check_kb(path=None, questions="", exam=True, say=print):
         )
 
     cases = load_cases()
+    search_qs = load_search_questions()
     err, warn = example_problems(
         fragments,
-        [c["question"] for c in cases if c["split"] == "holdout"],
+        [c["question"] for c in cases if c["split"] == "holdout"]
+        + [x["q"] for x in search_qs],
         [c["question"] for c in cases if c["split"] == "dev"],
     )
     for fid, msg in err:
@@ -240,7 +251,7 @@ def check_kb(path=None, questions="", exam=True, say=print):
         say(f"⚠️ формулировка в теме {fid}: {msg}")
     errors += len(err)
     if not err:
-        say("✅ формулировки не копируют отложенные вопросы экзамена")
+        say("✅ формулировки не копируют проверочные вопросы")
 
     if exam and live and not fmt:
         for split in ("dev", "holdout"):
@@ -261,6 +272,14 @@ def check_kb(path=None, questions="", exam=True, say=print):
                 for r in rows:
                     if not r["passed"]:
                         say(f"   ✗ {r['id']}: «{by_id[r['id']]['question']}»")
+        # только A: отложенный B смотрит разработчик перед слиянием, иначе правки базы подгоняются и под B
+        name, photo, lab, profile = DEMO
+        a = [x for x in search_qs if x["split"] == "A"]
+        r = search_score(answer, a, build_facts(photo, lab, profile))
+        say(
+            f"ℹ️ поиск, проверочные вопросы A: верная тема {r['ok']}/{r['n']} = {100 * r['ok'] / r['n']:.0f}%, "
+            f"не та тема {r['wrong']}, «не знаю» {r['idk']}"
+        )
     elif exam and not live:
         say("ℹ️ экзамен не запускался: он работает только с рабочим файлом kb/ru.md")
 

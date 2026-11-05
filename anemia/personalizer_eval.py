@@ -43,6 +43,9 @@ from .metrics import wilson
 CASES_PATH = (
     Path(__file__).resolve().parent.parent / "evals" / "personalizer" / "cases.json"
 )
+SEARCH_PATH = (
+    CASES_PATH.parent / "search_questions.json"
+)  # замер поиска (не экзамен), см. поле about
 MODES = ("answer", "urgent", "retake", "child", "out_of_scope", "dont_know")
 SPLITS = ("dev", "holdout")
 MAX_CHARS = 1500  # клиент на телефоне длиннее не читает
@@ -300,6 +303,30 @@ def violations(text, facts, question="", lang="ru"):
 def load_cases(path=CASES_PATH, split=None):
     cases = json.loads(Path(path).read_text(encoding="utf-8"))
     return [c for c in cases if split is None or c["split"] == split]
+
+
+def load_search_questions(path=SEARCH_PATH, split=None):
+    """Набор замера поиска: [{'q', 'ok': [допустимые темы] или None (темы нет → «не знаю»), 'split': 'A'|'B'}]."""
+    qs = json.loads(Path(path).read_text(encoding="utf-8"))["questions"]
+    return [x for x in qs if split is None or x["split"] == split]
+
+
+def search_score(answer_fn, questions, facts):
+    """Поиск темы всем движком. Верно = ответ из допустимой темы; для ok=None — «не знаю» / «не моя тема».
+    → {'n', 'ok', 'wrong' (не та тема), 'idk' (тема есть, а ответ «не знаю»)}."""
+    ok = wrong = idk = 0
+    for x in questions:
+        out = answer_fn(x["q"], facts)
+        silent = out["mode"] in ("dont_know", "out_of_scope")
+        if x["ok"] is None:
+            ok, wrong = ok + silent, wrong + (not silent)
+        elif set(out.get("sources") or ()) & set(x["ok"]):
+            ok += 1
+        elif silent:
+            idk += 1
+        else:
+            wrong += 1
+    return {"n": len(questions), "ok": ok, "wrong": wrong, "idk": idk}
 
 
 def validate_cases(cases):

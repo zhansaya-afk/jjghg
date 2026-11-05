@@ -17,7 +17,14 @@ from anemia.personalizer.facts import hb_from_question
 from anemia.personalizer.retrieve import SLOT, load_kb
 from anemia.personalizer.router import route
 from anemia.personalizer.survey import to_survey
-from anemia.personalizer_eval import load_cases, run, summary, violations
+from anemia.personalizer_eval import (
+    load_cases,
+    load_search_questions,
+    run,
+    search_score,
+    summary,
+    violations,
+)
 
 F_OK = {"status": "ok", "risk": "средний", "hb_range": [105, 125], "tissues": ["conj"]}
 F_BAD = {"status": "retake", "stage": "quality", "reason": "снимок размыт"}
@@ -227,6 +234,66 @@ def test_kb_examples_do_not_copy_holdout_questions():
         if SequenceMatcher(None, h, e).ratio() > 0.82
     ]
     assert not near, near
+
+
+def test_kb_examples_do_not_copy_search_questions():
+    # набор замера поиска (evals/personalizer/search_questions.json) тоже нельзя класть в базу знаний
+    norm = lambda s: re.sub(r"[^\w]+", " ", s.lower().replace("ё", "е")).strip()
+    examples = {norm(e) for fr in load_kb("ru") for e in fr.examples}
+    qs = load_search_questions()
+    assert {x["split"] for x in qs} == {"A", "B"} and len(qs) >= 150
+    ids = {fr.id for fr in load_kb("ru")}
+    assert all(x["ok"] is None or set(x["ok"]) <= ids for x in qs)
+    near = [
+        (x["q"], e)
+        for x in qs
+        for e in examples
+        if SequenceMatcher(None, norm(x["q"]), e).ratio() > 0.82
+    ]
+    assert not near, near
+
+
+def test_search_does_not_regress():
+    """Порог-страховка, не цель: правка базы или поиска не должна молча ухудшать поиск темы.
+    На 2026-11-05 весь движок: A 78/128, B 48/68 (до правок поиска B 42/68). Пороги и списки слов по B не
+    подбирались; B использован один раз — им отменены 71 новая формулировка базы (A росли, B нет)."""
+    f = facts(
+        {"status": "ok", "risk": "высокий", "hb_range": [92, 112], "tissues": ["conj"]}
+    )
+    r = search_score(answer, load_search_questions(), f)
+    assert r["ok"] / r["n"] >= 0.60 and r["wrong"] / r["n"] <= 0.20, r
+    b = search_score(
+        answer, load_search_questions(split="B"), f
+    )  # рост A не должен прятать падение B
+    assert b["ok"] / b["n"] >= 0.62, {k: b[k] for k in ("ok", "n")}
+
+
+def test_other_analytes_are_not_anemia_topics():
+    for q in (
+        "Какая норма сахара в крови?",
+        "Холестерин 6,5 — это много?",
+        "Гликированный гемоглобин 7%, это плохо?",
+        "HbA1c 8",
+    ):
+        assert answer(q, facts())["mode"] == "out_of_scope", q
+    assert hb_from_question("гликированный гемоглобин 6,5", {}) is None  # не 65 г/л
+    # но сахар как еда, давление как самочувствие и анализы рядом с симптомами анемии — в поиске по базе
+    for q in (
+        "Пью кофе с сахаром после еды, это вредно?",
+        "Кружится голова и низкое давление",
+        "Анализ на сахар сдавать, если слабость и бледность?",
+        "Креатинин повышен, может ли из-за почек быть анемия?",
+    ):
+        assert route(q, facts()) == (None, None), q
+
+
+def test_question_of_only_common_words_searches_full_text():
+    from anemia.personalizer.retrieve import _key
+
+    assert _key("Анемия?") is None and _key("Что такое анемия?") is None
+    assert _key("Может ли анемия быть от стресса?") == "быть стресса"
+    for q in ("Анемия?", "Что такое анемия?"):
+        assert answer(q, facts())["sources"] == ["what_is_anemia"], q
 
 
 def test_personalize_from_core_result():

@@ -172,7 +172,7 @@ def test_ya5_cell_shows_how_answer_was_found(monkeypatch, capsys):
     ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
     exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out
-    assert "🔎 поиск: тема" in out and "порога 0,40" in out
+    assert "🔎 поиск: тема" in out and "порога" in out
 
 
 def test_ya6_cell_checks_the_knowledge_base(capsys):

@@ -176,6 +176,24 @@ def urgent_reason(question, facts, history=None):
     return None
 
 
+# вопрос о другом анализе («норма сахара в крови», «холестерин»): в базе о них ничего нет, хотя есть «кровь»
+# и «норма». Только сами анализы: «чай с сахаром», «низкое давление» — не сюда (бывают и про анемию).
+OTHER_ANALYTE = re.compile(
+    r"глюкоз|холестерин|билирубин|креатинин|\bттг\b|\bалт\b|\bаст\b|сахар\w*\s+(?:в\s+)?кров|"
+    r"(?:норм|уров|анализ)\w*\s+(?:на\s+)?сахар",
+    re.IGNORECASE,
+)
+ANEMIA_WORD = re.compile(
+    r"гемогл|\bhb\b|\bhgb\b|анем|желез|ферритин|эритроц", re.IGNORECASE
+)
+# …но «анализ на сахар, если слабость и бледность», «креатинин и почки» — про анемию тоже: в поиск
+ANEMIA_CONTEXT = re.compile(
+    r"слабост|бледн|устал|утомл|головокруж|кружит|одышк|сердцебиен|ломк|выпада|почк|\bоак\b|"
+    r"анализ\w*\s+кров",
+    re.IGNORECASE,
+)
+
+
 def route(question, facts, history=None):
     """→ (режим, причина) для готового шаблона, или (None, None) — идти в поиск по базе знаний."""
     q = question or ""
@@ -202,6 +220,12 @@ def route(question, facts, history=None):
         return "answer", "drug"
     if _any(DIAGNOSIS, q):
         return "answer", "diagnosis"
+    if F.GLYCATED.search(q) or (
+        OTHER_ANALYTE.search(q)
+        and not ANEMIA_WORD.search(q)
+        and not ANEMIA_CONTEXT.search(q)
+    ):  # гликированный гемоглобин (HbA1c) — анализ на сахар, не на анемию
+        return "out_of_scope", "other_analyte"
     if q and not DOMAIN.search(q) and not F.hb_from_question(q, facts):
         if len(LATIN.findall(q)) > len(CYR_KK.findall(q)):
             return "answer", "language"

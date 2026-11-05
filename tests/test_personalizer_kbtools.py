@@ -34,7 +34,7 @@ def test_broken_knowledge_base_is_reported(tmp_path):
     path.write_text(bad, encoding="utf-8")
     ok, out = run_check(path, exam=True)
     assert not ok
-    for msg in ("имя темы", "нет строки ---", "неизвестные слоты", "почти совпадает с отложенным вопросом",
+    for msg in ("имя темы", "нет строки ---", "неизвестные слоты", "почти совпадает с проверочным вопросом",
                 "экзамен не запускался"):  # fmt: skip
         assert msg in out, (msg, out)
     fixed = bad.replace(" {oops}", "")
@@ -49,7 +49,7 @@ def test_broken_knowledge_base_is_reported(tmp_path):
 def test_explain_tells_why():
     assert "правило: доза" in explain(answer("Сколько таблеток пить?", F))
     low = explain(answer("Пью чай после обеда, это плохо?", F))
-    assert "< порога 0,40" in low and "строку q:" in low
+    assert "< порога" in low and "строку q:" in low
     h = [
         {"role": "user", "text": "Какая норма гемоглобина?"},
         {"role": "assistant", "text": "…"},

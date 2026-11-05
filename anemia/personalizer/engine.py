@@ -8,12 +8,12 @@ import re
 
 from ..personalizer_eval import violations
 from . import texts as T
-from .context import asks_dose, context_query, dialog_facts, is_follow_up
+from .context import asks_dose, base_question, context_query, dialog_facts, is_follow_up
 from .facts import build_facts, hb_from_question, photo_ok
 from .retrieve import SLOT, default_retriever, load_kb
 from .router import lang_of, needs_retake, route
 
-THRESHOLD = 0.40  # сходство вопроса с базой ниже порога → «не знаю»; на dev самое низкое верное 0,44
+THRESHOLD = 0.35  # сходство ниже порога → «не знаю»; выбран на наборе A (evals/personalizer/search_questions.json)
 EXPLAIN = "explain_result"
 LAB = "lab_explain"
 # фрагменты о самом результате фото: при непригодном снимке вместо них — «переснимите»
@@ -88,9 +88,12 @@ def _kk(mode, why, question, facts):
     return "answer", T.kk_explain(facts, question)
 
 
-def rules_answer(question, facts, history=None, retriever=None, force=None):
+def rules_answer(
+    question, facts, history=None, retriever=None, force=None, search=None
+):
     """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang', 'why', 'trace'}.
     force=(режим, причина) — маршрут уже решён снаружи (например, «А сколько?» после вопроса о железе).
+    search — текст для поиска темы, если он не question: у «А при беременности?» тема — из прошлого вопроса.
     trace — как найден ответ: правило маршрутизатора или лучшие темы поиска со сходством (для Я5 и Я6)."""
     q = (question or "").strip()
     lang = lang_of(q)
@@ -145,7 +148,7 @@ def rules_answer(question, facts, history=None, retriever=None, force=None):
             fr = _fragment(EXPLAIN)
             note("пустой вопрос: объяснение результата")
         else:
-            hits = (retriever or default_retriever("ru")).search(q, k=3)
+            hits = (retriever or default_retriever("ru")).search(search or q, k=3)
             trace["search"] = [(h.id, round(sc, 2)) for h, sc in hits]
             fr = hits[0][0] if hits and hits[0][1] >= THRESHOLD else None
             if (
@@ -212,7 +215,9 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
     facts = dialog_facts(facts, history, q)
     cq = context_query(q, history)
     force = ("answer", "dose") if asks_dose(q, cq) else None
-    base = rules_answer(cq, facts, history, retriever, force)
+    # уточнение без своей темы: тема — из прошлого вопроса, условие («для мужчин») — в подстановке фактов
+    topic = base_question(history) if cq != q else None
+    base = rules_answer(cq, facts, history, retriever, force, topic)
     lost = base["why"] is None and base["mode"] in ("out_of_scope", "dont_know")
     clarify = False
     if cq == q and lost:

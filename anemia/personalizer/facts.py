@@ -149,6 +149,8 @@ _NUM = re.compile(r"(?<![\w.,])(\d{1,3})(?:[.,](\d))?(?!\d|[.,]\d)")
 _HB_WORD = re.compile(
     r"гемогл|гемаглоб|\bhb\b|\bhgb\b|\bнв\b|гемоглобин", re.IGNORECASE
 )
+# гликированный гемоглобин (HbA1c, %) — показатель сахара, не Hb: «HbA1c 8» ≠ 80 г/л
+GLYCATED = re.compile(r"гликир|гликозилир|hb\s*a1c|\ba1c\b|нв\s*а1с|\bа1с\b", re.IGNORECASE)
 _OTHER_WORD = re.compile(
     r"ферритин|\bmcv\b|\bmch|b12|в12|фоли|витамин|эритроцит|тромбоцит|лейкоцит|\bсоэ\b|сывороточн|\bттг\b|"
     r"давлен|пульс|температур|\bрост|\bвес|сахар|глюкоз|креатинин|ферритин|\bmch\b|rdw",
@@ -184,6 +186,8 @@ def hb_from_question(question, facts):
     Единица: «г/л»; «г/дл» — число 3–25 (×10); «ммоль/л» — если так написано (×16,11, как labs.py).
     Возраст, недели, проценты и числа других показателей («ферритин 8», «MCV 75», «давление 120»)
     игнорируются."""
+    if GLYCATED.search(question or ""):
+        return None
     for m in _NUM.finditer(question or ""):
         whole, dec = int(m.group(1)), m.group(2)
         tail = question[m.end() : m.end() + 12].lower().lstrip(" ,.")

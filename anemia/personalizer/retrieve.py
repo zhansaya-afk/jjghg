@@ -72,44 +72,99 @@ def _norm(s):
     return " ".join(w for w in s.split() if w not in STOP)
 
 
+# слова, которые есть почти в каждом вопросе об анемии: по ним тема не различается, а совпадение
+# «может … понизить» тянуло вопрос о донорстве к теме про стресс. Убираются только из поиска.
+# «гемоглобин» оставлен: без него «какой у меня гемоглобин по фото?» терял тему hb_by_photo.
+_COMMON_WORDS = """
+    анемия анемии анемией анемию при низкий низком низкого может могут ли бывает правда вообще стоит
+    влияет влиять
+"""
+COMMON = frozenset(_COMMON_WORDS.split())
+_ASK_WORDS = """
+    почему зачем сколько когда где какой какая какое какие каким чем куда откуда насколько как такое
+"""
+ASK = frozenset(_ASK_WORDS.split())
+TOPIC_WEIGHT = 0.5  # доля оценки по теме целиком (все её формулировки вместе) против лучшей одной формулировки
+
+
+def _key(s):
+    """Текст для поиска: _norm без общих слов или None, если без них остались одни вопросительные слова
+    («анемия?», «сколько было с анемией»): тогда ищется полный текст (_norm) по полным формулировкам."""
+    rest = [w for w in _norm(s).split() if w not in COMMON]
+    return " ".join(rest) if any(w not in ASK for w in rest) else None
+
+
 @lru_cache(maxsize=4)
 def load_kb(lang="ru"):
     return tuple(parse_kb((KB_DIR / f"{lang}.md").read_text(encoding="utf-8")))
 
 
-class Retriever:
-    """Сходство вопроса с примерами вопросов каждого фрагмента; оценка фрагмента = лучший пример."""
+class _Index:
+    """TF-IDF (символьные n-граммы) по формулировкам и по темам целиком (все формулировки одним текстом)."""
 
-    def __init__(self, fragments, encoder=None):
+    def __init__(self, per_fragment):
         from sklearn.feature_extraction.text import TfidfVectorizer
 
-        self.fragments = list(fragments)
-        self.owner = [i for i, fr in enumerate(self.fragments) for _ in fr.examples]
-        texts = [_norm(e) for fr in self.fragments for e in fr.examples]
-        self.encoder = encoder
-        if encoder is None:
-            self.vec = TfidfVectorizer(
+        def tfidf(texts):
+            vec = TfidfVectorizer(
                 analyzer="char_wb", ngram_range=(2, 5), sublinear_tf=True
             )
-            self.mat = self.vec.fit_transform(texts)
+            return vec, vec.fit_transform(texts)
+
+        self.vec, self.mat = tfidf([t for ts in per_fragment for t in ts])
+        self.tvec, self.tmat = tfidf([" ".join(ts) for ts in per_fragment])
+
+    def sims(self, q):
+        """→ (сходство с каждой формулировкой, сходство с каждой темой)."""
+        ex = (self.mat @ self.vec.transform([q]).T).toarray().ravel()
+        return ex, (self.tmat @ self.tvec.transform([q]).T).toarray().ravel()
+
+
+class Retriever:
+    """Сходство вопроса с формулировками каждой темы. Оценка темы (TF-IDF) = половина — лучшая одна
+    формулировка, половина — тема целиком (все формулировки одним текстом): так вопрос, похожий на
+    несколько формулировок темы понемногу, не проигрывает случайному совпадению с одной чужой.
+    Поиск идёт без общих слов (_key); вопрос из одних общих и вопросительных слов — по полному тексту.
+    Всё это и порог engine.THRESHOLD = 0,35 — для TF-IDF; с encoder= (эмбеддер) поиск по полному тексту
+    и лучшей формулировке, порог для него надо подбирать заново."""
+
+    def __init__(self, fragments, encoder=None):
+        self.fragments = list(fragments)
+        self.owner = [i for i, fr in enumerate(self.fragments) for _ in fr.examples]
+        self.encoder = encoder
+        if encoder is None:
+            full = [[_norm(e) for e in fr.examples] for fr in self.fragments]
+            keyed = [
+                [_key(e) or n for e, n in zip(fr.examples, ns)]
+                for fr, ns in zip(self.fragments, full)
+            ]
+            self.keyed, self.full = _Index(keyed), _Index(full)
         else:
-            self.mat = np.asarray(encoder(texts), float)
+            self.mat = np.asarray(
+                encoder([_norm(e) for fr in self.fragments for e in fr.examples]), float
+            )
             self.mat /= np.linalg.norm(self.mat, axis=1, keepdims=True) + 1e-12
 
     def search(self, question, k=3):
         """→ [(Fragment, сходство 0–1)] по убыванию."""
-        q = _norm(question)
-        if not q:
+        key, full = _key(question), _norm(question)
+        if not full:
             return []
+        topic = None
         if self.encoder is None:
-            sims = (self.mat @ self.vec.transform([q]).T).toarray().ravel()
+            sims, topic = self.keyed.sims(key) if key else self.full.sims(full)
         else:
-            v = np.asarray(self.encoder([q]), float).ravel()
+            v = np.asarray(self.encoder([full]), float).ravel()
             sims = self.mat @ (v / (np.linalg.norm(v) + 1e-12))
         best = {}
         for j, s in enumerate(sims):
             i = self.owner[j]
             best[i] = max(best.get(i, 0.0), float(s))
+        if topic is not None:
+            best = {
+                i: (1 - TOPIC_WEIGHT) * b + TOPIC_WEIGHT * float(topic[i])
+                for i, b in best.items()
+            }
         order = sorted(best, key=best.get, reverse=True)[:k]
         return [(self.fragments[i], best[i]) for i in order]
 
