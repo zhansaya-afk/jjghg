@@ -63,6 +63,91 @@ def test_not_urgent_controls(q):
     assert route(q, facts())[0] != "urgent"
 
 
+# Казахский: опасные признаки — и с казахскими буквами, и без них (на телефоне часто пишут «кан кустым»).
+# Фразы — черновик, проверить носителем языка (список для проверки — в отчёте ветки).
+KK_URGENT_Q = [
+    ("Нәжісім қара болды", "stool"),
+    ("нажисим кара болды", "stool"),
+    ("Кеше қара нәжіс болды", "stool"),
+    ("Нәжісте қан бар", "stool"),
+    ("Қанмен құстым", "vomit"),
+    ("кан кустым", "vomit"),
+    ("Құсқанда қан шықты", "vomit"),
+    ("Кеудем ауырады, тыныс алу қиын", "chest"),
+    ("Демім жетпейді", "chest"),
+    ("Есімнен танып қалдым", "faint"),
+    ("Талып қалдым", "faint"),
+    ("Қатты қан кетіп жатыр", "bleeding"),
+    ("Жүктімін, қан кетіп жатыр", "bleeding"),
+    ("Өмір сүргім келмейді", "crisis"),
+    ("Өзімді өлтіргім келеді", "crisis"),
+    ("Басым қатты айналады", "dizzy"),
+    ("Жатсам да ентігемін", "breath"),
+    ("Кеудем қысып тұр", "chest"),
+    ("Дем ала алмай жатырмын", "chest"),
+    ("Ауа жетпейді", "chest"),
+    ("Есімді жоғалттым", "faint"),
+    ("Талықсып қалдым", "faint"),
+    ("Басым айналып құладым", "faint"),
+    ("есiмнен танып қалдым", "faint"),  # латинская i вместо і
+    ("Қан аралас құстым", "vomit"),
+    ("Қара түсті нәжіс шықты", "stool"),
+    ("Қансырап жатырмын", "bleeding"),
+    ("Өлгім келіп тұр", "crisis"),
+    ("Өзіме қол салғым келеді", "crisis"),
+]
+
+
+@pytest.mark.parametrize("q,why", KK_URGENT_Q)
+def test_kazakh_red_flags_are_urgent(q, why):
+    o = answer(q, facts())
+    assert o["mode"] == "urgent" and o["lang"] == "kk" and o["why"] == why, o
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        "Темірден нәжіс қара бола ма?",  # вопрос-справка, как «читала, что чёрный стул бывает от железа»
+        "Етеккір кезінде қан көп кетеді",  # обильные месячные — не кровотечение
+        "Басым кейде айналады",
+        "Қан тапсыру керек пе?",
+        "Қанша құс етін жеу керек?",  # құс еті — курица, не «құсу» (рвота)
+        "Қандай құс бауырын жеу керек?",
+        "Етеккір кезінде қан кетіп жатыр, бұл қалыпты ма?",
+    ],
+)
+def test_kazakh_not_urgent_controls(q):
+    assert answer(q, facts())["mode"] != "urgent"
+
+
+def test_kazakh_without_knowledge_base_is_honest():
+    f = facts()
+    assert answer("Қандай дәрі ішу керек?", f)["text"] == T.KK_DOSE
+    assert answer("Темір дәрісін қанша ішу керек?", f)["text"] == T.KK_DOSE
+    general = answer("Қандай тағам жеу керек?", f)
+    assert general["text"].startswith(T.KK_ONLY_RESULT) and "қаупі" in general["text"]
+    result = answer("Нәтижем нені білдіреді?", f)
+    assert T.KK_ONLY_RESULT not in result["text"] and "қаупі" in result["text"]
+    assert answer("Баламды тексеруге бола ма?", f)["mode"] == "child"
+    assert answer("Ауа райы қандай?", f)["mode"] == "out_of_scope"
+    assert answer("натижем нени билдиреди", f)["lang"] == "kk"
+    # то же без казахских букв и другими формами
+    assert answer("кандай дари ишу керек", f)["text"] == T.KK_DOSE
+    assert answer("улымды тексеруге бола ма", f)["mode"] == "child"
+    assert answer("Балаға тексеру керек пе?", f)["mode"] == "child"
+    for q in ("Қаназдық деген не?", "Қансыздану қаупі бар ма?"):
+        assert answer(q, f)["mode"] == "answer", q
+    # русские имена — не казахские слова
+    assert answer("Мои дети Дарина и Темирлан бледные", f)["lang"] == "ru"
+
+
+def test_kazakh_bad_photo_asks_retake():
+    f = facts(F_BAD)
+    assert answer("Нәтижем нені білдіреді?", f)["text"] == T.KK_RETAKE
+    general = answer("Қандай тағам жеу керек?", f)["text"]
+    assert general.startswith(T.KK_ONLY_RESULT) and T.KK_RETAKE in general
+
+
 def test_survey_flag_and_severe_lab_are_urgent():
     assert route("Что дальше?", facts(survey={"red_flag": True}))[0] == "urgent"
     assert (

@@ -552,6 +552,21 @@ KK_RETAKE = (
 )
 
 
+KK_ONLY_RESULT = (
+    "Қазақ тілінде әзірге тек скрининг нәтижесін түсіндіре аламын. Басқа сұрақты орыс тілінде қойыңыз "
+    "немесе дәрігерден сұраңыз."
+)
+_KK_RESULT_Q = re.compile(
+    r"нәтиже|натиже|фото|сурет|гемоглоб|талдау|норма|қалыпты|калыпты|қауіп\s+(?:деңгей|қандай)|\d",
+    re.IGNORECASE,
+)
+
+
+def kk_about_result(question, f=None):
+    """Казахский вопрос о самом результате (фото, анализ, норма, число), а не общий («что есть?»)."""
+    return bool(_KK_RESULT_Q.search(question or ""))
+
+
 def kk_lab(f, question=""):
     lab = f.get("lab")
     q = F.hb_from_question(question, f)

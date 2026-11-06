@@ -85,6 +85,15 @@ def _kk(mode, why, question, facts):
         return "retake", T.KK_RETAKE
     if mode in ("out_of_scope", "dont_know"):
         return "out_of_scope", T.KK_OUT
+    if why == "drug":
+        return "answer", T.KK_DOSE
+    if why is None and needs_retake(question, facts):  # снимок непригоден, анализа нет
+        if T.kk_about_result(question, facts):
+            return "retake", T.KK_RETAKE
+        return "answer", T.join(T.KK_ONLY_RESULT, T.KK_RETAKE)
+    if why is None and not T.kk_about_result(question, facts):
+        # базы знаний на казахском нет: честно сказать и объяснить результат (вопрос «что есть?» не о нём)
+        return "answer", T.join(T.KK_ONLY_RESULT, T.kk_explain(facts, question))
     return "answer", T.kk_explain(facts, question)
 
 
