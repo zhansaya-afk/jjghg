@@ -48,7 +48,7 @@ def test_broken_knowledge_base_is_reported(tmp_path):
 
 def test_explain_tells_why():
     assert "правило: доза" in explain(answer("Сколько таблеток пить?", F))
-    low = explain(answer("Пью чай после обеда, это плохо?", F))
+    low = explain(answer("Можно ли летать на самолёте с анемией?", F))  # темы о перелётах в базе нет
     assert "< порога" in low and "строку q:" in low
     h = [
         {"role": "user", "text": "Какая норма гемоглобина?"},
