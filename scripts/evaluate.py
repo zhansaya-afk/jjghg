@@ -45,6 +45,7 @@ from sklearn.model_selection import GroupKFold
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+from anemia import anatomy as AN  # noqa: E402
 from anemia import core as CORE  # noqa: E402
 from anemia import metrics as M  # noqa: E402
 from anemia import predict as PR  # noqa: E402
@@ -435,14 +436,18 @@ def _seg_test_item(root, row, kind):
     return rgb, resize_to(load_mask(os.path.join(root, row['mask'])), rgb.shape[:2], nearest=True)
 
 
-def _seg_scores(model, items):
-    """(IoU, Dice, нашёл) по снимкам; пустая разметка → None (IoU пусто/пусто = 1 завысил бы среднее)."""
+def _seg_scores(model, items, limits=None):
+    """(IoU, Dice, нашёл) по снимкам; пустая разметка → None (IoU пусто/пусто = 1 завысил бы среднее).
+    limits — с анатомией (AN.check): остаётся главная полоса века, не прошла проверку → пустая маска (отказ)."""
     out = []
     for rgb, gt in items:
         if not gt.any():
             out.append(None)
             continue
         p = SB.conj_mask(model, rgb)
+        if limits is not None and p.any():
+            an = AN.check(p, None, limits)
+            p = an['conj'] if an['conj_ok'] else np.zeros_like(p)
         out.append((M.iou(p, gt), M.dice(p, gt), bool(p.any())))
     return out
 
@@ -477,14 +482,23 @@ def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
         for arm, tr in (('Eyes-defy', tr_ed), ('Eyes-defy + телефонные', tr_ed + tr_ex)):
             jobs_list.append((f, arm, tr))
     models = Parallel(n_jobs=jobs)(delayed(SB.fit_samples)(tr) for _, _, tr in jobs_list)
+    # анатомия: пределы по маскам врачей только обучающих фолдов (Eyes-defy и телефонных) этой модели
+    ed_st = [AN.image_stats(gt, None) for _, gt in ed_items]
+    ex_st = [AN.image_stats(gt, None) for _, gt in ex_items]
     scores = {}
     for (f, arm, _), m in zip(jobs_list, models):
         te_ed = [it for it, g, ok in zip(ed_items, ed_fold, good) if g == f and ok]
         te_ex = [it for it, g in zip(ex_items, ex_fold) if g == f]
-        scores.setdefault((arm, 'eyes_defy'), []).extend(
-            zip(df.group.values[(ed_fold == f) & good], _seg_scores(m, te_ed)))
-        scores.setdefault((arm, 'phone_conj_masks'), []).extend(
-            zip(idx.group.values[ex_fold == f], _seg_scores(m, te_ex)))
+        arms = [(arm, None)]
+        if arm == 'Eyes-defy + телефонные':
+            lim = AN.fit_limits([x for x, g, ok in zip(ed_st, ed_fold, good) if g != f and ok]
+                                + [x for x, g in zip(ex_st, ex_fold) if g != f])
+            arms.append((arm + ' + анатомия (отказ = пустая маска)', lim))
+        for name, lim in arms:
+            scores.setdefault((name, 'eyes_defy'), []).extend(
+                zip(df.group.values[(ed_fold == f) & good], _seg_scores(m, te_ed, lim)))
+            scores.setdefault((name, 'phone_conj_masks'), []).extend(
+                zip(idx.group.values[ex_fold == f], _seg_scores(m, te_ex, lim)))
     rows = []
     for (arm, test), v in scores.items():
         v = [(g, sc) for g, sc in v if sc is not None]
@@ -494,7 +508,8 @@ def run_seg_external(root, df, jobs, cache=NO_CACHE, timer=None, n_folds=5):
         rows.append({'task': 'seg_ext', 'dataset': test, 'method': f'сегментатор ядра · обучение: {arm}',
                      'n': len(v), 'iou_mean': float(iou.mean()), 'iou_lo': lo, 'iou_hi': hi,
                      'iou_median': float(np.median(iou)), 'dice_mean': float(np.mean([s[1] for _, s in v])),
-                     'found': float(np.mean([s[2] for _, s in v]))})
+                     'found': float(np.mean([s[2] for _, s in v])),
+                     'iou_found': float(np.mean([s[0] for _, s in v if s[2]])) if any(s[2] for _, s in v) else np.nan})
     return rows
 
 
@@ -511,13 +526,13 @@ def _det_compute(path):
     return {k: det[k] for k in DET_KEYS}, {'read': t1 - t0, 'features': time.perf_counter() - t1}
 
 
-def eye_route(det, seg):
+def eye_route(det, seg, limits=AN.LIMITS):
     """Снимок глаза → (ткани после тех же отказов, что в анализе фото; модель взрослых или None; причина отказа).
     Шаг 1 _detect: несогласованные ткани → отказ; конъюнктива — сегментатор seg (learned_conj, с его отказами);
     затем качество тканей и выбор модели (tissue_route). Остальные шаги _detect (лицо, мелкая радужка) на
     Eyes-defy меняют маршрут 1 снимка из 216 (сверка 2026-10-18) и здесь не повторяются."""
     why = PR._inconsistent(det)
-    det = PR.learned_conj(PR._rejected(det, why) if why else det, seg)
+    det = PR.learned_conj(PR._rejected(det, why) if why else det, seg, limits=limits)
     key, why = PR.tissue_route(det)
     return det, key, why
 
@@ -533,13 +548,25 @@ def _seg_features(crop, conj, sclera, seed, stress):
     return (rows, srows), {'read': 0.0, 'features': time.perf_counter() - t0}
 
 
-def _core_job(root, row, seed, seg, stress, cache=NO_CACHE):
+def _crop_iou(root, row, crop, conj, accepted):
+    """IoU маски века, которая идёт в признаки, с маской врача на той же вырезке (None — у снимка нет годной маски
+    врача); отказ = пустая маска."""
+    if not isinstance(row.get('mask_conj'), str) or row['patient_id'] in BAD_DOCTOR_MASKS:
+        return None
+    gt = resize_to(load_mask(os.path.join(root, row['mask_conj'])), crop.shape[:2], nearest=True)
+    if not gt.any():
+        return None
+    return M.iou(conj if accepted and conj is not None else np.zeros_like(gt), gt)
+
+
+def _core_job(root, row, seed, seg, stress, cache=NO_CACHE, limits=AN.LIMITS):
     """Один снимок глаза: маршрут анализа фото + признаки тканей той модели, которой он будет оценён."""
     path = os.path.join(root, row['image'])
     det, t = cache.fetch('v12det', {'image': path}, {}, {'detect_side': V12.DETECT_SIDE}, _det_compute, path)
-    det, key, why = eye_route(det, seg)
+    det, key, why = eye_route(det, seg, limits)
+    iou = _crop_iou(root, row, det['crop'], det['conj'], key is not None and 'conj' in CORE.SPECS[key]['tissues'])
     if key is None:
-        return {'key': None, 'why': why, 'rows': [], 'srows': []}, t
+        return {'key': None, 'why': why, 'rows': [], 'srows': [], 'iou': iou}, t
     tissues = CORE.SPECS[key]['tissues']              # как analyze_photo: только пригодные ткани
     conj = det['conj'] if 'conj' in tissues else None
     sclera = det['sclera'] if 'sclera' in tissues else None
@@ -549,14 +576,38 @@ def _core_job(root, row, seed, seg, stress, cache=NO_CACHE):
     (rows, srows), t2 = cache.fetch('v12seg', {}, arrays, params, _seg_features, det['crop'], conj, sclera, seed,
                                     stress)
     rows, srows = _with_meta(row, rows, srows)
-    return {'key': key, 'why': '', 'rows': rows, 'srows': srows}, {k: t[k] + t2[k] for k in t}
+    return {'key': key, 'why': '', 'rows': rows, 'srows': srows, 'iou': iou}, {k: t[k] + t2[k] for k in t}
 
 
-def _core_batch(root, items, seg, stress, cache):
-    return [(i, role, *_core_job(root, row, i, seg, stress, cache)) for i, role, row in items]
+def _core_batch(root, items, seg, stress, cache, limits=AN.LIMITS):
+    return [(i, role, *_core_job(root, row, i, seg, stress, cache, limits)) for i, role, row in items]
 
 
-def core_jobs(root, df, jobs, segs, cache=NO_CACHE, timer=None, nested=False):
+def _anatomy_stats_job(root, path, mask_path, cache=NO_CACHE):
+    """Маска врача на вырезке шага 1 + пороговая склера этого снимка → AN.image_stats (только маски, без Hb)."""
+    det, _ = cache.fetch('v12det', {'image': path}, {}, {'detect_side': V12.DETECT_SIDE}, _det_compute, path)
+    gt = resize_to(load_mask(mask_path), det['crop'].shape[:2], nearest=True)
+    return AN.image_stats(gt, det['sclera'] if 'sclera' in det['use'] else None)
+
+
+def anatomy_limits(root, df, jobs, keys, cache=NO_CACHE, external=True):
+    """Пределы анатомии (AN.fit_limits) для каждого набора скрытых фолдов k: только по маскам врачей снимков вне k
+    (+ телефонные фото с масками, их в тестах ядра нет). Тестовые маски в пределы не попадают."""
+    recs = df.to_dict('records')
+    ed = Parallel(n_jobs=jobs)(delayed(_anatomy_stats_job)(root, os.path.join(root, r['image']),
+                                                          os.path.join(root, r['mask_conj']), cache) for r in recs)
+    ph = []
+    if external:
+        idx = EXT.seg_index(root)
+        ph = Parallel(n_jobs=jobs)(delayed(_anatomy_stats_job)(root, os.path.join(root, r['file']),
+                                                              os.path.join(root, r['mask']), cache)
+                                   for r in idx.to_dict('records'))
+    fold = df.fold.astype(int).values
+    bad = df.patient_id.isin(BAD_DOCTOR_MASKS).values
+    return {k: AN.fit_limits([s for s, g, b in zip(ed, fold, bad) if g not in k and not b] + ph) for k in keys}
+
+
+def core_jobs(root, df, jobs, segs, cache=NO_CACHE, timer=None, nested=False, limits=AN.LIMITS):
     """Маршрут и признаки каждого снимка глаза → список {i, role, key, why, rows, srows}.
     role 'test' — снимок фолда g с маской сегментатора без g (+ стресс-условия света);
     role f (nested) — тот же снимок как обучающий при внешнем фолде f, маска сегментатора без f и g."""
@@ -569,7 +620,9 @@ def core_jobs(root, df, jobs, segs, cache=NO_CACHE, timer=None, nested=False):
             if f != g:
                 batches.setdefault((f, g), []).append((i, f, row))
     t0 = time.perf_counter()
-    out = Parallel(n_jobs=jobs)(delayed(_core_batch)(root, items, segs[k], len(k) == 1, cache)
+    per_key = limits is not None and 'wfrac_min' not in limits     # {набор фолдов: пределы} или одни пределы на всё
+    out = Parallel(n_jobs=jobs)(delayed(_core_batch)(root, items, segs[k], len(k) == 1, cache,
+                                                     limits[k] if per_key else limits)
                                 for k, items in batches.items())
     res = [r for b in out for r in b]
     if timer is not None:
@@ -585,6 +638,11 @@ def route_counts(J, n):
     for x in T:
         k = x['key'] or 'отказ · ' + x['why'].split(':')[0]
         c[k] = c.get(k, 0) + 1
+    iou = [x['iou'] for x in T if x.get('iou') is not None]
+    acc = [x['iou'] for x in T if x.get('iou') is not None and x['key'] is not None and 'conj' in CORE.SPECS[x['key']]['tissues']]
+    if iou:
+        c['IoU века в расчёте (принятые)'] = round(float(np.mean(acc)), 3) if acc else None
+        c['IoU века, отказ = 0'] = round(float(np.mean(iou)), 3)
     return c
 
 
@@ -828,6 +886,8 @@ def main():
     ap.add_argument('--no-external-seg', action='store_true',
                     help='сегментатор только по маскам Eyes-defy (без телефонных фото external/, как до 2026-10-20)')
     ap.add_argument('--refresh-cache', action='store_true', help='пересчитать признаки и перезаписать кэш')
+    ap.add_argument('--no-anatomy', action='store_true',
+                    help='без анатомических ограничений масок (anemia/anatomy.py) — поведение до 2026-10-31, для сравнения')
     a = ap.parse_args()
     if a.no_cache and a.refresh_cache:
         ap.error('--no-cache и --refresh-cache вместе не имеют смысла')
@@ -900,8 +960,13 @@ def main():
             print(f'[{time.time() - t0:5.0f} с] {ds}: сегментаторы конъюнктивы по маскам врачей (без тестового фолда)...')
             segs = conj_segmenters(a.data, df, a.jobs, cache, timer, nested=True, full=False,
                                    external=not a.no_external_seg)
-            print(f'[{time.time() - t0:5.0f} с] {ds}: маршрут анализа фото, отказы и признаки...')
-            J = core_jobs(a.data, df, a.jobs, segs, cache, timer, nested=True)
+            lims = None
+            if not a.no_anatomy:      # пределы анатомии — по маскам врачей обучающих фолдов каждого теста
+                lims = anatomy_limits(a.data, df, a.jobs, list(segs), cache, external=not a.no_external_seg)
+                RUNS.write_json(os.path.join(run_dir, f'anatomy_limits_{ds}.json'), {str(k): v for k, v in lims.items()})
+            print(f'[{time.time() - t0:5.0f} с] {ds}: маршрут анализа фото, отказы и признаки'
+                  f'{" (без анатомии)" if lims is None else " + анатомия масок"}...')
+            J = core_jobs(a.data, df, a.jobs, segs, cache, timer, nested=True, limits=lims)
             rc = route_counts(J, len(df))
             print(f'{ds}: маршрут анализа фото (тестовые маски): ' + ', '.join(f'{k} {v}' for k, v in rc.items()))
             for key in CORE.specs_for(ds):   # у взрослых — модель на каждый набор тканей, одни и те же фолды

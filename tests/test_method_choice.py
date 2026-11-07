@@ -25,7 +25,7 @@ def bundle():
 def _route(monkeypatch, use, bad=()):
     """Найдены ткани use; ткани из bad — «плохое качество». OOD выключен (малая модель учена не на этих признаках)."""
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det(use))
-    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg: det)
+    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg, **k: det)
     monkeypatch.setattr(CORE, 'ood_share', lambda x, lo, hi: np.zeros(len(x)))
 
     def quality(crop, a, b, side):

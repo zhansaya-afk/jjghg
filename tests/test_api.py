@@ -52,7 +52,7 @@ def _route(monkeypatch, use, eye='весь кадр'):
     """Ткани «найдены» заданные, OOD выключен (маршрут и перевод ответа; сегментация — test_eye_location)."""
     monkeypatch.setattr(PR, 'quality', lambda *a: [])
     monkeypatch.setattr(PR, '_detect', lambda rgb, lm=None: _fake_det(use, eye=eye))
-    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg: det)
+    monkeypatch.setattr(PR, 'learned_conj', lambda det, seg, **kw: det)
     monkeypatch.setattr(CORE, 'ood_share', lambda x, lo, hi: np.zeros(len(x)))  # малая модель учена не на этих признаках
 
 
