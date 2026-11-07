@@ -210,13 +210,15 @@ def to_result(r, version, symptoms=None):
 
 
 # ------------------------------------------------------------------ главный вход
-def screen(image, sex, age, pregnant, symptoms=None, *, models):
+def screen(image, sex, age, pregnant, symptoms=None, *, models, method=None):
     """Фото глаза с оттянутым нижним веком → Result.
     image: bytes (JPEG/PNG), numpy.ndarray H×W×3 (uint8 или float 0–1) или PIL.Image; sex: 'M'/'F'/'М'/'Ж'/None;
     age: лет (число) или None; pregnant: True/False/None (неизвестно); symptoms: None, ['слабость', …] или
     {'слабость': True, …} — проверяются и возвращаются, на риск пока не влияют; models: из load_models().
     Неверный ввод → TypeError / ValueError. Непригодный снимок, не глаз, ребёнок младше 5 лет, нетипичный
-    снимок → risk='не определён' и причина в reason, без исключения и без цифр."""
+    снимок → risk='не определён' и причина в reason, без исключения и без цифр.
+    method: None / 'auto' — модель по пригодным тканям (как раньше); 'conj' / 'sclera' / 'both' — метод, выбранный
+    пользователем (predict.METHODS): нужной ткани нет или она непригодна → 'не определён' с причиной, без подмены."""
     if not isinstance(models, Models):
         raise TypeError('models: результат load_models(path)')
     image = _check_image(image)
@@ -224,6 +226,7 @@ def screen(image, sex, age, pregnant, symptoms=None, *, models):
     age = _check_age(age)
     pregnant = _check_pregnant(pregnant, sex)
     symptoms = _check_symptoms(symptoms)
+    method = PR.check_method(method)
     r = PR.analyze_photo(image, sex=sex, age=age, pregnant=pregnant, bundle=models.bundle,
-                         landmarker=models.landmarker)
+                         landmarker=models.landmarker, method=method)
     return to_result(r, models.version, symptoms)
