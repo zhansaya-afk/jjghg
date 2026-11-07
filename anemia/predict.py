@@ -740,6 +740,19 @@ def tissue_route(det):
         return None, 'качество: ' + '; '.join(whole + [f'{TISSUE_RU[t]}: {v}' for t, v in ts.items() if v != 'пригодна'])
     return ADULT_MODEL[good], ''
 TISSUE_RU = {'conj': 'конъюнктива', 'sclera': 'склера'}
+# Метод анализа, выбранный пользователем: какие ткани обязательны и используются (модель — ADULT_MODEL по ним).
+# None / 'auto' — как раньше: модель по всем пригодным тканям.
+METHODS = {'conj': ('conj',), 'sclera': ('sclera',), 'both': ('conj', 'sclera')}
+METHOD_RU = {'conj': 'Конъюнктива', 'sclera': 'Склера', 'both': 'Конъюнктива + склера'}
+
+
+def check_method(method):
+    """None / 'auto' → None (выбор по пригодным тканям); 'conj' / 'sclera' / 'both' → как есть; иначе ValueError."""
+    if method in (None, 'auto'):
+        return None
+    if method not in METHODS:
+        raise ValueError(f"method: одно из {list(METHODS)} или None/'auto', получено {method!r}")
+    return method
 
 
 def face_eyes(rgb, landmarker):
@@ -946,7 +959,7 @@ def _closeup_route(rgb, seg, lm=None, limits=AN.LIMITS):
 
 
 # ------------------------------------------------------------------ главный вход
-def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmarker='auto'):
+def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmarker='auto', method=None):
     """Фото глаза (оттянутое нижнее веко) → dict. Уже вырезанная ткань не оценивается (stage 'mismatch'),
     ребёнок младше 5 лет или нераспознанный возраст — тоже (stage 'age', до загрузки модели и разбора фото).
     age — число лет, строка с числом ('30') или None (не указан). pregnant: True / False / None.
@@ -961,12 +974,17 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         crop, conj, sclera — вырезка и маски (для показа, anemia.predict.overlay).
     Модель взрослых выбирается по пригодным тканям (обе / только конъюнктива / только склера): каждая обучена
     и проверена на своих признаках, недостающая ткань ничем не подменяется.
-    landmarker — 'auto' (MediaPipe, если установлен), готовый детектор или None (без поиска лица)."""
+    landmarker — 'auto' (MediaPipe, если установлен), готовый детектор или None (без поиска лица).
+    method — метод, выбранный пользователем: 'conj' / 'sclera' / 'both' (METHODS) — используются только эти ткани
+    и модель для них; нужная ткань не найдена или непригодна → отказ с причиной, другой метод не подставляется.
+    None / 'auto' — как раньше (модель по пригодным тканям)."""
+    method = check_method(method)
     sex = _sex(sex)
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
          'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
-         'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None}
+         'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None,
+         'method': method or 'auto'}
     try:
         age = parse_age(age)                # дальше возраст — число или None (нормы ВОЗ, подростки)
     except ValueError as e:
@@ -1040,6 +1058,16 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         r['issues'].append('это уже вырезанная ткань, а модель взрослых обучена на снимках глаза целиком — '
                            'пришлите фото глаза с оттянутым нижним веком')
         return r
+    if method is not None:                  # выбор пользователя: только его ткани, без подмены другим методом
+        miss = [t for t in METHODS[method] if t not in good]
+        if miss:
+            r['stage'] = 'quality' if any(ts[t].startswith('плохое') for t in miss) else 'no_tissue'
+            r['tissues'] = []
+            r['issues'].append(f'выбран метод «{METHOD_RU[method]}», но '
+                               + '; '.join(f'{TISSUE_RU[t]}: {ts[t]}' for t in miss)
+                               + ' — другой метод не подставляется: переснимите или выберите другой метод')
+            return r
+        good = METHODS[method]
     key = ADULT_MODEL[good]
     if key not in bundle['models']:
         r['status'], r['stage'] = 'unreliable', 'no_model'
@@ -1071,12 +1099,17 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         return r
     r['status'], r['stage'], r['p_anemia'] = 'ok', 'ok', float(p)
     r['risk'] = CORE.RISK_LEVELS[int(lv)]
-    r['reasons'].append({'eyes_defy': 'оценено по цвету конъюнктивы и склеры; цвет века дополнительно нормирован '
-                                      'по белку глаза',
-                         'eyes_defy_conj': 'оценено только по цвету конъюнктивы (склера непригодна — без поправки '
-                                           'на свет по белку глаза)',
-                         'eyes_defy_sclera': 'оценено только по цвету склеры (конъюнктива непригодна); у этой '
-                                             'модели своя, отдельно проверенная точность — см. evaluate'}[key])
+    if method is not None:
+        r['reasons'].append(f'метод выбран пользователем: «{METHOD_RU[method]}» — оценено только по цвету '
+                            + ' и '.join({'conj': 'конъюнктивы', 'sclera': 'склеры'}[t] for t in good)
+                            + (' (цвет века нормирован по белку глаза)' if key == 'eyes_defy' else ''))
+    else:
+        r['reasons'].append({'eyes_defy': 'оценено по цвету конъюнктивы и склеры; цвет века дополнительно нормирован '
+                                          'по белку глаза',
+                             'eyes_defy_conj': 'оценено только по цвету конъюнктивы (склера непригодна — без поправки '
+                                               'на свет по белку глаза)',
+                             'eyes_defy_sclera': 'оценено только по цвету склеры (конъюнктива непригодна); у этой '
+                                                 'модели своя, отдельно проверенная точность — см. evaluate'}[key])
     cal = ('калибрована (Platt, вложенная CV на обучающих пациентах)' if B.get('cal') is not None else
            'НЕ калибрована: файл модели старше кода — перезапустите ячейку Я1')
     if 'cal' in B:
@@ -1112,6 +1145,8 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
 def format_result(r):
     """Текст результата для печати."""
     lines = [f"Статус: {STATUS_RU[r['status']]}", f"Модель: {r['model']}"]
+    if r.get('method') in METHOD_RU:
+        lines.append(f"Метод анализа: {METHOD_RU[r['method']]}")
     if r['kind']:
         lines.append(f"На снимке: {r['kind']}; глаз: {r['eye'] or 'не найден'}")
         lines += [f"  {TISSUE_RU[t]}: {v}" for t, v in r['tissue_status'].items()]
