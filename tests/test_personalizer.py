@@ -442,3 +442,32 @@ def test_exam_dev_regression():
     assert s["confused"] == 0 and s["invented_numbers"] == 0
     assert s["passed"]["p"] >= 0.95
     assert s["max_s"] < 1.0
+
+
+# ------------------------------------------- вопросы пользователя 2026-11-07
+@pytest.mark.parametrize(
+    "q, topic",
+    [
+        # короткие вопросы без слова «анемия» не должны отсекаться как «не по теме»
+        ("Насколько опасен мой уровень?", "explain_result"),
+        ("Сколько времени на восстановление?", "treatment_course"),
+        ("Почему мне постоянно хочется спать?", "fatigue"),
+        ("Можно ли мне долго гулять или ходить пешком?", "activity"),
+        # «если у меня анемия» — условие, а не просьба поставить диагноз
+        ("Что делать, если у меня анемия и я устаю?", None),
+        # новые темы
+        ("Какие побочные эффекты могут быть у препаратов железа?", "iron_side_effects"),
+        ("Что делать, если я забыла принять препарат железа?", "missed_dose"),
+        (
+            "Почему уровень гемоглобина не повышается, несмотря на лечение?",
+            "treatment_check",
+        ),
+    ],
+)
+def test_user_questions_2026_11_07(q, topic):
+    r = answer(q, facts())
+    assert r["mode"] not in ("out_of_scope", "urgent")
+    assert (r.get("trace") or {}).get("rule") != "diagnosis"
+    if topic:
+        assert topic in r["sources"]
+    assert not violations(r["text"], r["facts"], q)
