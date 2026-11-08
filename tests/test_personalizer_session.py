@@ -183,3 +183,26 @@ def test_ya6_cell_checks_the_knowledge_base(capsys):
     out = capsys.readouterr().out
     assert "Итог: ✅ ошибок нет" in out and "экзамен dev: пройдено 58/58" in out
     assert "тема tea" in out and "правило: доза" in out
+
+
+def test_ya5_cell_uses_neural_net_from_cell_n(monkeypatch, capsys):
+    answers = iter(["Со временем станет только хуже?", ""])
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers, ""))
+    src = (
+        _ya5_source()
+        .replace("Опрос = True", "Опрос = False")
+        .replace(
+            "Нейросеть_понимает_вопрос = False", "Нейросеть_понимает_вопрос = True"
+        )
+        .replace(
+            "Показывать_как_найден_ответ = False", "Показывать_как_найден_ответ = True"
+        )
+    )
+    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    exec(compile(src, "Я5", "exec"), dict(ns))  # noqa: S102 — без ячейки Н
+    assert "запустите ячейку Н" in capsys.readouterr().out
+    answers = iter(["Со временем станет только хуже?", ""])
+    ns["LLM"] = lambda messages, **kw: "can_worsen"
+    exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
+    out = capsys.readouterr().out
+    assert "нейросеть поняла вопрос: тема can_worsen" in out

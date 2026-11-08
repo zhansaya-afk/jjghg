@@ -98,12 +98,13 @@ def _kk(mode, why, question, facts):
 
 
 def rules_answer(
-    question, facts, history=None, retriever=None, force=None, search=None
+    question, facts, history=None, retriever=None, force=None, search=None, pick=None
 ):
     """Режим rules: без языковой модели. → {'text', 'mode', 'sources', 'lang', 'why', 'trace'}.
     force=(режим, причина) — маршрут уже решён снаружи (например, «А сколько?» после вопроса о железе).
     search — текст для поиска темы, если он не question: у «А при беременности?» тема — из прошлого вопроса.
-    trace — как найден ответ: правило маршрутизатора или лучшие темы поиска со сходством (для Я5 и Я6)."""
+    trace — как найден ответ: правило маршрутизатора или лучшие темы поиска со сходством (для Я5 и Я6).
+    pick — id темы, уже выбранной снаружи (нейросеть поняла перефразированный вопрос): поиск не нужен."""
     q = (question or "").strip()
     lang = lang_of(q)
     mode, why = route(q, facts, history)
@@ -156,6 +157,9 @@ def rules_answer(
         if not q:
             fr = _fragment(EXPLAIN)
             note("пустой вопрос: объяснение результата")
+        elif pick:
+            fr = _fragment(pick)
+            note(f"нейросеть поняла вопрос: тема {pick}")
         else:
             hits = (retriever or default_retriever("ru")).search(search or q, k=3)
             trace["search"] = [(h.id, round(sc, 2)) for h, sc in hits]
@@ -215,8 +219,10 @@ def rules_answer(
 
 
 def answer(question, facts, history=None, *, engine="rules", llm=None, retriever=None):
-    """Ответ на вопрос по карточке фактов. engine='llm' + llm=callable(messages)→str: модель только
-    переформулирует ответ режима rules; при любом нарушении стража остаётся ответ режима rules.
+    """Ответ на вопрос по карточке фактов. llm=callable(messages)→str — локальная модель:
+    engine='understand' — модель только выбирает тему базы для вопроса, который поиск не нашёл
+    (перефраз); ответ — проверенный текст базы. engine='llm' — то же + модель переформулирует ответ;
+    при любом нарушении стража остаётся ответ режима rules.
 
     Память разговора (только history этого запуска): уточнение «А для мужчин?» ищется вместе с прошлым
     вопросом (out['context']); сказанное о себе («я вегетарианка») меняет советы (out['facts'])."""
@@ -248,9 +254,49 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
             base["trace"],
             notes=[*base["trace"]["notes"], "«сколько» после вопроса о лекарстве"],
         )
+    picked = None
+    if (
+        engine in ("understand", "llm")
+        and llm is not None
+        and lost
+        and not clarify
+        and base["mode"] in ("out_of_scope", "dont_know")
+        and base["lang"] == "ru"
+    ):
+        # поиск по буквам не нашёл (перефраз, синонимы): модель выбирает тему по смыслу или «нет темы».
+        # Срочные признаки и отказы (дозы, препараты, диагноз, дети) решены правилами раньше: lost = why is None
+        from .generate import pick_topic
+
+        picked = pick_topic(llm, cq, load_kb("ru"))
+        if picked:
+            first = base["trace"]
+            why_lost = (
+                "слова вопроса не узнаны как тема анемии"
+                if base["mode"] == "out_of_scope"
+                else "поиск по словам не набрал порог"
+            )
+            force_mode = ("answer", None) if base["mode"] == "out_of_scope" else None
+            base = rules_answer(cq, facts, history, retriever, force_mode, pick=picked)
+            base["trace"] = dict(
+                base["trace"],
+                rule=None,
+                search=first["search"],
+                notes=[
+                    f"{why_lost}; нейросеть поняла вопрос: тема {picked}",
+                    *[
+                        n
+                        for n in base["trace"]["notes"]
+                        if not n.startswith("нейросеть")
+                    ],
+                ],
+            )
     question = cq
     out = dict(
-        base, engine="rules", guard={}, context=cq if cq != q else None, facts=facts
+        base,
+        engine="understand" if picked else "rules",
+        guard={},
+        context=cq if cq != q else None,
+        facts=facts,
     )
     if (
         engine == "llm"

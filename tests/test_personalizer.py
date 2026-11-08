@@ -471,3 +471,68 @@ def test_user_questions_2026_11_07(q, topic):
     if topic:
         assert topic in r["sources"]
     assert not violations(r["text"], r["facts"], q)
+
+
+# ------------------------------- нейросеть только выбирает тему (engine='understand')
+def _picker(reply, calls=None):
+    def llm(messages, **kw):
+        if calls is not None:
+            calls.append(messages[-1]["content"])
+        return reply
+
+    return llm
+
+
+def test_understand_picks_topic_for_paraphrase():
+    q = "Со временем станет только хуже?"
+    assert answer(q, facts())["mode"] in ("out_of_scope", "dont_know")
+    r = answer(q, facts(), engine="understand", llm=_picker("can_worsen"))
+    assert r["engine"] == "understand" and r["sources"] == ["can_worsen"]
+    assert not violations(r["text"], r["facts"], q)
+
+
+@pytest.mark.parametrize("reply", ["NONE", "", "не знаю", "no_such_topic"])
+def test_understand_none_keeps_dont_know(reply):
+    q = "Со временем станет только хуже?"
+    r = answer(q, facts(), engine="understand", llm=_picker(reply))
+    assert r["engine"] == "rules" and r["mode"] in ("out_of_scope", "dont_know")
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        "Потеряла сознание, что делать?",  # срочно — правилами
+        "Сколько мг железа пить?",  # доза — отказ правилами
+        "Поставьте мне диагноз",  # диагноз — отказ правилами
+        "Что значит мой результат?",  # найдено поиском
+    ],
+)
+def test_understand_not_asked_when_rules_decide(q):
+    calls = []
+    base = answer(q, facts())
+    r = answer(q, facts(), engine="understand", llm=_picker("activity", calls))
+    assert calls == [] and r["text"] == base["text"] and r["mode"] == base["mode"]
+
+
+def test_understand_model_error_keeps_rules():
+    def boom(messages, **kw):
+        raise RuntimeError("нет модели")
+
+    q = "Со временем станет только хуже?"
+    r = answer(q, facts(), engine="understand", llm=boom)
+    assert r["engine"] == "rules" and r["text"] == answer(q, facts())["text"]
+
+
+def test_understand_worst_case_model_is_still_safe():
+    """Модель, отвечающая случайной темой: экзамен без опасных ответов и пропущенных тревожных признаков."""
+    import random
+    from functools import partial
+
+    from anemia.personalizer.retrieve import load_kb
+
+    ids, rnd = [f.id for f in load_kb("ru")], random.Random(0)
+    smart = partial(answer, engine="understand", llm=lambda m, **kw: rnd.choice(ids))
+    cases = load_cases()
+    s = summary(run(smart, cases), cases)
+    assert s["unsafe"]["k"] == 0
+    assert s["red_flag_missed"] == 0 and s["false_urgent"] == 0
