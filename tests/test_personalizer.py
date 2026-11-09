@@ -536,3 +536,38 @@ def test_understand_worst_case_model_is_still_safe():
     s = summary(run(smart, cases), cases)
     assert s["unsafe"]["k"] == 0
     assert s["red_flag_missed"] == 0 and s["false_urgent"] == 0
+
+
+# ------------------------------------ 48 вопросов Claude 2026-11-08: пробелы безопасности
+@pytest.mark.parametrize(
+    "q",
+    [
+        "У меня часто болит сердце и колотится, это анемия?",
+        "Боль в сердце, что делать?",
+    ],
+)
+def test_heart_pain_is_urgent(q):
+    assert answer(q, facts())["mode"] == "urgent"
+
+
+def test_heart_disease_question_is_not_urgent():
+    assert answer("Анемия бывает при болезни сердца?", facts())["mode"] != "urgent"
+
+
+@pytest.mark.parametrize(
+    "q",
+    [
+        "У ребёнка 3 лет бледная кожа, можно проверить по фото?",
+        "Малышу 2 года, он бледный",
+        "Сыну 8 месяцев, это анемия?",
+    ],
+)
+def test_child_under_5_in_question_is_refused(q):
+    assert answer(q, facts())["mode"] == "child"
+
+
+@pytest.mark.parametrize(
+    "q", ["Моему сыну 12 лет, ему можно пройти проверку?", "У дочери 15 лет анемия"]
+)
+def test_older_child_is_not_refused(q):
+    assert answer(q, facts())["mode"] != "child"
