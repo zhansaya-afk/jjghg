@@ -124,8 +124,9 @@ def analyze_series(photos, sex=None, age=None, pregnant=None, bundle=None, landm
     n_ok = len(used)
     out['n_used'] = n_ok
     if n_ok < min_ok:
-        out['issues'].append(f'принято {n_ok} из {out["n_photos"]} фото, нужно не меньше {min_ok} — переснимите '
-                             'при дневном свете')
+        out['issues'].append((f'ни одно из {out["n_photos"]} фото не принято' if n_ok == 0 else
+                              f'принято {n_ok} из {out["n_photos"]} фото, нужно не меньше {min_ok}')
+                             + ' — переснимите при дневном свете')
         out['issues'] += [f'фото № {row["n"]}: {row["why"]}' for row in out['per_photo'] if row['why']]
         return out
     B = bundle['models'][key]
