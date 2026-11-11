@@ -151,3 +151,45 @@ def test_build_ui(backend):
     for b in (backend, V.Backend(error='нет модели')):
         demo = ui.build(backend=b)
         assert isinstance(demo, gr.Blocks)
+
+
+# ------------------------------------------------------------------ редизайн: технические цифры только для врача
+def _ratio(a, b):
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_palette_contrast():
+    """WCAG AA: обычный текст ≥ 4,5:1 — основные пары цветов темы и уровней риска."""
+    from app.hemavision import theme as T
+    pairs = [(T.INK, '#ffffff'), (T.MUTED, '#ffffff'), (T.MUTED, T.BG), ('#ffffff', T.ACCENT),
+             ('#ffffff', T.ACCENT_DARK), ('#166534', '#f0fdf4'), ('#92400e', '#fffbeb'), ('#b91c1c', '#fef2f2'),
+             ('#334155', '#f1f5f9'), ('#ffffff', '#166534'), ('#ffffff', '#92400e'), ('#ffffff', '#b91c1c')]
+    for fg, bg in pairs:
+        assert _ratio(fg, bg) >= 4.5, (fg, bg, round(_ratio(fg, bg), 2))
+
+
+def test_user_cards_have_no_technical_numbers_doctor_section_has_disclaimer(backend, monkeypatch):
+    _route(monkeypatch, {'conj', 'sclera'})
+    r, res = V.run_analysis(_jpeg(synthetic_eye()[0]), V.Survey(sex='F', age=30), backend)
+    assert r['status'] == 'ok'
+    user = V.risk_card_html(r) + V.hb_html(r) + V.summary_html(r, res) + V.quality_html(res)
+    for tech in ('P(анемия)', 'MAE', 'CV', 'Platt', 'порог', 'AUC'):
+        assert tech not in user, tech
+    doc = V.doctor_html(r, backend.version)
+    assert 'не клиническая валидация' in doc and 'P(анемия)' in doc and backend.version in doc
+    assert V.CV_NOTE in V.report_text(r, V.Survey(), backend.version)
+
+
+def test_states_markup():
+    assert 'role="status"' in V.loading_html() and 'Идёт анализ' in V.loading_html()
+    err = V.error_html(ValueError('сбой'))
+    assert 'РИСК НЕ ОПРЕДЕЛЁН' in err and 'сбой' in err and 'г/л' not in err
+    assert V.legend_html(False, False) == '' and 'голубой' in V.legend_html(True, False)
+    assert 'Готово к работе' in V.model_status_html(V.Backend(version='v'))
+    for name in V.ICONS:
+        assert V.icon(name).startswith('<span class="hv-ic" aria-hidden="true"><svg')
