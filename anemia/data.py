@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from .labs import is_anemic, is_pregnant, norm_pregnant, who_grade
+from .labs import HB_PLAUSIBLE, is_anemic, is_pregnant, norm_pregnant, who_grade
 
 COLUMNS = ['dataset', 'patient_id', 'group', 'image', 'mask_conj', 'hb_g_l', 'sex', 'age', 'pregnant',
            'population', 'anemic', 'grade', 'sha1', 'dhash', 'fold']
@@ -164,6 +164,18 @@ def assign_folds(df, n_folds=N_FOLDS, seed=0):
     return fold.astype(int)
 
 
+def check_hb_units(df):
+    """Hb манифеста — в г/л: вне HB_PLAUSIBLE (30–250 г/л) почти наверняка другая единица или опечатка (12,5 г/дл
+    в колонке hb_g_l дала бы «тяжёлую анемию»). Молча не исправляем: ошибка с ID пациентов."""
+    lo, hi = HB_PLAUSIBLE
+    bad = df[(df.hb_g_l < lo) | (df.hb_g_l > hi)]
+    if len(bad):
+        ex = ', '.join(f'{p}: {h:g}' for p, h in zip(bad.patient_id[:5], bad.hb_g_l[:5]))
+        hint = (' — похоже на г/дл: умножьте на 10' if (bad.hb_g_l < lo).all() and (bad.hb_g_l >= 3).all() else '')
+        raise ValueError(f'Hb вне {lo:.0f}–{hi:.0f} г/л у {len(bad)} снимков ({ex}){hint}. Hb в манифесте — в г/л '
+                         '(Eyes-defy: из г/дл ×10; phone/hb.csv: колонка hb_g_l — в г/л)')
+
+
 def build_manifest(root, datasets=None, n_folds=N_FOLDS, seed=0):
     parts = []
     for name, (marker, loader) in LOADERS.items():
@@ -177,6 +189,7 @@ def build_manifest(root, datasets=None, n_folds=N_FOLDS, seed=0):
     df = pd.concat(parts, ignore_index=True)
     df['pregnant'] = df.pregnant.map(norm_pregnant).astype(object)     # None = неизвестно
     df = df[df.image.notna() & df.hb_g_l.notna()].reset_index(drop=True)
+    check_hb_units(df)
     exists = df.image.map(lambda p: os.path.exists(os.path.join(root, p)))
     if (~exists).any():
         print(f'⚠️ нет файлов: {(~exists).sum()} (пропущены), напр. {df.image[~exists].iloc[0]}')
