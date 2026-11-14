@@ -95,7 +95,7 @@ def test_no_interactive_input_ends_cleanly():
 
 
 def test_from_notebook_refuses_mixed_profiles():
-    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет",
+    ns = {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет"),
           "lab": {"hb_g_l": 104}, "Пол_анализ": "Мужской", "Возраст_анализ": 32, "Беременность_анализ": "Нет"}  # fmt: skip
     said = []
     assert from_notebook(ns, "Фото и анализ", say=said.append) is None
@@ -124,10 +124,26 @@ def _ya5_source():
 def test_ya5_cell_runs_on_ya2_variables(monkeypatch, capsys):
     answers = iter(["нет", "нет", "нет", "да", "нет", "Что такое ферритин?", ""])
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers, ""))
-    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    ns = {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет")}
     exec(compile(_ya5_source(), "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out
     assert "По фото риск анемии высокий" in out and "Ферритин" in out
+
+
+def test_ya5_keeps_ya2_profile_after_ya2s(monkeypatch, capsys):
+    """Я2 → Я2с → Я5: Я2с перезаписывает Пол / Возраст / Беременность, Я5 берёт профиль из Я2."""
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "")
+    ya2 = _cell("Ячейка Я2 —").splitlines()
+    run_at = next(i for i, s in enumerate(ya2) if s.startswith("r = analyze_photo("))
+    keep = next(s for s in ya2 if s.startswith("профиль_Я2 ="))
+    assert ya2.index(keep) > run_at  # профиль запоминается вместе с результатом Я2
+    ns = {"r": PHOTO, "Пол": "Мужской", "Возраст": 45, "Беременность": "Нет"}  # поля Я2
+    exec(keep, ns)  # noqa: S102 — строка ячейки Я2
+    ns.update({"Пол": "Женский", "Возраст": 4, "Беременность": "Да"})  # затем Я2с с другими полями
+    exec(compile(_ya5_source(), "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
+    out = capsys.readouterr().out
+    assert ns["_"]["facts"]["profile"] == {"sex": "M", "age": 45, "pregnant": False}
+    assert "По фото риск анемии высокий" in out and "младше 5" not in out and "беремен" not in out
 
 
 @pytest.mark.parametrize("what", ["Анализ крови (Я3)", "Фото и анализ"])
@@ -137,7 +153,7 @@ def test_ya5_cell_without_ya3_says_what_to_run(what, capsys):
     )
     exec(  # noqa: S102 — код ячейки блокнота
         compile(src, "Я5", "exec"),
-        {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"},
+        {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет")},
     )
     assert "Я3" in capsys.readouterr().out
 
@@ -169,7 +185,7 @@ def test_ya5_cell_shows_how_answer_was_found(monkeypatch, capsys):
             "Показывать_как_найден_ответ = False", "Показывать_как_найден_ответ = True"
         )
     )
-    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    ns = {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет")}
     exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out
     assert "🔎 поиск: тема" in out and "порога" in out
@@ -198,7 +214,7 @@ def test_ya5_cell_uses_neural_net_from_cell_n(monkeypatch, capsys):
             "Показывать_как_найден_ответ = False", "Показывать_как_найден_ответ = True"
         )
     )
-    ns = {"r": PHOTO, "Пол": "Женский", "Возраст": 32, "Беременность": "Нет"}
+    ns = {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет")}
     exec(compile(src, "Я5", "exec"), dict(ns))  # noqa: S102 — без ячейки Н
     assert "запустите ячейку Н" in capsys.readouterr().out
     answers = iter(["Со временем станет только хуже?", ""])

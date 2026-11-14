@@ -131,8 +131,9 @@ def chat(
 def from_notebook(
     ns, what="Фото (Я2)", survey=True, lang="ru", ask=None, say=None, debug=False, **kw
 ):
-    """Ячейка Я5: берёт результат Я2 (r, Пол, Возраст, Беременность) и/или Я3 (lab, Пол_анализ, …) из
-    переменных блокнота ns. Если профили Я2 и Я3 различаются — не смешивает их, а просит исправить."""
+    """Ячейка Я5: берёт результат Я2 (r и профиль_Я2 — поля формы Я2 на момент расчёта) и/или Я3 (lab,
+    Пол_анализ, …) из переменных блокнота ns. Профиль фото — только из профиль_Я2: общие Пол / Возраст /
+    Беременность перезаписывает Я2с. Если профили Я2 и Я3 различаются — не смешивает их, а просит исправить."""
     say = say or (lambda text: print(text))
     load_kb.cache_clear()  # правки kb/ru.md в этом сеансе Colab вступают в силу без перезапуска
     default_retriever.cache_clear()
@@ -145,7 +146,10 @@ def from_notebook(
     if use_lab and blood is None:
         say("Нет анализа крови: сначала запустите ячейку Я3.")
         return None
-    p2 = profile_from_form(ns.get("Пол"), ns.get("Возраст"), ns.get("Беременность"))
+    if use_photo and ns.get("профиль_Я2") is None:
+        say("Нет профиля к результату фото: перезапустите ячейку Я2.")
+        return None
+    p2 = profile_from_form(*ns["профиль_Я2"]) if use_photo else None
     p3 = profile_from_form(
         ns.get("Пол_анализ"), ns.get("Возраст_анализ"), ns.get("Беременность_анализ")
     )
