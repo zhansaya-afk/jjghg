@@ -1,14 +1,16 @@
-"""AI Personalizer для интерфейса HemaVision: интерфейс, офлайн-адаптер движка правил и заглушка.
+"""AI Personalizer для интерфейса HemaVision: интерфейс, офлайн-адаптер движка правил, заглушка и диалог.
 
 UI работает только через Personalizer.reply(PersonalizerInput) → PersonalizerReply, поэтому движок подключается
 одним адаптером (класс с тем же методом) без правки экранов: build(personalizer=МойАдаптер()).
 RulesPersonalizer — движок anemia.personalizer (правила + база знаний): работает офлайн, без сети и языковых моделей.
 
 Правила для любого адаптера: ответ анкеты не меняет риск по фото; без диагнозов, названий препаратов и доз;
-фото в адаптер не передаётся (только поля результата analyze_photo).
+фото в адаптер не передаётся (только поля результата analyze_photo). Анализ крови — отдельный блок lab
+(labs.lab_hb_report, как Я3): с прогнозом Hb по фото не смешивается и его не меняет.
+Диалог (ask): вопросы и ответы этой сессии интерфейса передаются движку как history — так же, как в Я5.
 Ключи самочувствия совпадают с опросом персонализатора: weakness, blood_loss, meat_fish (True / False / None).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 WELLBEING = (   # (ключ, вопрос) — ключи как в опросе персонализатора
@@ -33,6 +35,8 @@ class PersonalizerInput:
     p_anemia: float | None = None       # вероятность анемии по фото; None всегда, если оценки нет
     tissues: tuple = ()                 # ткани, по которым оценено: ('conj',), ('sclera',), ('conj', 'sclera')
     issues: tuple = ()                  # причины, почему снимок не подошёл (тексты analyze_photo)
+    lab: dict | None = None             # готовый анализ крови: dict labs.lab_hb_report (как Я3) или None
+    history: tuple = ()                 # прошлые реплики диалога: ({'role': 'user'|'assistant', 'text': ...}, ...)
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,8 @@ class RulesPersonalizer:
         profile = {'sex': inp.sex, 'age': inp.age, 'pregnant': inp.pregnant}
         survey = dict(inp.wellbeing) if inp.wellbeing else None
         try:
-            out = personalize(result, None, profile, survey, question=inp.question or None)
+            out = personalize(result, inp.lab, profile, survey, question=inp.question or None,
+                              history=list(inp.history) or None)
         except Exception:   # noqa: BLE001 — ошибка движка не должна ломать экран результата
             return PersonalizerReply(title='AI Personalizer', available=False, source=self.name,
                                      text=('Объяснение сейчас недоступно. Результат по фото выше не изменился; '
@@ -94,8 +99,9 @@ class RulesPersonalizer:
         return PersonalizerReply(title=title, text=out['text'], available=True, source=self.name)
 
 
-def make_input(r, survey):
-    """Результат analyze_photo + анкета (view.Survey) → PersonalizerInput. Без оценки — без риска, P и Hb.
+def make_input(r, survey, lab=None):
+    """Результат analyze_photo + анкета (view.Survey) [+ анализ крови lab_hb_report] → PersonalizerInput.
+    Без оценки по фото — без риска, P и Hb по фото (анализ крови при этом остаётся: это отдельный путь).
     Фото и картинки (crop, маски) не передаются: только поля результата."""
     ok = r.get('status') == 'ok'
     p = r.get('p_anemia')
@@ -105,4 +111,43 @@ def make_input(r, survey):
                              wellbeing=dict(survey.wellbeing), stage=r.get('stage'),
                              p_anemia=float(p) if ok and p is not None else None,
                              tissues=tuple(r.get('tissues') or ()) if ok else (),
-                             issues=tuple(str(x) for x in r.get('issues') or ()))
+                             issues=tuple(str(x) for x in r.get('issues') or ()), lab=lab)
+
+
+# ------------------------------------------------------------------ диалог (как ячейка Я5, но в интерфейсе)
+MAX_TURNS = 30                          # вопросов за одну проверку (как session.chat в Я5)
+MAX_QUESTION = 500                      # символов в одном вопросе: длиннее — обрезается
+LIMIT_TEXT = ('Лимит вопросов для этой проверки исчерпан. Начните новую проверку или обсудите вопросы с врачом: '
+              'окончательный ответ дают анализ крови и врач.')
+
+
+def start_history(reply):
+    """История диалога после первого объяснения (как в Я5: «Что значит мой результат?» → объяснение).
+    Объяснение недоступно (заглушка, ошибка) → пустая история."""
+    from anemia.personalizer.session import TEXT
+    if not reply.available:
+        return ()
+    return ({'role': 'user', 'text': TEXT['ru']['explain'], 'intro': True},
+            {'role': 'assistant', 'text': reply.text, 'intro': True})
+
+
+def ask(personalizer, inp, history, question):
+    """Один вопрос в диалоге → (PersonalizerReply | None, новая история). Пустой вопрос → (None, та же история).
+    Контекст — только история этой проверки; риск, Hb и анализ крови из inp не меняются. Язык ответа — язык
+    вопроса (русский или казахский), правила безопасности (срочно, дети, дозы, диагноз) — движка."""
+    q = ' '.join(str(question or '').split())[:MAX_QUESTION]
+    history = tuple(history or ())
+    if not q:
+        return None, history
+    if sum(m['role'] == 'user' and not m.get('intro') for m in history) >= MAX_TURNS:
+        return PersonalizerReply(title='AI Personalizer', text=LIMIT_TEXT, available=False,
+                                 source=getattr(personalizer, 'name', '?')), history
+    rep = personalizer.reply(replace(inp, question=q, history=history))
+    if not rep.available:               # ошибка или заглушка: в историю не записываем
+        return rep, history
+    return rep, history + ({'role': 'user', 'text': q}, {'role': 'assistant', 'text': rep.text})
+
+
+def chat_messages(history):
+    """История → сообщения gr.Chatbot. Первое объяснение (intro) показано карточкой выше, в чате только вопросы."""
+    return [{'role': m['role'], 'content': m['text']} for m in history if not m.get('intro')]

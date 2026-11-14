@@ -1,7 +1,8 @@
 """Раскладка интерфейса HemaVision (Gradio 6): мастер из 5 экранов.
 
-Главная → Фото → Анкета → Анализ → Результат (+ блок AI Personalizer). Экраны — колонки, видна одна;
-логика отображения — view.py, персонализатор — personalizer.py. Добавить экран: колонка в SCREENS + кнопки.
+Главная → Фото → Анкета (+ готовый анализ крови, необязательно) → Анализ → Результат (+ AI Personalizer:
+объяснение и диалог). Экраны — колонки, видна одна; логика отображения — view.py, персонализатор и диалог —
+personalizer.py. Добавить экран: колонка в SCREENS + кнопки.
 """
 import inspect
 import os
@@ -9,7 +10,15 @@ import tempfile
 import time
 
 from . import view as V
-from .personalizer import WELLBEING, Personalizer, RulesPersonalizer, make_input
+from .personalizer import (
+    WELLBEING,
+    Personalizer,
+    RulesPersonalizer,
+    ask,
+    chat_messages,
+    make_input,
+    start_history,
+)
 from .theme import CSS, LIGHT_JS, theme
 
 assert len(WELLBEING) == 3, 'run() принимает 3 ответа о самочувствии — поправьте сигнатуру'
@@ -32,6 +41,11 @@ PHOTO_HELP = ('<p class="hv-small">Нажмите на поле, чтобы вы
               'галерею или камеру — это зависит от телефона и браузера. Значок камеры под полем включает камеру '
               'браузера (удобно на ноутбуке; на телефоне снимок обычно хуже, чем в приложении «Камера»).</p>')
 MIN_COL = 320               # px: уже — колонки ряда встают друг под другом (телефон, узкий планшет)
+LAB_HELP = ('<p class="hv-small">Только если у вас есть готовый общий анализ крови. Число — как в бланке '
+            '(например, 12,5 при единице г/дл). Анализ показывается <b>отдельно</b> и <b>не меняет</b> оценку по '
+            'фото. Пусто — без анализа.</p>')
+CHAT_HELP = ('<p class="hv-small">Вопросы об анемии и о вашем результате: можно писать по-русски или по-казахски. '
+             'Ответы — из проверенной базы знаний, офлайн; диагноз, лекарства и дозы не обсуждаются.</p>')
 
 
 def _home_steps():
@@ -75,7 +89,8 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
     with gr.Blocks(title='HemaVision — скрининг риска анемии', elem_classes='hv-app', analytics_enabled=False,
                    **blocks_kw) as demo:
         demo.hv_launch_kwargs = launch_kw
-        state = gr.State(None)            # {'r': dict analyze_photo, 'survey': Survey}
+        state = gr.State(None)            # {'r': dict analyze_photo, 'survey': Survey, 'lab': dict | None}
+        chat_state = gr.State(None)       # {'inp': PersonalizerInput, 'history': tuple} — диалог этой проверки
         stepper = gr.HTML('')
 
         # ---------------------------------------------------------------- 0. Главная
@@ -118,6 +133,12 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                         gr.HTML('<p class="hv-small">Ответы попадут в отчёт для врача. <b>На оценку риска по фото '
                                 'они не влияют.</b></p>')
                         answers = [gr.Radio(list(V.ANSWER), value='Не знаю', label=q) for _, q in WELLBEING]
+                    with gr.Accordion('Анализ крови (если есть, необязательно)', open=False):
+                        gr.HTML(LAB_HELP)
+                        lab_value = gr.Textbox(label='Гемоглобин из анализа', placeholder='например, 125 или 12,5',
+                                               max_lines=1)
+                        lab_unit = gr.Radio(list(V.LAB_UNITS), value=V.LAB_UNITS[0], label='Единица')
+                        lab_msg = gr.HTML()
                     with gr.Accordion('Для специалиста: ткань для оценки', open=False):
                         method = gr.Radio(list(V.METHOD), value='Авто', label='Ткань',
                                           info='«Авто» — как в ядре: обе ткани пригодны → модель обеих, иначе по '
@@ -151,12 +172,17 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                 with gr.Column(min_width=MIN_COL):
                     risk_card = gr.HTML()
                     hb_card = gr.HTML()
+                    lab_card = gr.HTML(visible=False)
                     summary = gr.HTML()
                 with gr.Column(min_width=MIN_COL):
                     quality_card = gr.HTML()
                     p_card = gr.HTML()
-                    gr.Textbox(label='Вопрос к AI Personalizer', placeholder='Будет доступно в следующей версии',
-                               interactive=False)
+                    chatbot = gr.Chatbot(label='Диалог с AI Personalizer', height=320,
+                                         placeholder='Задайте вопрос о результате или об анемии')
+                    question = gr.Textbox(label='Вопрос к AI Personalizer', max_lines=3,
+                                          placeholder='Например: «Что такое ферритин?» или «Ферритин деген не?»')
+                    send = gr.Button('Спросить', size='lg')
+                    gr.HTML(CHAT_HELP)
             with gr.Accordion('Для врача: технические сведения', open=False):
                 doctor = gr.HTML()
             gr.HTML(DISCLAIMER_HTML)
@@ -178,6 +204,14 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
         def on_sex(s):
             return gr.update(visible=s != 'Мужской', value='Не указано')
 
+        def check_lab(s, a, pr, lab_v, lab_u):
+            """Ошибка ввода анализа крови → исправить на шаге «Анкета», не молча пропустить. Отдельное событие с
+            одним выходом: gr.Error останавливает цепочку и не трогает поля анкеты."""
+            _, err = V.parse_lab(lab_v, lab_u, V.parse_survey(s, a, pr, 'Авто'))
+            if err:
+                raise gr.Error(f'Анализ крови: {err}. Исправьте число или единицу либо очистите поле.')
+            return ''
+
         def on_analyze(p):
             if not p:                   # gr.Error останавливает цепочку: анализ без фото не запускается
                 raise gr.Error('Нет фото: вернитесь на шаг «Фото».')
@@ -185,8 +219,9 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                                        gr.update(visible=False), gr.update(interactive=False),
                                        gr.update(interactive=False)]
 
-        def run(p, s, a, pr, m, w1, w2, w3):
+        def run(p, s, a, pr, m, lab_v, lab_u, w1, w2, w3):
             survey = V.parse_survey(s, a, pr, m, (w1, w2, w3))
+            lab, lab_err = V.parse_lab(lab_v, lab_u, survey)
             t0 = time.time()
             try:
                 r, res = V.run_analysis(p, survey, backend)
@@ -198,31 +233,50 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                 res, err = None, e
             dt_s = time.time() - t0
             crop, face = V.overlays(r) if res is not None else (None, None)
-            reply = personalizer.reply(make_input(r, survey))
+            inp = make_input(r, survey, lab)
+            reply = personalizer.reply(inp)
             path = os.path.join(tempfile.mkdtemp(), 'hemavision_report.txt')
             with open(path, 'w', encoding='utf-8') as f:
-                f.write(V.report_text(r, survey, backend.version) if res is not None else
+                f.write(V.report_text(r, survey, backend.version, lab) if res is not None else
                         'Анализ не выполнен: ' + '; '.join(r['issues']) + '\n')
+            lab_h = V.lab_html(lab, lab_err)
             return (V.pipeline_html(r, dt_s),
                     gr.update(value=crop, visible=crop is not None), gr.update(value=face, visible=face is not None),
                     gr.update(visible=crop is not None or face is not None, value=V.legend_html(crop is not None,
                                                                                                face is not None)),
                     V.risk_card_html(r) if err is None else V.error_html(err),
-                    gr.update(value=V.hb_html(r), visible=bool(V.hb_html(r))),
+                    gr.update(value=V.hb_html(r), visible=bool(V.hb_html(r))), gr.update(value=lab_h, visible=bool(lab_h)),
                     V.quality_html(res) if res is not None else '', V.summary_html(r, res),
                     _personalizer_html(reply), V.doctor_html(r, backend.version), gr.update(value=path, visible=True),
-                    {'r': r, 'survey': survey}, gr.update(interactive=True), gr.update(interactive=True))
+                    {'r': r, 'survey': survey, 'lab': lab}, {'inp': inp, 'history': start_history(reply)}, [], '',
+                    gr.update(interactive=True), gr.update(interactive=True))
 
-        inputs = [photo, sex, age, preg, method, *answers]
+        def on_ask(q, chat):
+            if not chat:
+                gr.Warning('Сначала проанализируйте фото.')
+                return gr.update(), q, chat
+            rep, history = ask(personalizer, chat['inp'], chat['history'], q)
+            if rep is None:             # пустой вопрос
+                return gr.update(), '', chat
+            if not rep.available:       # лимит, ошибка движка или заглушка: ответ виден, в историю не идёт
+                return chat_messages(history) + [{'role': 'user', 'content': q},
+                                                 {'role': 'assistant', 'content': rep.text}], '', chat
+            return chat_messages(history), '', {**chat, 'history': history}
+
+        inputs = [photo, sex, age, preg, method, lab_value, lab_unit, *answers]
         start.click(lambda: show('photo'), None, screens)
         back1.click(lambda: show('home'), None, screens)
         next1.click(on_next_photo, photo, screens + [photo_msg])
         photo.change(lambda p: '' if p else gr.update(), photo, photo_msg)
         sex.change(on_sex, sex, preg)
         back2.click(lambda: show('photo'), None, screens)
-        go.click(on_analyze, photo, screens + [pipeline, crop_img, face_img, legend, to_result, go]).success(
-            run, inputs, [pipeline, crop_img, face_img, legend, risk_card, hb_card, quality_card, summary, p_card, doctor,
-                          report, state, to_result, go], show_progress='hidden')
+        go.click(check_lab, [sex, age, preg, lab_value, lab_unit], lab_msg).success(
+            on_analyze, photo, screens + [pipeline, crop_img, face_img, legend, to_result, go]).success(
+            run, inputs, [pipeline, crop_img, face_img, legend, risk_card, hb_card, lab_card, quality_card, summary,
+                          p_card, doctor, report, state, chat_state, chatbot, question, to_result, go],
+            show_progress='hidden')
+        send.click(on_ask, [question, chat_state], [chatbot, question, chat_state])
+        question.submit(on_ask, [question, chat_state], [chatbot, question, chat_state])
         back3.click(lambda: show('survey'), None, screens)
         to_result.click(lambda: show('result'), None, screens)
         again.click(lambda: show('photo') + [None], None, screens + [photo])

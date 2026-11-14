@@ -7,13 +7,16 @@ predict.RISK_TEXT; контуры масок — predict.overlay / overlay_photo
 - нет оценки (status ≠ 'ok') → ни уровня, ни P, ни Hb, только причина и что сделать;
 - Hb — только при status 'ok' и только если модель Hb прошла проверку (hb_range не None), с пометкой
   «экспериментально»;
-- советы — только существующие тексты ядра (RISK_TEXT, сообщения проверок) и «сдайте общий анализ крови».
+- советы — только существующие тексты ядра (RISK_TEXT, сообщения проверок) и «сдайте общий анализ крови»;
+- готовый анализ крови — anemia.labs.lab_hb_report (как ячейка Я3): отдельная карточка «лабораторный», с
+  прогнозом Hb по фото не смешивается и риск по фото не меняет.
 """
 import datetime as dt
 import html
 from dataclasses import dataclass, field
 
 from anemia import api as API
+from anemia import labs as LABS
 from anemia import predict as PR
 
 SEX = {'Женский': 'F', 'Мужской': 'M', 'Не указан': None}
@@ -21,6 +24,8 @@ PREG = {'Не указано': None, 'Нет': False, 'Да': True}
 METHOD = {'Авто': None, 'Конъюнктива': 'conj', 'Склера': 'sclera', 'Обе ткани': 'both'}
 ANSWER = {'Да': True, 'Нет': False, 'Не знаю': None}
 BLOOD_TEST = 'Точно уровень гемоглобина показывает только общий анализ крови.'
+LAB_UNITS = ('г/л', 'г/дл', 'ммоль/л')     # как в Я3; пересчёт и проверка — labs.hb_to_g_l
+LAB_SEPARATE = 'Показан отдельно от оценки по фото и не меняет её.'
 
 LEVEL = {   # уровень → (css-класс, значок, подпись) — значок и подпись дублируют цвет
     'низкий': ('low', 'check', 'НИЗКИЙ РИСК'),
@@ -63,6 +68,19 @@ def parse_survey(sex, age, pregnant, method, answers=()):
     age = None if age is None or age == '' else float(age)
     return Survey(sex=s, age=age, pregnant=PREG.get(pregnant) if s != 'M' else None, method=METHOD.get(method),
                   wellbeing={k: ANSWER.get(a) for (k, _), a in zip(WELLBEING, answers)})
+
+
+def parse_lab(value, unit, survey):
+    """Поле «Гемоглобин из анализа» → (lab | None, ошибка | None). Пусто — анализа нет (не ошибка).
+    Пересчёт единиц, проверка правдоподобия и нормы ВОЗ — labs.lab_hb_report (как Я3), с полом, возрастом и
+    беременностью из той же анкеты, что и фото."""
+    v = '' if value is None else str(value).strip()
+    if not v:
+        return None, None
+    try:
+        return LABS.lab_hb_report(v, unit or None, sex=survey.sex, age=survey.age, pregnant=survey.pregnant), None
+    except ValueError as e:
+        return None, f'{e}'
 
 
 # ------------------------------------------------------------------ модель и анализ
@@ -243,11 +261,26 @@ def hb_html(r):
         return ''
     if r.get('hb_range'):
         lo, hi = r['hb_range']
-        return (f'<div class="hv-card"><h3>{icon("drop")} Ориентировочный гемоглобин <span class="hv-tag">экспериментально'
-                f'</span></h3><p class="hv-hb">{lo:.0f}–{hi:.0f} <small>г/л</small></p><p class="hv-small">Это грубый '
+        return (f'<div class="hv-card"><h3>{icon("drop")} Ориентировочный гемоглобин по фото <span class="hv-tag">'
+                f'экспериментально</span></h3><p class="hv-hb">{lo:.0f}–{hi:.0f} <small>г/л</small></p><p class="hv-small">Это грубый '
                 f'ориентир по цвету на фото, а не результат анализа. {BLOOD_TEST}</p></div>')
     return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин</h3><p class="hv-small">По этому фото цифра гемоглобина '
             f'не показывается: модель Hb пока недостаточно точна. {BLOOD_TEST}</p></div>')
+
+
+def lab_html(lab, error=None):
+    """Карточка готового анализа крови (лабораторный Hb). Ничего не введено → пустая строка; ошибка ввода →
+    предупреждение без цифр. Всегда помечена как анализ крови, отдельно от прогноза по фото."""
+    if error:
+        return note_html('warn', f'<b>Анализ крови не учтён:</b> {_e(error)}. Проверьте число и единицу.')
+    if not lab:
+        return ''
+    grade = lab['grade_ru'] if lab['anemic'] else 'в пределах нормы'
+    return (f'<div class="hv-card hv-lab"><h3>{icon("clipboard")} Гемоглобин из анализа крови <span class="hv-tag">'
+            f'лабораторный</span></h3><p class="hv-hb">{lab["hb_g_l"]:.0f} <small>г/л</small></p>'
+            f'<p><b>{_e(_cap(grade))}</b> по нормам ВОЗ ({_e(lab["group"])}: норма от {lab["normal_from_g_l"]:.0f} г/л).'
+            f'</p><p class="hv-small">Это ваш результат анализа, введённый вручную. {LAB_SEPARATE} Диагноз ставит врач.'
+            '</p></div>')
 
 
 def quality_html(res):
@@ -324,8 +357,9 @@ def reasons_md(r):
     return '\n'.join(lines) if lines else '—'
 
 
-def report_text(r, survey, backend_version=''):
-    """Отчёт для врача (.txt): результат ядра (predict.format_result) + анкета со слов пользователя."""
+def report_text(r, survey, backend_version='', lab=None):
+    """Отчёт для врача (.txt): результат ядра (predict.format_result) + анкета со слов пользователя
+    [+ анализ крови, введённый пользователем: отдельным разделом, не смешивая с оценкой по фото]."""
     ru = {True: 'да', False: 'нет', None: 'не указано'}
     from .personalizer import WELLBEING
     head = ['HemaVision — отчёт скрининга риска анемии по фото глаза (не диагноз)',
@@ -335,5 +369,7 @@ def report_text(r, survey, backend_version=''):
              f'возраст: {"не указан" if survey.age is None else f"{survey.age:g}"}; беременность: {ru[survey.pregnant]}'),
             f'  ткань: {PR.METHOD_RU.get(survey.method, "Авто")}']
     head += [f'  {q} — {ru[survey.wellbeing.get(k)]}' for k, q in WELLBEING]
-    head += ['  (ответы о самочувствии на оценку риска по фото не влияют)', '', CV_NOTE, '', 'Результат:']
-    return '\n'.join(head) + '\n' + PR.format_result(r) + '\n'
+    head += ['  (ответы о самочувствии на оценку риска по фото не влияют)', '', CV_NOTE, '', 'Результат по фото:']
+    tail = ['', 'Анализ крови (введён пользователем; отдельно от оценки по фото):',
+            f'  {lab["text"]}' if lab else '  не введён']
+    return '\n'.join(head) + '\n' + PR.format_result(r) + '\n' + '\n'.join(tail) + '\n'
