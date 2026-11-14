@@ -9,7 +9,7 @@ import tempfile
 import time
 
 from . import view as V
-from .personalizer import WELLBEING, Personalizer, StubPersonalizer, make_input
+from .personalizer import WELLBEING, Personalizer, RulesPersonalizer, make_input
 from .theme import CSS, LIGHT_JS, theme
 
 assert len(WELLBEING) == 3, 'run() принимает 3 ответа о самочувствии — поправьте сигнатуру'
@@ -60,17 +60,20 @@ def _blocks_kwargs(gr):
 
 
 def build(model_path=None, personalizer: Personalizer | None = None, backend=None):
-    """→ gr.Blocks. backend — готовый view.Backend (для тестов); иначе модель Я1 грузится здесь один раз."""
+    """→ gr.Blocks. backend — готовый view.Backend (для тестов); иначе модель Я1 грузится здесь один раз.
+    personalizer по умолчанию — RulesPersonalizer (офлайн). Телеметрия Gradio выключена: приложение офлайн."""
+    os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'     # до импорта: Gradio не шлёт статистику и не проверяет версию
     import gradio as gr
 
     backend = backend if backend is not None else V.load_backend(model_path)
-    personalizer = personalizer or StubPersonalizer()
+    personalizer = personalizer or RulesPersonalizer()
     blocks_kw, launch_kw = _blocks_kwargs(gr)
 
     def show(name):
         return [gr.update(visible=s == name) for s in SCREENS] + [V.stepper_html(STEP_OF[name])]
 
-    with gr.Blocks(title='HemaVision — скрининг риска анемии', elem_classes='hv-app', **blocks_kw) as demo:
+    with gr.Blocks(title='HemaVision — скрининг риска анемии', elem_classes='hv-app', analytics_enabled=False,
+                   **blocks_kw) as demo:
         demo.hv_launch_kwargs = launch_kw
         state = gr.State(None)            # {'r': dict analyze_photo, 'survey': Survey}
         stepper = gr.HTML('')

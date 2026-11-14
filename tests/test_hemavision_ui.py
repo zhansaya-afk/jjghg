@@ -131,6 +131,63 @@ def test_wellbeing_keys_match_personalizer_survey():
     assert [k for k, _ in P.WELLBEING] == ['weakness', 'blood_loss', 'meat_fish']
 
 
+def test_make_input_passes_result_fields_without_photo():
+    """В персонализатор уходят только поля результата: ни фото, ни вырезок, ни масок; без оценки — без P и ткани."""
+    import dataclasses
+
+    ok = {'status': 'ok', 'stage': 'ok', 'risk': 'высокий', 'p_anemia': np.float64(0.83), 'hb_range': [92.0, 112.0],
+          'tissues': ['conj'], 'issues': [], 'crop': np.zeros((4, 4, 3)), 'conj': np.ones((4, 4), bool)}
+    inp = P.make_input(ok, V.Survey(sex='F', age=30, wellbeing={'weakness': True}))
+    assert (inp.stage, inp.p_anemia, inp.tissues, inp.issues) == ('ok', 0.83, ('conj',), ())
+    for v in dataclasses.asdict(inp).values():
+        assert not isinstance(v, np.ndarray)
+    bad = P.make_input(_refused_dict(tissues=['conj']), V.Survey(sex='F', age=30))
+    assert bad.p_anemia is None and bad.tissues == () and bad.stage == 'ood'
+    assert bad.issues == ('снимок <b>не похож</b> на обучающие',)
+
+
+def test_rules_personalizer_explains_without_changing_result():
+    import dataclasses
+
+    from anemia.personalizer import build_facts
+    from anemia.personalizer_eval import violations
+
+    rp = P.RulesPersonalizer()
+    assert isinstance(rp, P.Personalizer)
+    inp = P.PersonalizerInput(status='ok', risk='высокий', hb_range=(92.0, 112.0), sex='F', age=30, pregnant=False,
+                              wellbeing={'weakness': True, 'blood_loss': None, 'meat_fish': False}, stage='ok',
+                              p_anemia=0.83, tissues=('conj',))
+    rep = rp.reply(inp)
+    assert rep.available and rep.source == 'rules' and 'высок' in rep.text.lower()
+    facts = build_facts({'status': 'ok', 'risk': 'высокий', 'p_anemia': 0.83, 'hb_range': [92, 112],
+                         'tissues': ['conj']}, None, {'sex': 'F', 'age': 30, 'pregnant': False})
+    assert violations(rep.text, facts) == {}
+    retake = rp.reply(P.make_input(_refused_dict(status='retake', stage='frame', issues=['снимок тёмный']),
+                                   V.Survey(sex='F', age=30)))
+    assert retake.available and 'высок' not in retake.text.lower() and 'г/л' not in retake.text
+    child = rp.reply(P.make_input(_refused_dict(stage='age', issues=['младше 5 лет']), V.Survey(sex='F', age=3)))
+    assert child.title.endswith('детям до 5 лет')
+    urgent = rp.reply(dataclasses.replace(inp, question='Болит в сердце и тяжело дышать'))
+    assert 'срочно' in urgent.title
+
+
+def test_rules_personalizer_works_offline(monkeypatch):
+    """Без сети и без языковых моделей: любое сетевое соединение → ошибка теста."""
+    import socket
+    import sys
+
+    def no_network(*a, **kw):
+        raise AssertionError('персонализатор пытался выйти в сеть')
+
+    monkeypatch.setattr(socket.socket, 'connect', no_network)
+    monkeypatch.setattr(socket, 'create_connection', no_network)
+    rep = P.RulesPersonalizer().reply(P.PersonalizerInput(status='ok', risk='низкий', hb_range=(120.0, 140.0),
+                                                          sex='M', age=40, pregnant=None, stage='ok',
+                                                          question='Что значит мой результат?'))
+    assert rep.available and rep.source == 'rules'
+    assert 'openai' not in sys.modules and 'llama_cpp' not in sys.modules
+
+
 # ------------------------------------------------------------------ модель и сборка интерфейса
 def test_load_backend_missing_model(tmp_path):
     b = V.load_backend(tmp_path / 'нет.joblib', landmarker=None)
