@@ -42,3 +42,27 @@ def test_missing_data_dir_raises(tmp_path):
     import pytest
     with pytest.raises(FileNotFoundError):
         build_manifest(str(tmp_path))
+
+
+def test_manifest_rejects_hb_in_g_dl(tmp_path):
+    """hb.csv заполнен в г/дл (13,5 вместо 135 г/л) → ошибка с понятной причиной, а не «тяжёлая анемия» у всех."""
+    import pytest
+    make_phone(tmp_path, n_patients=4, photos=1)
+    p = os.path.join(tmp_path, 'phone', 'hb.csv')
+    lab = pd.read_csv(p)
+    lab['hb_g_l'] = lab.hb_g_l / 10
+    lab.to_csv(p, index=False)
+    with pytest.raises(ValueError, match='г/л'):
+        build_manifest(str(tmp_path), n_folds=2)
+
+
+def test_manifest_rejects_implausible_hb_any_dataset(tmp_path):
+    """Одно значение вне 30–250 г/л (опечатка 1350) → ошибка с ID пациента; правдоподобные значения не трогаются."""
+    import pytest
+    make_phone(tmp_path, n_patients=4, photos=1)
+    p = os.path.join(tmp_path, 'phone', 'hb.csv')
+    lab = pd.read_csv(p)
+    lab.loc[1, 'hb_g_l'] = 1350
+    lab.to_csv(p, index=False)
+    with pytest.raises(ValueError, match='PH_1'):
+        build_manifest(str(tmp_path), n_folds=2)
