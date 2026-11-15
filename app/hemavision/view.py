@@ -19,8 +19,8 @@ from anemia import api as API
 from anemia import labs as LABS
 from anemia import predict as PR
 
-SEX = {'Женский': 'F', 'Мужской': 'M', 'Не указан': None}
-PREG = {'Не указано': None, 'Нет': False, 'Да': True}
+SEX = {'Женский': 'F', 'Мужской': 'M'}        # только два варианта, без «Не указан»
+PREG = {'Нет': False, 'Да': True}        # только да/нет; поле показывается и учитывается только для пола «Женский»
 METHOD = {'Авто': None, 'Конъюнктива': 'conj', 'Склера': 'sclera', 'Обе ткани': 'both'}
 ANSWER = {'Да': True, 'Нет': False, 'Не знаю': None}
 BLOOD_TEST = 'Точно уровень гемоглобина показывает только общий анализ крови.'
@@ -66,7 +66,7 @@ def parse_survey(sex, age, pregnant, method, answers=()):
     from .personalizer import WELLBEING
     s = SEX.get(sex)
     age = None if age is None or age == '' else float(age)
-    return Survey(sex=s, age=age, pregnant=PREG.get(pregnant) if s != 'M' else None, method=METHOD.get(method),
+    return Survey(sex=s, age=age, pregnant=PREG.get(pregnant) if s == 'F' else None, method=METHOD.get(method),
                   wellbeing={k: ANSWER.get(a) for (k, _), a in zip(WELLBEING, answers)})
 
 
@@ -366,7 +366,8 @@ def report_text(r, survey, backend_version='', lab=None):
             f'Дата: {dt.datetime.now().strftime("%Y-%m-%d %H:%M")}', f'Версия модели: {backend_version or "—"}', '',
             'Анкета (со слов пользователя):',
             (f'  пол: {({"F": "женский", "M": "мужской"}).get(survey.sex, "не указан")}; '
-             f'возраст: {"не указан" if survey.age is None else f"{survey.age:g}"}; беременность: {ru[survey.pregnant]}'),
+             f'возраст: {"не указан" if survey.age is None else f"{survey.age:g}"}'
+             + (f'; беременность: {ru[survey.pregnant]}' if survey.sex == 'F' else '')),
             f'  ткань: {PR.METHOD_RU.get(survey.method, "Авто")}']
     head += [f'  {q} — {ru[survey.wellbeing.get(k)]}' for k, q in WELLBEING]
     head += ['  (ответы о самочувствии на оценку риска по фото не влияют)', '', CV_NOTE, '', 'Результат по фото:']

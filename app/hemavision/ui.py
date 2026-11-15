@@ -127,7 +127,7 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                 with gr.Column(min_width=MIN_COL):
                     sex = gr.Radio(list(V.SEX), value='Женский', label='Пол')
                     age = gr.Number(label='Возраст, полных лет', value=None, minimum=0, maximum=120, precision=0)
-                    preg = gr.Radio(list(V.PREG), value='Не указано', label='Беременность', visible=True)
+                    preg = gr.Radio(list(V.PREG), value='Нет', label='Беременность', visible=True)
                 with gr.Column(min_width=MIN_COL):
                     with gr.Accordion('Самочувствие (необязательно)', open=False):
                         gr.HTML('<p class="hv-small">Ответы попадут в отчёт для врача. <b>На оценку риска по фото '
@@ -202,7 +202,7 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
             return show('survey') + ['']
 
         def on_sex(s):
-            return gr.update(visible=s != 'Мужской', value='Не указано')
+            return gr.update(visible=s == 'Женский', value='Нет')   # беременность — только для женщин
 
         def check_lab(s, a, pr, lab_v, lab_u):
             """Ошибка ввода анализа крови → исправить на шаге «Анкета», не молча пропустить. Отдельное событие с
