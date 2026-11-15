@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from anemia.personalizer import session as S
 from anemia.personalizer.session import chat, from_notebook, yes_no
 from anemia.personalizer_eval import violations
 
@@ -139,11 +140,17 @@ def test_ya5_keeps_ya2_profile_after_ya2s(monkeypatch, capsys):
     assert ya2.index(keep) > run_at  # профиль запоминается вместе с результатом Я2
     ns = {"r": PHOTO, "Пол": "Мужской", "Возраст": 45, "Беременность": "Нет"}  # поля Я2
     exec(keep, ns)  # noqa: S102 — строка ячейки Я2
-    ns.update({"Пол": "Женский", "Возраст": 4, "Беременность": "Да"})  # затем Я2с с другими полями
+    ns.update(
+        {"Пол": "Женский", "Возраст": 4, "Беременность": "Да"}
+    )  # затем Я2с с другими полями
     exec(compile(_ya5_source(), "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out
     assert ns["_"]["facts"]["profile"] == {"sex": "M", "age": 45, "pregnant": False}
-    assert "По фото риск анемии высокий" in out and "младше 5" not in out and "беремен" not in out
+    assert (
+        "По фото риск анемии высокий" in out
+        and "младше 5" not in out
+        and "беремен" not in out
+    )
 
 
 @pytest.mark.parametrize("what", ["Анализ крови (Я3)", "Фото и анализ"])
@@ -222,3 +229,18 @@ def test_ya5_cell_uses_neural_net_from_cell_n(monkeypatch, capsys):
     exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out
     assert "нейросеть поняла вопрос: тема can_worsen" in out
+
+
+def test_profile_from_form_pregnancy_yes_no_women_only():
+    assert S.profile_from_form("Женский", 30, "Да")["pregnant"] is True
+    assert S.profile_from_form("Женский", 30, "Нет")["pregnant"] is False
+    assert S.profile_from_form("Мужской", 30, "Да")["pregnant"] is False
+    assert S.profile_from_form("Женский", 30)["pregnant"] is False
+
+
+def test_notebook_pregnancy_fields_have_no_unknown_option():
+    for title in ("Ячейка Я2 —", "Ячейка Я2с", "Ячейка Я3"):
+        src = _cell(title)
+        assert "Не указан" not in src and '#@param ["Нет", "Да"]' in src
+        assert '#@param ["Женский", "Мужской"]' in src
+        assert "if Пол" in src  # беременность учитывается только при поле «Женский»

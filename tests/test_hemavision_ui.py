@@ -40,8 +40,17 @@ def test_parse_survey():
     assert s.wellbeing == {'weakness': True, 'blood_loss': False, 'meat_fish': None}
     s = V.parse_survey('Женский', None, 'Да', 'Склера')
     assert s.sex == 'F' and s.age is None and s.pregnant is True and s.method == 'sclera' and s.wellbeing == {}
-    assert V.parse_survey('Не указан', '', 'Нет', 'Обе ткани').method == 'both'
+    assert V.parse_survey('Женский', '', 'Нет', 'Обе ткани').method == 'both'
     assert set(V.METHOD.values()) - {None} == set(PR.METHODS)
+
+
+def test_pregnancy_only_yes_no_and_only_for_women():
+    """Беременность: только «Да» / «Нет» (без «Не указано»); учитывается только при поле «Женский»."""
+    assert set(V.PREG) == {'Да', 'Нет'}
+    assert V.parse_survey('Женский', 30, 'Нет', 'Авто').pregnant is False
+    assert V.parse_survey('Женский', 30, 'Да', 'Авто').pregnant is True
+    assert V.parse_survey('Мужской', 30, 'Да', 'Авто').pregnant is None   # = нормы небеременных (labs.is_pregnant)
+    assert set(V.SEX) == {'Женский', 'Мужской'}                          # пол: только два варианта
 
 
 # ------------------------------------------------------------------ нормальное фото

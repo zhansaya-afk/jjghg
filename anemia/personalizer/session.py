@@ -42,12 +42,13 @@ def yes_no(text):
     return True if t in YES else False if t in NO else None
 
 
-def profile_from_form(sex="Не указан", age=None, pregnant="Не указано"):
-    """Поля форм Я2 / Я3 → профиль карточки фактов."""
+def profile_from_form(sex=None, age=None, pregnant="Нет"):
+    """Поля форм Я2 / Я3 → профиль карточки фактов. Беременность «Да» учитывается только при поле «Женский»."""
+    preg = {"Да": True, "Нет": False}.get(pregnant)
     return {
         "sex": {"Женский": "F", "Мужской": "M"}.get(sex),
         "age": age,
-        "pregnant": {"Да": True, "Нет": False}.get(pregnant),
+        "pregnant": False if preg and sex != "Женский" else preg,
     }
 
 
