@@ -8,12 +8,25 @@ import re
 
 from ..personalizer_eval import violations
 from . import texts as T
-from .context import asks_dose, base_question, context_query, dialog_facts, is_follow_up
+from .context import (
+    asks_dose,
+    base_question,
+    context_query,
+    dialog_facts,
+    is_follow_up,
+    refers_back,
+)
 from .facts import build_facts, hb_from_question, photo_ok
 from .retrieve import SLOT, default_retriever, load_kb
 from .router import lang_of, needs_retake, route
 
 THRESHOLD = 0.35  # сходство ниже порога → «не знаю»; выбран на наборе A (evals/personalizer/search_questions.json)
+# вопрос без слов про анемию («На парах выдыхаюсь»): маршрутизатор считает его «не моей темой»; если поиск
+# всё же уверенно находит тему (сходство не ниже этого порога), отвечаем ей. Порог выбран на наборах A и P.
+OFF_DOMAIN_THRESHOLD = 0.45
+LLM_TOP_K = 3  # нейросеть выбирает тему только среди стольких лучших тем поиска (или «нет темы»)
+OFF_DOMAIN_NOTE = "нет слов про анемию, но поиск уверенно нашёл тему"
+REFER_MARGIN = 0.25  # «это» в разговоре: тема по прошлому вопросу берётся, если сходство выше на столько
 EXPLAIN = "explain_result"
 LAB = "lab_explain"
 # фрагменты о самом результате фото: при непригодном снимке вместо них — «переснимите»
@@ -111,12 +124,23 @@ def rules_answer(
     if force and mode != "urgent":
         mode, why = force
     sources = []
+    off_domain = None
+    if mode == "out_of_scope" and why is None and lang == "ru" and not pick and q:
+        # «не моя тема» только по словам: если поиск уверенно находит тему базы — это вопрос о самочувствии
+        # или еде без слова «анемия». Срочное, дозы, препараты, диагноз уже решены правилами выше.
+        off_domain = (retriever or default_retriever("ru")).search(search or q, k=3)
+        if off_domain and off_domain[0][1] >= OFF_DOMAIN_THRESHOLD:
+            mode = None
     trace = {
         "rule": (why or mode) if (mode or why) else None,
         "search": [],
         "notes": [],
     }
     note = trace["notes"].append
+    if off_domain is not None:
+        trace["search"] = [(h.id, round(sc, 2)) for h, sc in off_domain]
+        if mode is None:
+            note(OFF_DOMAIN_NOTE)
     if lang == "kk":
         mode, text = _kk(mode, why, q, facts)
         note("казахский: готовый шаблон")
@@ -243,6 +267,8 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
             base, cq = alt, wq
         elif is_follow_up(q) and base["lang"] == "ru":
             clarify = True  # «А для мужчин?» без прошлого вопроса
+    if cq == q and not clarify and base["why"] is None and refers_back(q):
+        base = _refer_back(q, facts, history, retriever, base)
     if clarify:
         base = dict(base, mode="dont_know", text=T.CLARIFY, sources=[])
         base["trace"] = dict(
@@ -267,7 +293,11 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
         # Срочные признаки и отказы (дозы, препараты, диагноз, дети) решены правилами раньше: lost = why is None
         from .generate import pick_topic
 
-        picked = pick_topic(llm, cq, load_kb("ru"))
+        # выбор только из LLM_TOP_K лучших тем поиска: на перефразах 30 вопросов с полным списком тем
+        # модель чаще уходила в чужую тему (не та тема 2 → 6 из 30, прогон 10.11)
+        hits = (retriever or default_retriever("ru")).search(cq, k=LLM_TOP_K)
+        candidates = [fr for fr, sc in hits if sc > 0]
+        picked = pick_topic(llm, cq, candidates) if candidates else None
         if picked:
             first = base["trace"]
             why_lost = (
@@ -319,6 +349,46 @@ def answer(question, facts, history=None, *, engine="rules", llm=None, retriever
     if bad:  # не должно случаться в режиме rules: это ошибка шаблона, ответ заменяется безопасным
         out.update(text=SAFE_FALLBACK, guard={**out["guard"], **bad}, sources=[])
     return out
+
+
+def _top(out):
+    hits = (out.get("trace") or {}).get("search") or []
+    return (
+        hits[0][1] if hits and out["mode"] not in ("out_of_scope", "dont_know") else 0.0
+    )
+
+
+def _refer_back(q, facts, history, retriever, base):
+    """«Можно ли это предотвратить?», «Зачем его сдавать?» в разговоре об анемии. Срабатывает, только если
+    сам вопрос не нашёлся или нашёлся без слов про анемию: тема, найденная по словам вопроса, не меняется
+    («Пью чай после обеда, это плохо?»). Разговор уже по теме, поэтому фильтр «не моя тема» не нужен.
+    Вопрос вместе с прошлым берётся, если сам вопрос не нашёлся или прошлый даёт тему точнее на REFER_MARGIN
+    («Что такое ферритин? → Зачем его сдавать?»). Правила (срочное, дозы, препараты, диагноз) уже проверены:
+    сюда попадают только вопросы с why=None."""
+    prev = base_question(history)
+    if base["lang"] != "ru" or not prev or route(prev, facts)[0] == "out_of_scope":
+        return base  # прошлый вопрос не об анемии («Как выучить химию? → Это сложно?»)
+    weak = base["mode"] != "answer" or any(
+        n.startswith(OFF_DOMAIN_NOTE) for n in base["trace"]["notes"]
+    )
+    if not weak:
+        return base  # «Пью чай после обеда, это плохо?» — своя тема найдена по словам вопроса
+    back = ("answer", None)
+    alone = (
+        base
+        if base["mode"] == "answer"
+        else rules_answer(q, facts, history, retriever, back)
+    )
+    joined = f"{prev.rstrip('?.! ')}? {q}"
+    alt = rules_answer(q, facts, history, retriever, back, search=joined)
+    if _top(alt) and _top(alt) - _top(alone) >= (REFER_MARGIN if _top(alone) else 0):
+        note = f"«это» — о прошлом вопросе «{prev}»: искался вместе с ним"
+    elif _top(alone) and alone is not base:
+        alt, note = alone, "разговор об анемии: вопрос без слова «анемия» искался сам"
+    else:
+        return base
+    alt["trace"] = dict(alt["trace"], notes=[note, *alt["trace"]["notes"]])
+    return alt
 
 
 def _lost_facts(base, text):

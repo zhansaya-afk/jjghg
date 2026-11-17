@@ -484,7 +484,7 @@ def _picker(reply, calls=None):
 
 
 def test_understand_picks_topic_for_paraphrase():
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     assert answer(q, facts())["mode"] in ("out_of_scope", "dont_know")
     r = answer(q, facts(), engine="understand", llm=_picker("can_worsen"))
     assert r["engine"] == "understand" and r["sources"] == ["can_worsen"]
@@ -493,7 +493,7 @@ def test_understand_picks_topic_for_paraphrase():
 
 @pytest.mark.parametrize("reply", ["NONE", "", "не знаю", "no_such_topic"])
 def test_understand_none_keeps_dont_know(reply):
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     r = answer(q, facts(), engine="understand", llm=_picker(reply))
     assert r["engine"] == "rules" and r["mode"] in ("out_of_scope", "dont_know")
 
@@ -518,7 +518,7 @@ def test_understand_model_error_keeps_rules():
     def boom(messages, **kw):
         raise RuntimeError("нет модели")
 
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     r = answer(q, facts(), engine="understand", llm=boom)
     assert r["engine"] == "rules" and r["text"] == answer(q, facts())["text"]
 
