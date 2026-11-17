@@ -92,24 +92,45 @@ def test_unknown_or_too_young_age(age, words):
     assert c['status'] == 'insufficient' and words in c['message'] and c['grade'] is None
 
 
-@pytest.mark.parametrize('kw,words', [
-    ({'sex': 'M', 'pregnant': True}, 'мужчин'),
-    ({'sex': 'F', 'pregnant': False, 'trimester': 2}, 'триместр'),
-    ({'sex': 'M', 'trimester': 1}, 'триместр'),
-    ({'sex': 'F', 'pregnant': True, 'trimester': 4}, 'триместр'),
-    ({'sex': 'F', 'pregnant': True, 'trimester': 'II'}, 'триместр'),
-    ({'sex': 'X'}, 'пол'),
-    ({'sex': 'F', 'age': -1}, 'возраст'),
-    ({'sex': 'F', 'age': 121}, 'возраст'),
-    ({'sex': 'F', 'age': 'abc'}, 'возраст'),
-    ({'sex': 'F', 'age': True}, 'возраст'),
+# kz — ожидаемый статус шкалы РК: триместр она не принимает, поэтому противоречия триместра её не касаются
+@pytest.mark.parametrize('kw,words,kz', [
+    ({'sex': 'M', 'pregnant': True}, 'мужчин', 'invalid'),
+    ({'sex': 'F', 'pregnant': False, 'trimester': 2}, 'триместр', 'ok'),
+    ({'sex': 'M', 'trimester': 1}, 'триместр', 'ok'),
+    ({'sex': 'F', 'pregnant': True, 'trimester': 4}, 'триместр', 'not_applicable'),
+    ({'sex': 'F', 'pregnant': True, 'trimester': 'II'}, 'триместр', 'not_applicable'),
+    ({'sex': 'X'}, 'пол', 'invalid'),
+    ({'sex': 'F', 'age': -1}, 'возраст', 'invalid'),
+    ({'sex': 'F', 'age': 121}, 'возраст', 'invalid'),
+    ({'sex': 'F', 'age': 'abc'}, 'возраст', 'invalid'),
+    ({'sex': 'F', 'age': True}, 'возраст', 'invalid'),
+    ({'sex': 'F', 'age': 8, 'pregnant': True, 'trimester': 2}, 'возраст', 'invalid'),
 ])
-def test_contradictory_or_invalid_inputs(kw, words):
+def test_contradictory_or_invalid_inputs(kw, words, kz):
     args = {'age': 30, **kw}
     c = classify_who2024(110, **args)
     assert c['status'] == 'invalid' and words in c['message'] and c['grade'] is None
-    assert classify_kz2017(110, args.get('sex'), args['age'], args.get('pregnant'))['status'] in (
-        'invalid', 'ok', 'insufficient', 'not_applicable')
+    k = classify_kz2017(110, args.get('sex'), args['age'], args.get('pregnant'))
+    assert k['status'] == kz
+    if kz == 'invalid':
+        assert k['grade'] is None and k['anemic'] is None
+
+
+@pytest.mark.parametrize('hb', [float('nan'), float('inf'), None, '', 'abc', True, 10, 29.9, 250.1, 400])
+def test_classifiers_reject_bad_hb_instead_of_grading(hb):
+    for c in (classify_who2024(hb, 'M', 40, False), classify_kz2017(hb, 'M', 40, False)):
+        assert c['status'] == 'invalid' and 'Hb' in c['message']
+        assert c['grade'] is None and c['anemic'] is None
+
+
+def test_pregnancy_age_check_boundary():
+    assert classify_who2024(110, 'F', 9.9, True, 1)['status'] == 'invalid'
+    assert classify_who2024(110, 'F', 10, True, 1)['status'] == 'ok'
+
+
+def test_kz_unknown_sex_shows_higher_threshold():
+    c = classify_kz2017(100, None, 40, False)
+    assert c['grade'] == 'mild' and c['normal_from_g_l'] == 130   # как у ВОЗ: при неизвестном поле — порог выше
 
 
 def test_trimester_accepts_digit_strings_and_cyrillic_sex():

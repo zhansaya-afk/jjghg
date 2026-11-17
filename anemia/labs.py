@@ -112,6 +112,7 @@ KZ2017_SOURCE = 'протокол МЗ РК «Железодефицитная �
 WHO2024_MIN_AGE = 0.5        # лет: младше 6 месяцев ВОЗ 2024 порогов не даёт
 WHO2024_ADULT_MAX_AGE = 65   # лет: пороги взрослых в ВОЗ 2024 даны для 15–65 лет
 KZ_MIN_AGE = 18              # лет: протокол МЗ РК — для взрослых
+MIN_PREGNANCY_AGE = 10       # лет: беременность младше — почти наверняка ошибка в возрасте (проверка ввода)
 TRIMESTERS = (1, 2, 3)
 KZ_GRADE_RU = {'norm': 'Нет анемии', 'mild': 'Анемия лёгкой степени', 'moderate': 'Анемия средней степени',
                'severe': 'Анемия тяжёлой степени'}
@@ -195,7 +196,22 @@ def _inputs(sex, age, pregnant, trimester):
         raise _Invalid('беременность отмечена у мужчины: проверьте пол')
     if t is not None and p is not True:
         raise _Invalid('указан триместр, но беременность не отмечена: проверьте анкету')
+    if p is True and a is not None and a < MIN_PREGNANCY_AGE:
+        raise _Invalid(f'беременность отмечена в возрасте {a:g} лет: проверьте возраст')
     return s, a, p, t
+
+
+def _norm_hb(hb_g_l):
+    """Hb в г/л для классификаторов: пусто, не число, NaN/∞ или вне HB_PLAUSIBLE → _Invalid (не «анемия»)."""
+    try:
+        hb = float(hb_g_l)
+    except (TypeError, ValueError):
+        raise _Invalid(f'Hb не число ({hb_g_l!r})') from None
+    if isinstance(hb_g_l, bool) or not math.isfinite(hb):
+        raise _Invalid(f'Hb не число ({hb_g_l!r})')
+    if not HB_PLAUSIBLE[0] <= hb <= HB_PLAUSIBLE[1]:
+        raise _Invalid(f'Hb {hb:g} г/л вне правдоподобного диапазона {HB_PLAUSIBLE[0]:.0f}–{HB_PLAUSIBLE[1]:.0f} г/л')
+    return hb
 
 
 def _hb_text(hb):
@@ -257,8 +273,8 @@ def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None):
     одна и та же — она выдаётся, иначе status = insufficient. Неизвестный возраст — всегда insufficient."""
     out = {'system': 'who2024', 'source': WHO2024_SOURCE, 'status': 'ok', 'grade': None, 'grade_ru': None,
            'anemic': None, 'normal_from_g_l': None, 'group': None, 'message': '', 'notes': []}
-    hb = float(hb_g_l)
     try:
+        hb = _norm_hb(hb_g_l)
         s, a, p, t = _inputs(sex, age, pregnant, trimester)
     except _Invalid as e:
         return {**out, 'status': 'invalid', 'message': f'Противоречивые или неверные данные: {e}.'}
@@ -298,8 +314,8 @@ def classify_kz2017(hb_g_l, sex=None, age=None, pregnant=None):
     → dict: status ok / insufficient / not_applicable / invalid; grade (None, если протокол степень не задаёт)."""
     out = {'system': 'kz2017', 'source': KZ2017_SOURCE, 'status': 'ok', 'grade': None, 'grade_ru': None,
            'anemic': None, 'normal_from_g_l': None, 'message': '', 'notes': []}
-    hb = float(hb_g_l)
     try:
+        hb = _norm_hb(hb_g_l)
         s, a, p, _ = _inputs(sex, age, pregnant, None)
     except _Invalid as e:
         return {**out, 'status': 'invalid', 'message': f'Противоречивые или неверные данные: {e}.'}
@@ -322,7 +338,7 @@ def classify_kz2017(hb_g_l, sex=None, age=None, pregnant=None):
         return {**out, 'status': 'insufficient',
                 'message': f'Недостаточно данных: при Hb {_hb_text(hb)} г/л ответ зависит от пола '
                            '(мужчины: анемия, женщины: нет). Укажите пол.'}
-    out.update(anemic=True, normal_from_g_l=float(cuts[0]))
+    out.update(anemic=True, normal_from_g_l=float(max(cuts)))   # пол не указан: порог выше из двух, как у ВОЗ
     if hb > 120:             # мужчины 120–129: анемия, но шкала лёгкой степени заканчивается на 120
         return {**out, 'grade_ru': 'Анемия; степень шкалой протокола не задана (лёгкая — 90–120 г/л)'}
     grade = 'severe' if hb < 70 else 'moderate' if hb < 90 else 'mild'
