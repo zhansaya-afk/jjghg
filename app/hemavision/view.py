@@ -365,7 +365,7 @@ def report_text(r, survey, backend_version='', lab=None):
     head = ['HemaVision — отчёт скрининга риска анемии по фото глаза (не диагноз)',
             f'Дата: {dt.datetime.now().strftime("%Y-%m-%d %H:%M")}', f'Версия модели: {backend_version or "—"}', '',
             'Анкета (со слов пользователя):',
-            (f'  пол: {({"F": "женский", "M": "мужской"}).get(survey.sex, "не указан")}; '
+            (f'  пол: {({"F": "женский", "M": "мужской"}).get(survey.sex, "—")}; '
              f'возраст: {"не указан" if survey.age is None else f"{survey.age:g}"}'
              + (f'; беременность: {ru[survey.pregnant]}' if survey.sex == 'F' else '')),
             f'  ткань: {PR.METHOD_RU.get(survey.method, "Авто")}']

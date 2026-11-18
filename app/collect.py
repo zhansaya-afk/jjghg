@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from anemia import collect as C
 
 SEX = {'Женский': 'F', 'Мужской': 'M'}
-PREG = {'Не указано': None, 'Нет': False, 'Да': True}
+PREG = {'Нет': False, 'Да': True}          # только да/нет; для мужчин поле скрыто и равно «Нет»
 EYE = {'Левый': 'L', 'Правый': 'R'}
 MASK = {'Нарисую кистью': 'draw', 'Предложенная верна': 'auto', 'Без маски (разметят позже)': 'none'}
 EDIT_SIDE = 1280              # px: размер фото в редакторе маски (маска потом растягивается до сохраняемого)
@@ -109,7 +109,7 @@ def build(root=None):
                 with gr.Row():
                     sex = gr.Radio(list(SEX), label='Пол')
                     age = gr.Number(label='Возраст, лет', precision=1)
-                preg = gr.Radio(list(PREG), value='Не указано', label='Беременность')
+                preg = gr.Radio(list(PREG), value='Нет', label='Беременность')
                 gap = gr.Radio([0, 1], value=0, label='Дней между анализом крови и фото')
                 eye = gr.Radio(list(EYE), label='Глаз')
             with gr.Column():
@@ -129,6 +129,7 @@ def build(root=None):
         status = gr.Markdown()
         zfile = gr.File(label='Архив (скачайте: в Colab папка стирается вместе со средой)')
         check.click(on_check, photo, [state, editor, report, mask_choice])
+        sex.change(lambda s: gr.update(visible=s != 'Мужской', value='Нет'), sex, preg)   # беременность — только женщинам
         save.click(on_save, [state, editor, consent, pid, hb, unit, sex, age, preg, eye, gap, mask_choice],
                    [status, stats])
         zbtn.click(on_zip, None, zfile)

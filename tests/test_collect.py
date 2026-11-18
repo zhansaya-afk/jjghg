@@ -159,3 +159,13 @@ def test_save_record_downscales_large(tmp_path):
     rgb = np.random.default_rng(0).random((3000, 2400, 3), dtype=np.float32)
     out = C.save_record(str(tmp_path), rgb, _meta())
     assert max(Image.open(out['image']).size) == C.MAX_SAVE_SIDE
+
+
+def test_collect_form_sex_and_pregnancy_have_no_unknown_option():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location('collect_app', Path(__file__).resolve().parents[1] / 'app' / 'collect.py')
+    app = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(app)
+    assert set(app.SEX) == {'Женский', 'Мужской'} and set(app.PREG) == {'Нет', 'Да'}
