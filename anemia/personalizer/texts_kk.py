@@ -9,7 +9,7 @@
 import re
 
 from . import facts as F
-from .texts import RISK_KK, _gi_relevant, _hb, is_vegan, join, lab_grade
+from .texts import RISK_KK, _gi_relevant, _has_hb, _hb, is_vegan, join, lab_grade
 
 KK_GROUP_FOR = {  # «для кого» (для + родительный → «… үшін»)
     "беременных": "жүкті әйелдер",
@@ -87,7 +87,7 @@ def other_groups(f, question="", hb=None):
             "Жауап профильдегі жынысыңыз бойынша берілді; ол қате болса, түзетіңіз."
         )
     if re.search(r"жүкті|жукти", q) and not F.is_pregnant(f) and p.get("sex") != "M":
-        add("Жүктілік кезінде ДДҰ шегі — 110 г/л.", 110)
+        add("Жүктілік кезінде ДДҰ 2024 шегі — I және III триместрде 110 г/л, II триместрде 105 г/л.", 110)
     return join(*out)
 
 
@@ -100,6 +100,14 @@ def norm_line(f, question=""):
 
 def _lab_sentence(hb, grade, f, prefix=""):
     group, norm = _group(f), F.norm_g_l(f)
+    if grade is None:  # ДДҰ 2024: санатты анықтау үшін деректер жетпейді (әдетте триместр); мәтінді қазақ тілін білетін адам тексеруі керек
+        p = f.get("profile") or {}
+        why = (
+            "жүктілік кезінде шекті мән триместрге байланысты (I және III — 110 г/л, II — 105 г/л)"
+            if p.get("pregnant") is True
+            else "жыныс, жас немесе жүктілік толық көрсетілмеген"
+        )
+        return f"{prefix}{_hb(hb)} г/л — ДДҰ 2024 бойынша санатты анықтау үшін деректер жеткіліксіз: {why}."
     if grade == "norm":
         s = f"{prefix}{_hb(hb)} г/л — {group} үшін ДДҰ нормасы шегінде ({norm} г/л және одан жоғары)"
         sex = (f.get("profile") or {}).get("sex")
@@ -147,6 +155,8 @@ def _question_sentence(q, f, question):
 def lab_advice(f, question=""):
     g = lab_grade(f, question)
     if g is None:
+        if _has_hb(f, question):  # ДДҰ 2024: санат анықталмады — бәрібір дәрігерге
+            return f"Анализді жақын күндері {doctor(f)} көрсетіңіз: ол жетіспейтін деректерді ескеріп бағалайды."
         return ""
     if g == "norm":
         return (

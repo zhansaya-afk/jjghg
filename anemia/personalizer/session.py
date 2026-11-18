@@ -2,7 +2,7 @@
 
 Ввод и вывод передаются функциями (ask, say), поэтому тот же код работает в Colab (input / print)
 и в тестах (поддельный ввод). Риск по фото и анализ крови не пересчитываются: персонализатор только
-объясняет то, что вернули predict.analyze_photo (Я2) и labs.lab_hb_report (Я3).
+объясняет то, что вернули predict.analyze_photo (Я2) и labs.lab_report (Я3, ВОЗ 2024).
 """
 
 from .context import dialog_facts, new_facts_note
@@ -160,10 +160,18 @@ def from_notebook(
             "Исправьте поля, перезапустите Я2 или Я3, затем Я5."
         )
         return None
+    profile = p2 if use_photo else p3
+    if use_lab:  # триместр из Я3 — только для нормы анализа (ВОЗ 2024); фото он не меняет
+        profile = {
+            **profile,
+            "trimester": {"I": 1, "II": 2, "III": 3}.get(ns.get("Триместр_анализ"))
+            if profile.get("pregnant") is True
+            else None,
+        }
     return chat(
         photo,
         blood,
-        p2 if use_photo else p3,
+        profile,
         ask=ask,
         say=say,
         survey=survey,
