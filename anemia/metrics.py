@@ -112,3 +112,43 @@ def binary_report(flag, y, groups=None, n_boot=1000, seed=0):
         if groups is not None and n_boot and np.isfinite(r[name]):
             r[name + '_lo'], r[name + '_hi'] = bootstrap_ci(fn_, groups, n_boot, seed, flag, y)
     return r
+
+
+def within_strata_auc(score, y, strata):
+    """AUC только по парам «больной — здоровый» внутри одной подгруппы (страны): сдвиг скора между подгруппами
+    его не меняет. Ничьи — 0,5. Нет ни одной пары → ValueError (как у roc_auc_score)."""
+    score, y, strata = np.asarray(score, float), np.asarray(y).astype(bool), np.asarray(strata)
+    num = den = 0.0
+    for k in np.unique(strata):
+        m = strata == k
+        pos, neg = score[m & y], score[m & ~y]
+        if len(pos) and len(neg):
+            d = pos[:, None] - neg[None, :]
+            num += (d > 0).sum() + 0.5 * (d == 0).sum()
+            den += d.size
+    if den == 0:
+        raise ValueError('нет пар больной — здоровый внутри подгрупп')
+    return float(num / den)
+
+
+def auc_by_stratum(score, y, strata, groups, n_boot=1000, seed=0):
+    """AUC с 95% ДИ (бутстрэп по пациентам) и размеры: все вместе, каждая подгруппа, «внутри стран».
+    Подгруппа без больных или без здоровых → AUC «—» (NaN), не 0."""
+    score, y, strata, groups = np.asarray(score, float), np.asarray(y).astype(bool), np.asarray(strata), np.asarray(groups)
+    nan = float('nan')
+
+    def row(name, m, fn):
+        r = {'подвыборка': name, 'n': int(m.sum()), 'n_patients': int(len(np.unique(groups[m]))), 'n_anemic': int((y & m).sum()), 'n_healthy': int((~y & m).sum()),
+             'auc': nan, 'auc_lo': nan, 'auc_hi': nan}
+        try:
+            r['auc'] = fn(score[m], y[m], strata[m])
+        except ValueError:
+            return r
+        r['auc_lo'], r['auc_hi'] = bootstrap_ci(fn, groups[m], n_boot, seed, score[m], y[m], strata[m])
+        return r
+
+    every = np.ones(len(y), bool)
+    rows = [row('все', every, lambda s, t, _: auc(s, t))]
+    rows += [row(str(k), strata == k, lambda s, t, _: auc(s, t)) for k in np.unique(strata)]
+    rows.append(row('внутри стран', every, within_strata_auc))
+    return rows
