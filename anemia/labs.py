@@ -364,6 +364,20 @@ def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None, 
             'notes': notes}
 
 
+def who2024_normal(sex=None, age=None, pregnant=None, trimester=None, elevation_m=None):
+    """Порог нормы ВОЗ 2024 для профиля, г/л (с поправкой на высоту, если она указана). Неизвестный пол /
+    беременность / триместр → наибольший из возможных порогов (как normal_from_g_l в classify_who2024).
+    Неизвестный или < 6 мес возраст, противоречие, высота ≥ 3000 м → None."""
+    try:
+        s, a, p, t = _inputs(sex, age, pregnant, trimester)
+        adj = who2024_altitude_adjustment(elevation_m) or 0.0
+    except (_Invalid, ValueError):
+        return None
+    if a is None or a < WHO2024_MIN_AGE:
+        return None
+    return float(max(WHO2024_GROUPS[g][1] for g in _who_candidates(s, a, p, t))) + adj
+
+
 def classify_kz2017(hb_g_l, sex=None, age=None, pregnant=None):
     """Степень АНЕМИИ по шкале протокола МЗ РК «ЖДА» 2017 (взрослые): анемия — Hb < 130 г/л у мужчин и < 120 г/л
     у женщин; лёгкая 90–120, средняя 70–89, тяжёлая < 70 г/л. Только по Hb: это не диагноз ЖДА (статус
@@ -421,8 +435,8 @@ def lab_report(value, unit=None, sex=None, age=None, pregnant=None, trimester=No
     """Интерпретация готового лабораторного Hb (ячейка Я3): ВОЗ 2024 и протокол МЗ РК 2017 — двумя отдельными
     системами. С оценкой по фото не связана: цифры фото-модели здесь не используются.
     → dict: прежние ключи (grade, grade_ru, anemic, normal_from_g_l, group — по ВОЗ 2024), who2024, kz2017,
-    iron_deficiency (отдельный статус железодефицита), text. В персонализатор (Я5) этот отчёт не передаётся:
-    Я5 получает прежний lab_hb_report (ВОЗ 2011). elevation_m — высота проживания, м (поправка ВОЗ 2024 только к
+    iron_deficiency (отдельный статус железодефицита), text. Этот же отчёт получает персонализатор (Я5),
+    чтобы нормы в Я3 и Я5 совпадали. elevation_m — высота проживания, м (поправка ВОЗ 2024 только к
     шкале ВОЗ и только если высота указана; шкала МЗ РК без поправки).
     Ошибка числа или единицы → ValueError. Если по ВОЗ 2024 классифицировать нельзя (данных недостаточно или
     противоречие) → LabDataError (подкласс ValueError) с понятным сообщением и полным отчётом в .report."""

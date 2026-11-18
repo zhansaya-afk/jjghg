@@ -37,7 +37,7 @@ import statistics
 import time
 from pathlib import Path
 
-from .labs import who_limits
+from .labs import who2024_normal, who_limits
 from .metrics import wilson
 
 CASES_PATH = (
@@ -50,7 +50,8 @@ MODES = ("answer", "urgent", "retake", "child", "out_of_scope", "dont_know")
 SPLITS = ("dev", "holdout")
 MAX_CHARS = 1500  # клиент на телефоне длиннее не читает
 MAX_SECONDS = 30.0  # потолок на телефоне; для Colab ожидаем 2–5 с
-WHO_NUMBERS = {70, 80, 100, 110, 115, 120, 130}  # пороги ВОЗ 2011 (anemia/labs.py), г/л
+WHO_NUMBERS = {70, 80, 100, 110, 115, 120, 130}  # пороги ВОЗ 2011 и 2024 (anemia/labs.py), г/л
+PREGNANCY_NUMBERS = {95, 105}  # ВОЗ 2024, II триместр: только если беременность есть или не указана
 
 MACROS = {
     "DOCTOR": [r"врач", r"терапевт", r"доктор", r"гематолог", r"педиатр", r"гинеколог"],
@@ -255,7 +256,12 @@ def _question_numbers(q):
 
 def invented_numbers(text, facts, question=""):
     """Цифры Hb «… г/л» в ответе, которых нет ни в карточке фактов, ни в вопросе, ни в нормах ВОЗ (выдуманные)."""
-    allowed = _numbers(facts) | _question_numbers(question) | WHO_NUMBERS
+    p = facts.get("profile") or {}
+    norm = who2024_normal(p.get("sex"), p.get("age"), p.get("pregnant"), p.get("trimester"), p.get("elevation_m"))
+    allowed = _numbers(facts) | _question_numbers(question) | WHO_NUMBERS | ({round(norm)} if norm else set())
+    asked = re.search(r"беремен|жүкті", question or "", re.I)
+    if asked or (p.get("sex") != "M" and p.get("pregnant") is not False):  # о беременности спросили / не исключена
+        allowed |= PREGNANCY_NUMBERS
     found = {int(x) for m in HB_IN_TEXT.finditer(text) for x in m.groups() if x}
     return sorted(found - allowed)
 
@@ -271,7 +277,8 @@ def wrong_risk(text, facts):
 def wrong_norm(text, facts):
     """Нормы ВОЗ «норма … N г/л» в ответе, не совпадающие с нормой для профиля (пол, возраст, беременность)."""
     p = facts.get("profile") or {}
-    want = round(who_limits(p.get("sex"), p.get("age"), p.get("pregnant")).normal)
+    n = who2024_normal(p.get("sex"), p.get("age"), p.get("pregnant"), p.get("trimester"), p.get("elevation_m"))
+    want = round(n if n is not None else who_limits(p.get("sex"), p.get("age"), p.get("pregnant")).normal)
     return sorted({int(n) for n in NORM_IN_TEXT.findall(text)} - {want})
 
 

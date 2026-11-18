@@ -6,7 +6,14 @@
 
 import re
 
-from ..labs import lab_hb_report, who_grade, who_limits
+from ..labs import (
+    LabDataError,
+    classify_who2024,
+    lab_report,
+    who2024_altitude_adjustment,
+    who2024_normal,
+    who_limits,
+)
 
 # Точность ядра, которую персонализатор называет пользователю. Источник: results/metrics_history.csv,
 # task core, dataset eyes_defy, 2026-10-31 (f58eb53, calib_before): n = 193, AUC 0,856,
@@ -71,7 +78,9 @@ def photo_facts(result):
 
 
 def lab_facts(lab, profile):
-    """Отчёт labs.lab_hb_report(), число г/л или строка с единицей → блок lab (или None)."""
+    """Отчёт labs.lab_report() (ячейка Я3, ВОЗ 2024), число г/л или строка с единицей → блок lab (или None).
+    Число пересчитывается по ВОЗ 2024 для профиля (триместр и высота — если указаны). Если категорию определить
+    нельзя (например, беременность без триместра при Hb 95–99 или 105–109 г/л) — grade None и message."""
     if lab is None:
         return None
     if (
@@ -81,19 +90,26 @@ def lab_facts(lab, profile):
     ):
         lab = lab["hb_g_l"]  # только число без степени → пересчитать по ВОЗ для профиля
     if not isinstance(lab, dict):
-        lab = lab_hb_report(
-            lab,
-            sex=profile.get("sex"),
-            age=profile.get("age"),
-            pregnant=profile.get("pregnant"),
-        )
-    keys = ("hb_g_l", "grade", "grade_ru", "normal_from_g_l", "group")
+        try:
+            lab = lab_report(
+                lab,
+                sex=profile.get("sex"),
+                age=profile.get("age"),
+                pregnant=profile.get("pregnant"),
+                trimester=profile.get("trimester"),
+                elevation_m=profile.get("elevation_m"),
+            )
+        except LabDataError as e:  # данных не хватает: степень не выдумываем
+            lab = {**e.report, "message": str(e)}
+    keys = ("hb_g_l", "grade", "grade_ru", "normal_from_g_l", "group", "message")
     return {k: lab.get(k) for k in keys}
 
 
 def build_facts(result=None, lab=None, profile=None, survey=None):
     """Единственный источник правды о человеке для персонализатора."""
     profile = {"sex": None, "age": None, "pregnant": None, **(profile or {})}
+    # триместр и высота проживания — только если указаны (Я3); без них ключей нет, профиль как раньше
+    profile = {k: v for k, v in profile.items() if k not in ("trimester", "elevation_m") or v not in (None, "")}
     sv = None
     if survey is not None:
         sv = {k: None for k in SURVEY_KEYS}
@@ -108,8 +124,27 @@ def build_facts(result=None, lab=None, profile=None, survey=None):
 
 # ------------------------------------------------------------------ производные факты (только из карточки)
 def norm_g_l(facts):
+    """Порог нормы ВОЗ 2024 для профиля (как в Я3). Возраст не указан — порог взрослых по полу (ВОЗ 2011 и 2024
+    для взрослых совпадают), чтобы ответ не остался без числа."""
     p = facts.get("profile") or {}
-    return round(who_limits(p.get("sex"), p.get("age"), p.get("pregnant")).normal)
+    n = who2024_normal(
+        p.get("sex"), p.get("age"), p.get("pregnant"), p.get("trimester"), p.get("elevation_m")
+    )
+    if n is None:
+        n = who_limits(p.get("sex"), p.get("age"), p.get("pregnant")).normal
+    return round(n)
+
+
+def altitude_unknown(facts):
+    """Высота указана, но поправка ВОЗ 2024 для неё не задана (≥ 3000 м или неверный ввод)."""
+    h = (facts.get("profile") or {}).get("elevation_m")
+    if h in (None, ""):
+        return False
+    try:
+        who2024_altitude_adjustment(h)
+    except ValueError:
+        return True
+    return False
 
 
 def group_name(facts):
@@ -210,5 +245,8 @@ def hb_from_question(question, facts):
 
 
 def grade_of(hb, facts):
+    """Категория ВОЗ 2024 для числа из вопроса; None — нельзя определить без недостающих данных."""
     p = facts.get("profile") or {}
-    return who_grade(hb, p.get("sex"), p.get("age"), p.get("pregnant"))
+    return classify_who2024(
+        hb, p.get("sex"), p.get("age"), p.get("pregnant"), p.get("trimester"), p.get("elevation_m")
+    )["grade"]
