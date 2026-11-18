@@ -80,3 +80,13 @@ def test_ya3_new_report_kept_separately():
     ns = _run_ya3(Hb='10.7', Единица='г/дл', Пол_анализ='Женский', Возраст_анализ=28, Беременность_анализ='Да',
                   Триместр_анализ='Не знаю')
     assert ns['lab_2024'] is None and ns['lab']['grade'] == 'mild'       # отказ ВОЗ 2024 не лишает Я5 анализа
+
+
+@pytest.mark.parametrize('h', ['', '550', '1250'])
+def test_altitude_in_ya3_does_not_change_ya5(h, capsys):
+    ns = _run_ya3(Hb='12.2', Единица='г/дл', Пол_анализ='Женский', Возраст_анализ=30, Беременность_анализ='Нет',
+                  Триместр_анализ='Не знаю', Высота_проживания_м=h)
+    assert ns['lab'] == _old_ya3_lab('12.2', 'г/дл', 'Женский', 30, 'Нет')   # Я5 — прежний ВОЗ 2011
+    assert ns['lab_2024']['who2024']['grade'] == ('norm' if not h else 'mild')
+    out = capsys.readouterr().out
+    assert ('поправка на высоту не применена' in out) == (not h)

@@ -121,6 +121,12 @@ KZ_GRADE_RU = {'norm': 'Нет анемии', 'mild': 'Анемия лёгкой
 IRON_NOT_CONFIRMED = ('Железодефицит не подтверждён: недостаточно лабораторных данных '
                       '(нет ферритина и насыщения трансферрина, TSat).')
 NO_ADJUSTMENTS = 'Поправки на высоту проживания и курение не применены.'
+NO_SMOKING_ADJUSTMENT = 'Поправка на курение не применяется (поправки на высоту и курение не суммируются).'
+# Поправка ВОЗ 2024 на высоту проживания (таблица 4, NBK602198): (верхняя граница высоты, м, не включая; г/л).
+# Прибавляется к порогам (то же, что вычесть из измеренного Hb). Выше 2999 м таблица в модуле не задана:
+# отказ с сообщением, а не догадка. Только по введённой высоте; без высоты поправки нет.
+WHO2024_ALTITUDE = ((500, 0), (1000, 4), (1500, 8), (2000, 11), (2500, 14), (3000, 18))
+ELEVATION_INPUT_RANGE = (-500.0, 9000.0)   # м: проверка ввода (опечатки)
 NOT_DIAGNOSIS = 'Это интерпретация анализа крови, не оценка по фото и не диагноз; диагноз ставит врач.'
 
 # группа → (подпись, норма от, лёгкая от, умеренная от); ниже «умеренная от» — тяжёлая. ВОЗ 2024, таблица 3.
@@ -214,6 +220,42 @@ def _norm_hb(hb_g_l):
     return hb
 
 
+def _norm_elevation(elevation_m):
+    """Высота проживания, м → float или None (не указана). Не число / вне диапазона → _Invalid."""
+    if elevation_m is None:
+        return None
+    if isinstance(elevation_m, bool):
+        raise _Invalid(f'высота не число ({elevation_m!r})')
+    if isinstance(elevation_m, str):
+        if not elevation_m.strip():
+            return None
+        elevation_m = elevation_m.strip().replace(',', '.')
+    try:
+        h = float(elevation_m)
+    except (TypeError, ValueError):
+        raise _Invalid(f'высота не число ({elevation_m!r})') from None
+    if math.isnan(h):
+        return None
+    if not ELEVATION_INPUT_RANGE[0] <= h <= ELEVATION_INPUT_RANGE[1]:
+        raise _Invalid(f'высота {h:g} м вне диапазона {ELEVATION_INPUT_RANGE[0]:g}…{ELEVATION_INPUT_RANGE[1]:g} м')
+    return h
+
+
+def who2024_altitude_adjustment(elevation_m):
+    """Поправка ВОЗ 2024 к порогам Hb по высоте проживания (таблица 4), г/л. None — высота не указана.
+    Высота ≥ 3000 м — ValueError: таблица для неё в модуле не задана (нужно сверить с ВОЗ)."""
+    try:
+        h = _norm_elevation(elevation_m)
+    except _Invalid as e:
+        raise ValueError(str(e)) from None
+    if h is None:
+        return None
+    for upper, adj in WHO2024_ALTITUDE:
+        if h < upper:
+            return float(adj)
+    raise ValueError(f'высота {h:g} м: поправка ВОЗ 2024 для высоты от 3000 м в модуле не задана')
+
+
 def _hb_text(hb):
     return f'{hb:.2f}'.rstrip('0').rstrip('.').replace('.', ',')
 
@@ -265,19 +307,29 @@ def _unknowns(sex, pregnant, trimester, age):
     return u
 
 
-def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None):
-    """Классификация лабораторного Hb по ВОЗ 2024 (таблицы 2–3), без поправок на высоту и курение. → dict:
+def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None, elevation_m=None):
+    """Классификация лабораторного Hb по ВОЗ 2024 (таблицы 2–3). elevation_m — высота проживания, м: если указана,
+    пороги повышаются на поправку таблицы 4 (who2024_altitude_adjustment); не указана — без поправки.
+    Поправка на курение не применяется. → dict (+ altitude: высота и поправка или None):
     status: ok / insufficient (данных недостаточно) / invalid (противоречие); grade, grade_ru, anemic,
     normal_from_g_l (Hb не ниже этого — норма во всех возможных группах), group, message, notes.
     Неизвестные пол, беременность или триместр не подставляются: если при всех возможных значениях категория
     одна и та же — она выдаётся, иначе status = insufficient. Неизвестный возраст — всегда insufficient."""
     out = {'system': 'who2024', 'source': WHO2024_SOURCE, 'status': 'ok', 'grade': None, 'grade_ru': None,
-           'anemic': None, 'normal_from_g_l': None, 'group': None, 'message': '', 'notes': []}
+           'anemic': None, 'normal_from_g_l': None, 'group': None, 'message': '', 'notes': [], 'altitude': None}
     try:
         hb = _norm_hb(hb_g_l)
         s, a, p, t = _inputs(sex, age, pregnant, trimester)
+        h = _norm_elevation(elevation_m)
     except _Invalid as e:
         return {**out, 'status': 'invalid', 'message': f'Противоречивые или неверные данные: {e}.'}
+    try:
+        adj = who2024_altitude_adjustment(h)
+    except ValueError as e:
+        return {**out, 'status': 'insufficient', 'message': f'Недостаточно данных: {e}.'}
+    if adj is not None:
+        out['altitude'] = {'elevation_m': h, 'adjust_g_l': adj}
+    shift = adj or 0.0
     if a is None:
         return {**out, 'status': 'insufficient',
                 'message': 'Недостаточно данных: укажите возраст (пороги ВОЗ 2024 зависят от возраста).'}
@@ -285,7 +337,7 @@ def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None):
         return {**out, 'status': 'insufficient',
                 'message': 'ВОЗ 2024 не даёт порогов гемоглобина для детей младше 6 месяцев.'}
     groups = _who_candidates(s, a, p, t)
-    grades = {g: _grade_by(hb, *WHO2024_GROUPS[g][1:]) for g in groups}
+    grades = {g: _grade_by(hb - shift, *WHO2024_GROUPS[g][1:]) for g in groups}   # = пороги + поправка
     if len(set(grades.values())) > 1:
         detail = '; '.join(f'{WHO2024_GROUPS[g][0]}: {GRADE_RU[k].lower()}' for g, k in grades.items())
         need = ', '.join(_unknowns(s, p, t, a)) or 'анкету'
@@ -300,11 +352,16 @@ def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None):
         label = f'не указано: {", ".join(_unknowns(s, p, t, a))}'
         notes.append('Категория одинакова при всех возможных значениях того, что не указано '
                      f'({"; ".join(WHO2024_GROUPS[g][0] for g in groups)}).')
+    if adj is not None:
+        notes.append(f'Порог с учётом высоты проживания {h:g} м: +{adj:g} г/л ко всем порогам '
+                     '(ВОЗ 2024, таблица 4).' if adj else
+                     f'Высота проживания {h:g} м: ниже 500 м, поправка ВОЗ 2024 не нужна (0 г/л).')
     if a > WHO2024_ADULT_MAX_AGE and not p:
         notes.append('ВОЗ 2024 даёт пороги взрослых для 15–65 лет; отдельных порогов старше 65 лет нет, '
                      'применены пороги взрослых.')
     return {**out, 'grade': grade, 'grade_ru': GRADE_RU[grade], 'anemic': grade != 'norm',
-            'normal_from_g_l': float(max(WHO2024_GROUPS[g][1] for g in groups)), 'group': label, 'notes': notes}
+            'normal_from_g_l': float(max(WHO2024_GROUPS[g][1] for g in groups)) + shift, 'group': label,
+            'notes': notes}
 
 
 def classify_kz2017(hb_g_l, sex=None, age=None, pregnant=None):
@@ -360,25 +417,28 @@ def _system_line(name, c, normal_word):
     return f'{head}: {c["grade_ru"].lower()}.' + ''.join(f' {n}' for n in c['notes'])
 
 
-def lab_report(value, unit=None, sex=None, age=None, pregnant=None, trimester=None):
+def lab_report(value, unit=None, sex=None, age=None, pregnant=None, trimester=None, elevation_m=None):
     """Интерпретация готового лабораторного Hb (ячейка Я3): ВОЗ 2024 и протокол МЗ РК 2017 — двумя отдельными
     системами. С оценкой по фото не связана: цифры фото-модели здесь не используются.
     → dict: прежние ключи (grade, grade_ru, anemic, normal_from_g_l, group — по ВОЗ 2024), who2024, kz2017,
     iron_deficiency (отдельный статус железодефицита), text. В персонализатор (Я5) этот отчёт не передаётся:
-    Я5 получает прежний lab_hb_report (ВОЗ 2011).
+    Я5 получает прежний lab_hb_report (ВОЗ 2011). elevation_m — высота проживания, м (поправка ВОЗ 2024 только к
+    шкале ВОЗ и только если высота указана; шкала МЗ РК без поправки).
     Ошибка числа или единицы → ValueError. Если по ВОЗ 2024 классифицировать нельзя (данных недостаточно или
     противоречие) → LabDataError (подкласс ValueError) с понятным сообщением и полным отчётом в .report."""
     hb = hb_to_g_l(value, unit)
-    who = classify_who2024(hb, sex, age, pregnant, trimester)
+    who = classify_who2024(hb, sex, age, pregnant, trimester, elevation_m)
     kz = classify_kz2017(hb, sex, age, pregnant)
     iron = iron_deficiency_status()
+    adjust = ('Поправка на высоту применена только к ВОЗ 2024; в шкале МЗ РК её нет. ' if who['altitude'] else
+              'Высота проживания не указана: поправка на высоту не применена. ') + NO_SMOKING_ADJUSTMENT
     text = '\n'.join([
         f'Hb {_hb_text(hb)} г/л (лабораторный анализ).',
         '• ' + _system_line('ВОЗ 2024', who, 'норма'),
         '• ' + _system_line('МЗ РК 2017, степень анемии по шкале протокола, взрослые', kz, 'норма'),
         '• ' + iron['text'],
         'ВОЗ и МЗ РК — две отдельные системы: их категории и пороги не совпадают. Степень анемии — не диагноз ЖДА. '
-        + NO_ADJUSTMENTS,
+        + adjust,
         NOT_DIAGNOSIS])
     report = {'source': 'лабораторный анализ', 'hb_g_l': round(hb, 1), 'status': who['status'],
               'grade': who['grade'], 'grade_ru': who['grade_ru'], 'anemic': who['anemic'],

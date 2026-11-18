@@ -184,7 +184,8 @@ def test_report_shows_who_and_kz_separately():
     assert len(who) == 1 and len(kz) == 1
     assert 'умеренная анемия' in who[0] and 'лёгкая' not in who[0]
     assert 'анемия лёгкой степени' in kz[0] and 'умеренная' not in kz[0]
-    assert 'не применены' in r['text'] and 'не диагноз' in r['text']
+    assert 'поправка на высоту не применена' in r['text'] and 'не диагноз' in r['text']
+    assert 'Поправка на курение не применяется' in r['text']
 
 
 def test_report_keeps_legacy_keys_from_who2024():
