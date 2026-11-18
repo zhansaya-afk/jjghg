@@ -21,6 +21,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from . import anatomy as AN
 from . import core as CORE
 from . import crop_quality as CQ
+from . import retake as RT
 from . import eyes as EYES
 from . import regions as R
 from . import segment_baseline as SB
@@ -1161,6 +1162,9 @@ def format_result(r):
             lines.append(f"Hb: {r['hb_note']}")
         lines += [f'Почему: {x}' for x in r['reasons']]
     else:
+        hint = RT.retake_text(r)
+        if hint:
+            lines.append(hint)
         lines += [f'Проблема: {x}' for x in r['issues']]
     lines += [f'Примечание: {x}' for x in r['notes']]
     if r.get('diag'):

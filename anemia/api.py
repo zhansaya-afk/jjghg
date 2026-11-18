@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from . import predict as PR
+from . import retake as RT
 
 RISK_UNKNOWN = 'не определён'
 TISSUE = {('conj', 'sclera'): 'обе', ('conj',): 'конъюнктива', ('sclera',): 'склера'}
@@ -60,6 +61,7 @@ class Result:
     symptoms: dict | None = None
     disclaimer: str = PR.DISCLAIMER
     diag: list = field(default_factory=list)
+    retake: str = ''                   # «Переснимите, потому что …. Как: …» (anemia/retake.py); '' — не нужно
 
     def to_dict(self, images=True):
         """Словарь для JSON. images=True — маски и вырезка как PNG в base64, False — без них."""
@@ -206,7 +208,8 @@ def to_result(r, version, symptoms=None):
                   tissue=TISSUE[tuple(r['tissues'])] if ok else None,
                   reason=_reason(r), quality=_quality(r), warnings=warnings, masks=masks, crop=crop,
                   model_version=version, status=r['status'], stage=r['stage'],
-                  hb_note=r['hb_note'] if ok else None, symptoms=symptoms, diag=list(r.get('diag') or []))
+                  hb_note=r['hb_note'] if ok else None, symptoms=symptoms, diag=list(r.get('diag') or []),
+                  retake=RT.retake_text(r))
 
 
 # ------------------------------------------------------------------ главный вход
