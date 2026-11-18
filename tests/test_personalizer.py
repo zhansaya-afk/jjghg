@@ -124,8 +124,11 @@ def test_kazakh_without_knowledge_base_is_honest():
     f = facts()
     assert answer("Қандай дәрі ішу керек?", f)["text"] == T.KK_DOSE
     assert answer("Темір дәрісін қанша ішу керек?", f)["text"] == T.KK_DOSE
+    # с 2026-11-18 общий вопрос ищется в казахской базе kb/kk.md (tests/test_personalizer_kk_kb.py)
     general = answer("Қандай тағам жеу керек?", f)
-    assert general["text"].startswith(T.KK_ONLY_RESULT) and "қаупі" in general["text"]
+    assert (
+        general["sources"] == ["nutrition"] and T.KK_ONLY_RESULT not in general["text"]
+    )
     result = answer("Нәтижем нені білдіреді?", f)
     assert T.KK_ONLY_RESULT not in result["text"] and "қаупі" in result["text"]
     assert answer("Баламды тексеруге бола ма?", f)["mode"] == "child"
@@ -145,7 +148,7 @@ def test_kazakh_bad_photo_asks_retake():
     f = facts(F_BAD)
     assert answer("Нәтижем нені білдіреді?", f)["text"] == T.KK_RETAKE
     general = answer("Қандай тағам жеу керек?", f)["text"]
-    assert general.startswith(T.KK_ONLY_RESULT) and T.KK_RETAKE in general
+    assert T.KK_ONLY_RESULT not in general and "қайта түсіріңіз" in general
 
 
 def test_survey_flag_and_severe_lab_are_urgent():

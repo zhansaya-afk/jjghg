@@ -5,7 +5,7 @@
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -128,8 +128,12 @@ class Retriever:
     Всё это и порог engine.THRESHOLD = 0,35 — для TF-IDF; с encoder= (эмбеддер) поиск по полному тексту
     и лучшей формулировке, порог для него надо подбирать заново."""
 
-    def __init__(self, fragments, encoder=None):
-        self.fragments = list(fragments)
+    def __init__(self, fragments, encoder=None, prep=None):
+        self.prep = prep or (lambda t: t)
+        self.fragments = [
+            fr if prep is None else replace(fr, examples=[prep(e) for e in fr.examples])
+            for fr in fragments
+        ]
         self.owner = [i for i, fr in enumerate(self.fragments) for _ in fr.examples]
         self.encoder = encoder
         if encoder is None:
@@ -147,6 +151,7 @@ class Retriever:
 
     def search(self, question, k=3):
         """→ [(Fragment, сходство 0–1)] по убыванию."""
+        question = self.prep(question)
         key, full = _key(question), _norm(question)
         if not full:
             return []
@@ -169,6 +174,25 @@ class Retriever:
         return [(self.fragments[i], best[i]) for i in order]
 
 
+# казахские частицы и местоимения в записи kk_norm (без казахских букв): «бола ма», «маган керек пе»
+_KK_STOP_WORDS = """
+    ма ме ба бе па пе ғой гой да де та те ғана гана мен менин маган мени менде сиз сизге сизди сизде сизин
+    биз бизге ол оны оган бул осы сол бар жок керек емес жане мен де ше еди едим
+"""
+KK_STOP = frozenset(_KK_STOP_WORDS.split())
+
+
+def kk_prep(s):
+    """Казахский текст для поиска: казахские буквы → русские двойники (как пишут на телефоне: «каным аз»)
+    и без частиц. Одинаково для формулировок базы и вопроса."""
+    from .router import kk_norm
+
+    t = re.sub(r"[^\w\s/%]", " ", kk_norm(s))
+    return " ".join(w for w in t.split() if w not in KK_STOP)
+
+
 @lru_cache(maxsize=4)
 def default_retriever(lang="ru"):
+    if lang == "kk":
+        return Retriever(load_kb("kk"), prep=kk_prep)
     return Retriever(load_kb(lang))

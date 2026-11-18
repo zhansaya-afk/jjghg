@@ -8,6 +8,7 @@ import re
 
 from ..personalizer_eval import violations
 from . import texts as T
+from . import texts_kk as TK
 from .context import (
     asks_dose,
     base_question,
@@ -18,7 +19,7 @@ from .context import (
 )
 from .facts import build_facts, hb_from_question, photo_ok
 from .retrieve import SLOT, default_retriever, load_kb
-from .router import lang_of, needs_retake, route
+from .router import kk_norm, lang_of, needs_retake, route
 
 THRESHOLD = 0.35  # сходство ниже порога → «не знаю»; выбран на наборе A (evals/personalizer/search_questions.json)
 # вопрос без слов про анемию («На парах выдыхаюсь»): маршрутизатор считает его «не моей темой»; если поиск
@@ -87,27 +88,84 @@ def _fragment(fid):
     return next(fr for fr in load_kb("ru") if fr.id == fid)
 
 
-def _kk(mode, why, question, facts):
+def _kk_fragment(fid):
+    return next(fr for fr in load_kb("kk") if fr.id == fid)
+
+
+def kk_fill(body, facts, question=""):
+    return tidy(SLOT.sub(lambda m: TK.SLOTS[m.group(1)](facts, question), body))
+
+
+KK_PREGNANT = re.compile(r"жукти|бала\s*кутип")
+
+
+def _kk(mode, why, question, facts, note=None, trace=None):
+    """Казахский вопрос. Срочное, дети, дозы и препараты, «переснимите» решены правилами раньше и не меняются.
+    Остальное ищется в казахской базе kb/kk.md (перевод ru.md, ИИ-черновик) тем же порогом, что русский поиск;
+    не нашлось — как раньше: объяснение результата для вопроса о нём, иначе «не знаю».
+    → (режим, текст, источники)."""
+    note = note or (lambda _n: None)
     if mode == "urgent":
-        return "urgent", T.kk_urgent(facts, why)
+        return "urgent", T.kk_urgent(facts, why), []
     if mode == "child":
-        return "child", T.KK_CHILD
+        return "child", T.KK_CHILD, []
     if why == "dose":
-        return "answer", T.KK_DOSE
+        return "answer", T.KK_DOSE, []
     if mode == "retake":
-        return "retake", T.KK_RETAKE
-    if mode in ("out_of_scope", "dont_know"):
-        return "out_of_scope", T.KK_OUT
+        return "retake", T.KK_RETAKE, []
+    if mode == "dont_know" or (mode == "out_of_scope" and why is not None):
+        return "out_of_scope", T.KK_OUT, []
     if why == "drug":
-        return "answer", T.KK_DOSE
-    if why is None and needs_retake(question, facts):  # снимок непригоден, анализа нет
-        if T.kk_about_result(question, facts):
-            return "retake", T.KK_RETAKE
-        return "answer", T.join(T.KK_ONLY_RESULT, T.KK_RETAKE)
-    if why is None and not T.kk_about_result(question, facts):
-        # базы знаний на казахском нет: честно сказать и объяснить результат (вопрос «что есть?» не о нём)
-        return "answer", T.join(T.KK_ONLY_RESULT, T.kk_explain(facts, question))
-    return "answer", T.kk_explain(facts, question)
+        return "answer", T.KK_DOSE, []
+    if (
+        why is not None
+    ):  # диагноз, приветствие и т.п.: как раньше — объяснение результата
+        return "answer", T.kk_explain(facts, question), []
+    fr = None
+    if question:
+        hits = default_retriever("kk").search(question, k=3)
+        if trace is not None:
+            trace["search"] = [(h.id, round(sc, 2)) for h, sc in hits]
+        thr = OFF_DOMAIN_THRESHOLD if mode == "out_of_scope" else THRESHOLD
+        if hits and hits[0][1] >= thr:
+            fr = hits[0][0]
+            if mode == "out_of_scope":
+                note(OFF_DOMAIN_NOTE)
+    if mode == "out_of_scope" and fr is None:
+        return "out_of_scope", T.KK_OUT, []
+    plain = kk_norm(question)
+    if fr is not None and fr.id in GENERAL_FOR_PREGNANCY and KK_PREGNANT.search(plain):
+        fr = _kk_fragment("pregnancy")
+        note("в вопросе беременность: тема pregnancy вместо общей")
+    if hb_from_question(question, facts) and (fr is None or fr.id in NOT_ABOUT_NUMBER):
+        note("в вопросе число Hb: объяснение числа")
+        return "answer", T.kk_explain(facts, question), []
+    if fr is not None and fr.id == LAB and facts.get("photo") and facts.get("lab"):
+        fr = _kk_fragment("photo_vs_lab")
+        note("есть и фото, и анализ: тема photo_vs_lab")
+    retake = needs_retake(question, facts)
+    if retake and (fr.id in ABOUT_RESULT if fr else T.kk_about_result(question, facts)):
+        note("снимок непригоден: «переснимите»")
+        return "retake", T.KK_RETAKE, []
+    if fr is None:
+        if T.kk_about_result(question, facts) and not retake:
+            note("вопрос про результат: объяснение результата")
+            return "answer", T.kk_explain(facts, question), []
+        text = TK.DONT_KNOW
+        return "dont_know", T.join(text, TK.RETAKE_NOTE) if retake else text, []
+    note(f"казахская база: тема {fr.id}")
+    text, sources = kk_fill(fr.body, facts, question), [fr.id]
+    data = [k for k in fr.slots if k != "doctor"]
+    if (
+        data
+        and len(SLOT.sub("", fr.body).strip()) < 60
+        and not any(TK.SLOTS[k](facts, question) for k in data)
+    ):
+        text, sources = kk_fill(_kk_fragment(EXPLAIN).body, facts, question), [EXPLAIN]
+        note(f"для темы {fr.id} нет данных: общее объяснение результата")
+    if retake:
+        text = T.join(text, TK.RETAKE_NOTE)
+    return "answer", text, sources
 
 
 def rules_answer(
@@ -142,8 +200,7 @@ def rules_answer(
         if mode is None:
             note(OFF_DOMAIN_NOTE)
     if lang == "kk":
-        mode, text = _kk(mode, why, q, facts)
-        note("казахский: готовый шаблон")
+        mode, text, sources = _kk(mode, why, search or q, facts, note, trace)
         return {
             "text": tidy(text),
             "mode": mode,
