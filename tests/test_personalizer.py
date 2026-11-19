@@ -124,8 +124,11 @@ def test_kazakh_without_knowledge_base_is_honest():
     f = facts()
     assert answer("Қандай дәрі ішу керек?", f)["text"] == T.KK_DOSE
     assert answer("Темір дәрісін қанша ішу керек?", f)["text"] == T.KK_DOSE
+    # с 2026-11-18 общий вопрос ищется в казахской базе kb/kk.md (tests/test_personalizer_kk_kb.py)
     general = answer("Қандай тағам жеу керек?", f)
-    assert general["text"].startswith(T.KK_ONLY_RESULT) and "қаупі" in general["text"]
+    assert (
+        general["sources"] == ["nutrition"] and T.KK_ONLY_RESULT not in general["text"]
+    )
     result = answer("Нәтижем нені білдіреді?", f)
     assert T.KK_ONLY_RESULT not in result["text"] and "қаупі" in result["text"]
     assert answer("Баламды тексеруге бола ма?", f)["mode"] == "child"
@@ -145,7 +148,7 @@ def test_kazakh_bad_photo_asks_retake():
     f = facts(F_BAD)
     assert answer("Нәтижем нені білдіреді?", f)["text"] == T.KK_RETAKE
     general = answer("Қандай тағам жеу керек?", f)["text"]
-    assert general.startswith(T.KK_ONLY_RESULT) and T.KK_RETAKE in general
+    assert T.KK_ONLY_RESULT not in general and "қайта түсіріңіз" in general
 
 
 def test_survey_flag_and_severe_lab_are_urgent():
@@ -484,7 +487,7 @@ def _picker(reply, calls=None):
 
 
 def test_understand_picks_topic_for_paraphrase():
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     assert answer(q, facts())["mode"] in ("out_of_scope", "dont_know")
     r = answer(q, facts(), engine="understand", llm=_picker("can_worsen"))
     assert r["engine"] == "understand" and r["sources"] == ["can_worsen"]
@@ -493,7 +496,7 @@ def test_understand_picks_topic_for_paraphrase():
 
 @pytest.mark.parametrize("reply", ["NONE", "", "не знаю", "no_such_topic"])
 def test_understand_none_keeps_dont_know(reply):
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     r = answer(q, facts(), engine="understand", llm=_picker(reply))
     assert r["engine"] == "rules" and r["mode"] in ("out_of_scope", "dont_know")
 
@@ -518,7 +521,7 @@ def test_understand_model_error_keeps_rules():
     def boom(messages, **kw):
         raise RuntimeError("нет модели")
 
-    q = "Со временем станет только хуже?"
+    q = "Если запустить, что будет?"
     r = answer(q, facts(), engine="understand", llm=boom)
     assert r["engine"] == "rules" and r["text"] == answer(q, facts())["text"]
 
