@@ -4,7 +4,6 @@
 два отдельных блока, друг на друга не влияют. Норма ВОЗ берётся из anemia.labs.
 """
 
-import math
 import re
 
 from ..labs import lab_hb_report, who_grade, who_limits
@@ -49,17 +48,6 @@ def _get(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-HB_LOW_SHOWN = 100  # г/л, = predict.HB_LOW_SHOWN (без тяжёлого импорта ядра; равенство проверяет тест)
-
-
-def _estimate_shown(iv, est):
-    """Как predict.hb_estimate_shown (без тяжёлого импорта ядра): прогноз до 5 г/л внутри диапазона;
-    прогноза нет → середина диапазона."""
-    lo, hi = iv
-    est = (lo + hi) / 2 if est is None else est
-    return float(min(max(5 * math.floor(est / 5 + 0.5), lo), hi))
-
-
 def photo_facts(result):
     """api.Result, его to_dict() или dict из predict.analyze_photo → блок photo (или None)."""
     if result is None:
@@ -69,23 +57,14 @@ def photo_facts(result):
         result, "hb_range"
     ):  # сырой dict analyze_photo
         out["hb_interval_g_l"] = list(_get(result, "hb_range"))
-    if out["hb_estimate_g_l"] is None and out["hb_interval_g_l"]:
-        # сырой dict analyze_photo: оценка как на экране (predict.hb_estimate_shown)
-        out["hb_estimate_g_l"] = _estimate_shown(
-            out["hb_interval_g_l"], _get(result, "hb_estimate")
-        )
     if out["tissue"] is None and _get(result, "tissues"):
         out["tissue"] = _TISSUE.get(tuple(_get(result, "tissues")))
     if out["reason"] is None and out["status"] != "ok" and _get(result, "issues"):
         # сырой dict analyze_photo: причина — первая проблема снимка, без совета после «—»
         out["reason"] = str(_get(result, "issues")[0]).split(" — ")[0].rstrip(".")
-    if (
-        out["status"] == "ok"
-        and out["hb_estimate_g_l"] is not None
-        and out["hb_estimate_g_l"] < HB_LOW_SHOWN
-    ):
-        # низкая оценка: пользователю число не показывается — в карточку Personalizer цифры не попадают
-        out.update(hb_interval_g_l=None, hb_estimate_g_l=None, hb_low_hidden=True)
+    if out["status"] == "ok" and out["hb_interval_g_l"]:
+        # число Hb по фото пользователю не показывается (predict.HB_USER): в карточку Personalizer цифры не попадают
+        out.update(hb_interval_g_l=None, hb_estimate_g_l=None, hb_hidden=True)
     if out["status"] != "ok":
         out.update(
             risk="не определён",

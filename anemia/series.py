@@ -188,8 +188,7 @@ def format_series(s):
         lines.append(f"РИСК АНЕМИИ: {s['risk'].upper()} — {PR.RISK_TEXT[s['risk']]}")
         if s['hb_range']:
             lines.append(f"Hb по фото: {PR.hb_text(s)} ({s['hb_note']})")
-            if PR.hb_low(s):
-                lines.append(f'Hb по фото — внимание: {PR.HB_LOW_CAVEAT}')
+            lines.append(f'Hb по фото — внимание: {PR.HB_DOCTOR_CAVEAT}')
         else:
             lines.append(f"Hb: {s['hb_note']}")
         lines += [f'Почему: {x}' for x in s['reasons']]

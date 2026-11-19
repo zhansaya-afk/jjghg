@@ -56,12 +56,7 @@ def risk_meaning(f):
 def hb_photo(f):
     if not F.photo_ok(f):
         return ""
-    iv = f["photo"].get("hb_interval_g_l")
-    if iv:
-        return (
-            f"Гемоглобин шамамен {_hb(iv[0])}–{_hb(iv[1])} г/л, бірақ бұл қабақтың түсі бойынша болжам ғана, "
-            "өлшем емес."
-        )
+    # фото бойынша Hb саны пайдаланушыға көрсетілмейді (texts.hb_photo, predict.HB_USER сияқты)
     return "Бұл фото бойынша жүйе гемоглобин санын бермейді: мұндай баға сенімсіз болар еді."
 
 

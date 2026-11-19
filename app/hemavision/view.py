@@ -259,16 +259,9 @@ def hb_html(r):
     модели Hb — в разделе для врача (doctor_html). Без оценки — пустая строка."""
     if r.get('status') != 'ok':
         return ''
-    if r.get('hb_range') and PR.hb_low(r):     # низкая оценка: число ненадёжно — только врачу (отчёт), не на экране
-        return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин по фото</h3><p>{_e(PR.HB_LOW_USER)}</p>'
+    if r.get('hb_range'):     # число Hb по фото пользователю не показывается (только врачу — в отчёте)
+        return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин по фото</h3><p>{_e(PR.HB_USER)}</p>'
                 f'<p class="hv-small">{BLOOD_TEST}</p></div>')
-    if r.get('hb_range'):
-        lo, hi = r['hb_range']
-        est = PR.hb_estimate_shown(r)
-        return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин по фото: оценка <span class="hv-tag">'
-                f'экспериментально</span></h3><p class="hv-hb">~{est:.0f} <small>г/л</small></p>'
-                f'<p>Точно не определить: {lo:.0f}–{hi:.0f} г/л.</p><p class="hv-small"><b>Это НЕ анализ крови</b>, '
-                f'а грубая оценка по цвету на фото. {BLOOD_TEST}</p></div>')
     return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин</h3><p class="hv-small">По этому фото цифра гемоглобина '
             f'не показывается: модель Hb пока недостаточно точна. {BLOOD_TEST}</p></div>')
 
@@ -325,7 +318,7 @@ def doctor_html(r, version=''):
     if r.get('method'):
         items.append(f'Выбор ткани: {_e(PR.METHOD_RU.get(r["method"], "Авто"))}')
     items += [_e(x) for x in (r.get('reasons') if ok else r.get('issues')) or []]
-    if ok and r.get('hb_note') and not PR.hb_low(r):    # при низкой оценке цифры Hb — только в отчёте для врача
+    if ok and r.get('hb_note') and not r.get('hb_range'):   # цифры Hb по фото — только в отчёте для врача
         items.append('Hb: ' + _e(r['hb_note']))
     items += ['Примечание: ' + _e(x) for x in r.get('notes') or []]
     diag = ''.join(f'<li>{_e(x)}</li>' for x in r.get('diag') or [])
