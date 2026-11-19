@@ -92,6 +92,20 @@ def is_follow_up(question):
     return len(words) <= 4 and all(w in ASK_WORDS or GROUP.match(w) for w in words)
 
 
+# «Можно ли это предотвратить?», «А его можно вылечить?» — вопрос о том, о чём говорили раньше
+REFERS_BACK = re.compile(
+    r"\b(?:это|этого|этому|этим|этом|эту|такое|такого|е[её]|его|она|оно|него|не[её]|ней|нем|н[её]м)\b",
+    re.IGNORECASE,
+)
+
+
+def refers_back(question):
+    """Короткий вопрос со ссылкой на прошлое («это», «её»): тема может быть только в прошлом вопросе."""
+    return (
+        bool(REFERS_BACK.search(question or "")) and len(_norm(question).split()) <= 6
+    )
+
+
 def is_short_mark(question):
     """«А ферритин?», «А железо тоже?» — может быть и уточнением, и новым вопросом: сначала ищется сам."""
     return bool(SHORT_MARK.match(question or "")) and len(_norm(question).split()) <= 3
