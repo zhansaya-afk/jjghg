@@ -20,6 +20,13 @@ import numpy as np
 
 BLUR_MIN = 1.3            # тот же порог резкости, что в regions.quality (не ослабляется)
 MEASURE_SIDE = 320        # = regions.WORK_SIDE: крупнее — уменьшить до него, мельче — мерить как есть (не увеличивать)
+# Ширина размытых краёв по градиентам двух масштабов (edge_sigma), в долях стороны кадра измерения. blur_ratio
+# (лапласиан) на 8-битных и шумных снимках НЕ монотонен: шум и шаг квантования дают лапласиану «детали», и сильно
+# размытый снимок выглядит резким (2026-11-18: σ 8 px → blur_ratio 4,0 при пороге 1,3). Градиент на масштабах 2 и 4 px
+# шум почти не видит. Порог задан заранее (≈ 6 px на кадре 320 px), не подобран по снимкам; проверка доли ложных
+# отказов на чистых снимках Eyes-defy — scripts/qc_stress.py в Colab.
+EDGE_SCALES = (2.0, 4.0)
+EDGE_SIGMA_REL_MAX = 0.019
 DRIFT_MAX = 0.10          # правило вывода порогов (задано до расчёта): медиана сдвига признаков цвета века ≤ 0,10 SD
 IOU_DROP_MAX = 0.03       # … и средний IoU сегментатора падает не больше чем на 0,03 от полного разрешения
 
@@ -121,6 +128,29 @@ def blur_ratio(rgb, roi):
     return float(e0 / (e1 + 1e-6))
 
 
+def _grad(g, s):
+    b = cv2.GaussianBlur(g, (0, 0), s)
+    return np.hypot(cv2.Sobel(b, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(b, cv2.CV_32F, 0, 1, ksize=3)) / 8
+
+
+def edge_sigma(rgb, roi, q=95):
+    """Оценка σ размытия краёв (px), устойчивая к шуму: у гауссова края пик градиента после сглаживания s
+    ∝ 1/√(σ² + s²), поэтому отношение пиков на масштабах s1 < s2 даёт σ. Пик — q-й перцентиль |∇| у границ roi.
+    Мягкие края самой ткани тоже дают σ > 0 (резкий синтетический глаз ≈ 4 px на 320 px)."""
+    g = gray255(rgb) / 255
+    band = cv2.dilate(np.asarray(roi, np.uint8), np.ones((9, 9), np.uint8)) > 0
+    if not band.any():
+        return float('nan')
+    s1, s2 = EDGE_SCALES
+    a, b = (np.percentile(_grad(g, s)[band], q) for s in (s1, s2))
+    if a <= 1e-6:
+        return float('inf')
+    r2 = (a / max(b, 1e-9)) ** 2
+    if r2 <= 1 + 1e-6:
+        return float('inf')
+    return float(np.sqrt(max((s2 ** 2 - r2 * s1 ** 2) / (r2 - 1), 0.0)))
+
+
 def strip_px(mask_src):
     """Полоса века в пикселях исходного фото → (ширина, толщина): ширина — по рамке главной части, толщина —
     медиана высоты маски по столбцам."""
@@ -151,7 +181,9 @@ def measure(src, lid, roi=None, offset=(0, 0)):
                                          interpolation=cv2.INTER_AREA)
     rr = r if k == 1 else to_source(r, img.shape)
     w, t = strip_px(m)
+    es = edge_sigma(img, rr)
     return {'lid_w': w, 'lid_h': round(t, 1), 'blur': blur_ratio(img, rr), 'measure_scale': round(k, 3),
+            'edge_sigma_rel': round(es / max(img.shape[:2]), 4) if np.isfinite(es) else es,
             'noise': round(noise_sigma(src), 2), 'block': round(blockiness(src, offset), 3)}
 
 
@@ -208,6 +240,9 @@ def check(q, limits=None, file_q=None):
     elif rel_blur(q, lim) > lim['rel_blur_max']:
         issues.append(f'снимок размыт относительно размера глаза (размытие {rel_blur(q, lim):.3f} ширины века, '
                       f'допустимо ≤ {lim["rel_blur_max"]:.3f}) — увеличение вырезки резкость не вернёт')
+    elif q.get('edge_sigma_rel', 0) > EDGE_SIGMA_REL_MAX:      # nan/inf: inf — краёв нет совсем (размыто)
+        issues.append(f'снимок размыт: края ткани размыты на {q["edge_sigma_rel"] * 100:.1f}% кадра (допустимо ≤ '
+                      f'{EDGE_SIGMA_REL_MAX * 100:.1f}%) — шум камеры маскировал размытие')
     return issues
 
 
