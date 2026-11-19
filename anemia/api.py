@@ -57,6 +57,7 @@ class Result:
     status: str = 'retake'             # 'ok' | 'retake' (переснять) | 'unreliable' (снимок не похож на обучающие)
     stage: str = 'frame'               # где остановилось ядро (см. predict.analyze_photo)
     hb_note: str | None = None
+    hb_estimate_g_l: float | None = None  # оценка Hb по фото, г/л, округлена до 5; только вместе с hb_interval_g_l
     symptoms: dict | None = None
     disclaimer: str = PR.DISCLAIMER
     diag: list = field(default_factory=list)
@@ -206,7 +207,8 @@ def to_result(r, version, symptoms=None):
                   tissue=TISSUE[tuple(r['tissues'])] if ok else None,
                   reason=_reason(r), quality=_quality(r), warnings=warnings, masks=masks, crop=crop,
                   model_version=version, status=r['status'], stage=r['stage'],
-                  hb_note=r['hb_note'] if ok else None, symptoms=symptoms, diag=list(r.get('diag') or []))
+                  hb_note=r['hb_note'] if ok else None,
+                  hb_estimate_g_l=PR.hb_estimate_shown(r) if ok else None, symptoms=symptoms, diag=list(r.get('diag') or []))
 
 
 # ------------------------------------------------------------------ главный вход

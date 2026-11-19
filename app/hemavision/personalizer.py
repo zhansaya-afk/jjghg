@@ -37,6 +37,7 @@ class PersonalizerInput:
     issues: tuple = ()                  # причины, почему снимок не подошёл (тексты analyze_photo)
     lab: dict | None = None             # готовый анализ крови: dict labs.lab_hb_report (как Я3) или None
     history: tuple = ()                 # прошлые реплики диалога: ({'role': 'user'|'assistant', 'text': ...}, ...)
+    hb_estimate: float | None = None    # прогноз Hb по фото (г/л, analyze_photo); None — середина hb_range
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,8 @@ class RulesPersonalizer:
         from anemia.personalizer import personalize
 
         result = {'status': inp.status, 'stage': inp.stage, 'risk': inp.risk, 'p_anemia': inp.p_anemia,
-                  'hb_range': list(inp.hb_range) if inp.hb_range else None, 'tissues': list(inp.tissues),
+                  'hb_range': list(inp.hb_range) if inp.hb_range else None, 'hb_estimate': inp.hb_estimate,
+                  'tissues': list(inp.tissues),
                   'issues': list(inp.issues)}
         profile = {'sex': inp.sex, 'age': inp.age, 'pregnant': inp.pregnant}
         survey = dict(inp.wellbeing) if inp.wellbeing else None
@@ -111,7 +113,8 @@ def make_input(r, survey, lab=None):
                              wellbeing=dict(survey.wellbeing), stage=r.get('stage'),
                              p_anemia=float(p) if ok and p is not None else None,
                              tissues=tuple(r.get('tissues') or ()) if ok else (),
-                             issues=tuple(str(x) for x in r.get('issues') or ()), lab=lab)
+                             issues=tuple(str(x) for x in r.get('issues') or ()), lab=lab,
+                             hb_estimate=r.get('hb_estimate') if ok and r.get('hb_range') else None)
 
 
 # ------------------------------------------------------------------ диалог (как ячейка Я5, но в интерфейсе)

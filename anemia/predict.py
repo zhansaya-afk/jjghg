@@ -12,6 +12,7 @@
 Лабораторный Hb сюда не передаётся и с фото не смешивается: для него anemia.labs.lab_hb_report.
 """
 import io
+import math
 import os
 
 import cv2
@@ -41,6 +42,42 @@ RISK_TEXT = {'высокий': 'признаки бледности выраже
              'средний': 'по фото уверенно сказать нельзя — сдайте общий анализ крови (Hb)',
              'низкий': 'признаков анемии по фото нет; это не исключает анемию, при симптомах сдайте анализ крови'}
 DISCLAIMER = 'Скрининг риска по фото, не диагноз. Решение принимает врач по анализу крови.'
+HB_NOT_LAB = 'это НЕ анализ крови'
+# Показ, не расчёт: при оценке ниже этого значения пользователю число Hb не показывается (интерфейс, Personalizer),
+# в отчёте для врача (Я2, .txt, PDF) — показывается с оговоркой HB_LOW_CAVEAT. Модель, диапазон и риск не меняются.
+HB_LOW_SHOWN = 100       # г/л
+HB_LOW_USER = ('Число гемоглобина по этому фото не показываем: оценка попала в область низких значений, а там '
+               'оценка по фото ненадёжна (обычно завышает). Сдайте общий анализ крови.')
+HB_LOW_CAVEAT = ('оценка ниже 100 г/л: на проверке (Eyes-defy, OOF, предварительно) при реальном Hb < 100 г/л '
+                 'прогноз по фото был завышен в среднем на 14–20 г/л, а диапазон накрывал реальный Hb примерно у '
+                 '60% таких пациентов; пользователю число не показывается')
+
+
+def hb_estimate_shown(r):
+    """Показываемая оценка Hb по фото, г/л: прогноз модели, округлённый до 5 (точнее модель не различает).
+    Нет поля hb_estimate (старый dict) → середина диапазона. Нет диапазона → None. Расчёт не меняет."""
+    if not r.get('hb_range'):
+        return None
+    lo, hi = r['hb_range']
+    est = r.get('hb_estimate')
+    est = (lo + hi) / 2 if est is None else est
+    return float(min(max(5 * math.floor(est / 5 + 0.5), lo), hi))
+
+
+def hb_low(r):
+    """Оценка Hb по фото есть и ниже HB_LOW_SHOWN → пользователю число не показывать."""
+    est = hb_estimate_shown(r)
+    return est is not None and est < HB_LOW_SHOWN
+
+
+def hb_text(r):
+    """Одна строка Hb по фото: «оценка ~105 г/л (точно не определить: 90–120), это НЕ анализ крови».
+    Без диапазона → ''."""
+    est = hb_estimate_shown(r)
+    if est is None:
+        return ''
+    lo, hi = r['hb_range']
+    return f'оценка ~{est:.0f} г/л (точно не определить: {lo:.0f}–{hi:.0f}), {HB_NOT_LAB}'
 
 
 class PhotoError(ValueError):
@@ -969,7 +1006,8 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
                    этого набора тканей нет обученной модели), 'mismatch' (вырез вместо снимка глаза), 'age' (младше 5 лет), 'ood', 'ok';
         eye      — как найден глаз; tissue_status — {'conj': …, 'sclera': …}; tissues — какие ткани использованы;
         risk     — 'низкий' / 'средний' / 'высокий' или None; p_anemia — P(анемия) модели или None;
-        hb_range — (от, до) г/л, экспериментально, или None; hb_note — почему цифры Hb нет / что она значит;
+        hb_range — (от, до) г/л, экспериментально, или None; hb_estimate — сам прогноз Hb (г/л, без округления) или None,
+        показывать через hb_text; hb_note — почему цифры Hb нет / что она значит;
         model, kind — чем и по какому снимку оценено; reasons — почему такой ответ; issues — проблемы снимка;
         crop, conj, sclera — вырезка и маски (для показа, anemia.predict.overlay).
     Модель взрослых выбирается по пригодным тканям (обе / только конъюнктива / только склера): каждая обучена
@@ -981,6 +1019,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
     method = check_method(method)
     sex = _sex(sex)
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
+         'hb_estimate': None,
          'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
          'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None,
@@ -1125,6 +1164,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         hw = B['hb_halfwidth']
         lo, hi = CORE.hb_interval(hb, hw)
         r['hb_range'] = (float(lo), float(hi))
+        r['hb_estimate'] = float(hb)          # сам прогноз; для показа — hb_text (округление до 5)
         if lv > lv_p:
             r['risk'] = CORE.RISK_LEVELS[lv]
             r['reasons'].append(f'по P уровень «{CORE.RISK_LEVELS[lv_p]}», но весь диапазон Hb {lo:.0f}–{hi:.0f} г/л ниже '
@@ -1156,7 +1196,9 @@ def format_result(r):
     if r['status'] == 'ok':
         lines.append(f"РИСК АНЕМИИ: {r['risk'].upper()} — {RISK_TEXT[r['risk']]}")
         if r['hb_range']:
-            lines.append(f"Ориентировочный Hb: {r['hb_range'][0]:.0f}–{r['hb_range'][1]:.0f} г/л ({r['hb_note']})")
+            lines.append(f"Hb по фото: {hb_text(r)} ({r['hb_note']})")
+            if hb_low(r):
+                lines.append(f'Hb по фото — внимание: {HB_LOW_CAVEAT}')
         else:
             lines.append(f"Hb: {r['hb_note']}")
         lines += [f'Почему: {x}' for x in r['reasons']]

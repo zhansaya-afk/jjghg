@@ -86,7 +86,7 @@ def test_ood_refusal_has_no_level_no_hb(backend, monkeypatch):
     assert 'РИСК НЕ ОПРЕДЕЛЁН' in card and 'анализ крови' in card and hb == ''
     _no_numbers(card, hb)
     assert [st for _, st in V.step_states(r)] == ['done'] * 5 + ['fail']
-    assert 'Ориентировочный Hb' not in V.report_text(r, V.Survey(), backend.version)
+    assert 'Hb по фото' not in V.report_text(r, V.Survey(), backend.version)
 
 
 def test_child_refused_before_photo(backend):
@@ -307,7 +307,7 @@ def test_lab_goes_to_personalizer_but_not_into_photo_fields():
     assert (a.risk, a.p_anemia, a.hb_range) == (b.risk, b.p_anemia, b.hb_range) == ('высокий', 0.83, (92.0, 112.0))
     assert a.lab is None and b.lab is lab
     text = P.RulesPersonalizer().reply(b).text
-    assert 'риск анемии высокий' in text and '92–112 г/л' in text and '118 г/л' in text
+    assert 'риск анемии высокий' in text and '~100 г/л (точно не определить: 92–112)' in text and '118 г/л' in text
     # снимок не подошёл: про фото — «переснимите», анализ крови всё равно объясняется
     refused = P.make_input(_refused_dict(status='retake', stage='frame', issues=['снимок тёмный']), survey, lab)
     assert refused.risk is None and refused.hb_range is None and refused.lab is lab
