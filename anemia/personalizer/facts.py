@@ -25,6 +25,7 @@ PHOTO_KEYS = (
     "risk",
     "p_anemia",
     "hb_interval_g_l",
+    "hb_estimate_g_l",
     "tissue",
     "reason",
 )
@@ -61,9 +62,16 @@ def photo_facts(result):
     if out["reason"] is None and out["status"] != "ok" and _get(result, "issues"):
         # сырой dict analyze_photo: причина — первая проблема снимка, без совета после «—»
         out["reason"] = str(_get(result, "issues")[0]).split(" — ")[0].rstrip(".")
+    if out["status"] == "ok" and out["hb_interval_g_l"]:
+        # число Hb по фото пользователю не показывается (predict.HB_USER): в карточку Personalizer цифры не попадают
+        out.update(hb_interval_g_l=None, hb_estimate_g_l=None, hb_hidden=True)
     if out["status"] != "ok":
         out.update(
-            risk="не определён", p_anemia=None, hb_interval_g_l=None, tissue=None
+            risk="не определён",
+            p_anemia=None,
+            hb_interval_g_l=None,
+            hb_estimate_g_l=None,
+            tissue=None,
         )
     else:
         out["validation"] = dict(MODEL_CARD)

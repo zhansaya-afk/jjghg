@@ -223,7 +223,7 @@ def test_hb_from_question(q, want):
 def test_photo_facts_from_raw_analyze_photo_and_result():
     f = facts()
     assert f["photo"]["risk"] == "средний"
-    assert f["photo"]["hb_interval_g_l"] == [105, 125]
+    assert f["photo"]["hb_interval_g_l"] is None and f["photo"]["hb_hidden"]  # число Hb по фото — не пользователю
     assert f["photo"]["tissue"] == "конъюнктива"
     assert f["photo"]["validation"]["patients"] == MODEL_CARD["patients"]
     bad = facts(F_BAD)["photo"]
