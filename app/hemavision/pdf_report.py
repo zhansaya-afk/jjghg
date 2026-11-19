@@ -23,13 +23,11 @@ from anemia import labs as LABS
 from anemia import predict as PR
 
 DISCLAIMER = 'Не является диагнозом. Не заменяет анализ крови и консультацию врача.'
-TITLE = 'HemaVision — отчёт скрининга риска анемии по фото глаза'
+TITLE = 'HemaVision — протокол скринингового исследования риска анемии по фото глаза'
 NO_DATA = 'нет данных'
 WHO2011_SOURCE = ('ВОЗ 2011: WHO, Haemoglobin concentrations for the diagnosis of anaemia and assessment of '
                   'severity (WHO/NMH/NHD/MNM/11.1), таблица 1')
 LEVELS = ('низкий', 'средний', 'высокий')
-LEVEL_COLORS = {'низкий': ('#166534', '#f0fdf4'), 'средний': ('#92400e', '#fffbeb'), 'высокий': ('#b91c1c', '#fef2f2'),
-                None: ('#334155', '#f1f5f9')}
 Q_TEXT = {'ok': 'в норме', None: 'не проверялось'}
 RU3 = {True: 'да', False: 'нет', None: 'не указано'}
 FONT_CANDIDATES = (     # (обычный, жирный)
@@ -230,17 +228,56 @@ def images(r, photo=None):
     return out
 
 
-# ------------------------------------------------------------------ сборка PDF
+# ------------------------------------------------------------------ сборка PDF (формат протокола исследования)
+METHOD_TEXT = ('неинвазивная оценка по фотографии глаза: цветовой анализ слизистой нижнего века (конъюнктивы) '
+               'и белка глаза (склеры), модель машинного обучения')
+LIMITS_TEXT = ('Показатели модели получены ретроспективной кросс-валидацией на одном наборе данных (Eyes-defy: '
+               'взрослые Италии и Индии, снимки через насадку-линзу). Клиническая валидация не проводилась; точность '
+               'на других телефонах, при другом освещении и у жителей Казахстана не проверена. Программа не '
+               'зарегистрирована как медицинское изделие. Детям младше 5 лет оценка не проводится.')
+TISSUE_TEXT = {'обе': 'конъюнктива и склера', 'конъюнктива': 'конъюнктива', 'склера': 'склера'}
+
+
+def result_rows(r, survey, lab=None):
+    """Таблица результатов как в лабораторном бланке: [(показатель, результат, ед., референс, примечание)].
+    Отсутствующее значение — словами, без единиц и норм (не выглядит как измерение)."""
+    ok = r.get('status') == 'ok'
+    rb = risk_block(r)
+    risk = (rb['level'].upper() if rb['level'] else 'НЕ ОПРЕДЕЛЁН')
+    rows = [('Риск анемии по фотографии', risk, '—', 'низкий / средний / высокий',
+             'скрининговая оценка, не диагноз' if ok else 'оценка не выполнена')]
+    if ok and r.get('hb_range'):
+        lo, hi = r['hb_range']
+        lim = LABS.who_limits(survey.sex, survey.age, survey.pregnant)
+        rows.append(('Гемоглобин, ориентировочно по фото', f'{lo:.0f}–{hi:.0f}', 'г/л', f'≥ {lim.normal:.0f}',
+                     'НЕ лабораторное измерение; неопределённость: ' + (r.get('hb_note') or 'не указана')))
+    elif ok:
+        rows.append(('Гемоглобин, ориентировочно по фото', 'не показан', '—', '—',
+                     _cap(r.get('hb_note') or NO_DATA)))
+    else:
+        rows.append(('Гемоглобин, ориентировочно по фото', 'не оценивался', '—', '—', 'оценка по фото не выполнена'))
+    if lab:
+        rows.append(('Гемоглобин, лабораторный (введён пациентом)', f'{lab["hb_g_l"]:.0f}', 'г/л',
+                     f'≥ {lab["normal_from_g_l"]:.0f}', f'{lab["grade_ru"]}; документ анализа не проверялся'))
+    else:
+        rows.append(('Гемоглобин, лабораторный (введён пациентом)', 'не представлен', '—', '—', '—'))
+    return rows
+
+
 def build_pdf(path, r, survey, *, res=None, lab=None, photo=None, model_version='', reply=None, history=(),
               created=None):
-    """Записать PDF-отчёт в path → path. r — dict analyze_photo (полный, частичный или отказ), survey — view.Survey,
-    res — api.Result (качество) или None, lab — labs.lab_hb_report или None, photo — исходное фото или None,
-    reply / history — ответы Personalizer этой проверки (или None / ())."""
+    """Записать PDF-протокол в path → path. r — dict analyze_photo (полный, частичный или отказ), survey —
+    view.Survey, res — api.Result (качество) или None, lab — labs.lab_hb_report или None, photo — исходное фото
+    или None, reply / history — ответы Personalizer этой проверки (или None / ()).
+    Формат — протокол исследования: паспортная часть, сведения об исследовании, таблица результатов с
+    референсными значениями, контроль качества, иллюстрации, интерпретация, источники, ограничения, отметки врача,
+    приложение с ответами Personalizer; чёрно-белый, читается при печати в оттенках серого."""
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.platypus import (
         Image,
         KeepTogether,
@@ -255,158 +292,184 @@ def build_pdf(path, r, survey, *, res=None, lab=None, photo=None, model_version=
     created = created or dt.datetime.now()  # noqa: DTZ005 — местное время устройства, как в .txt-отчёте
     rid = report_id(created)
     version = model_version or 'модель не указана'
-    ink, muted, line, accent = (colors.HexColor(c) for c in ('#0f172a', '#475569', '#cbd5e1', '#0e7490'))
+    ink, muted, grid, head_bg = (colors.HexColor(c) for c in ('#111111', '#444444', '#555555', '#e6e6e6'))
     st = {
-        'h1': ParagraphStyle('h1', fontName='HV-Bold', fontSize=15, leading=19, textColor=accent),
-        'h2': ParagraphStyle('h2', fontName='HV-Bold', fontSize=11.5, leading=15, textColor=ink, spaceBefore=8,
+        'org': ParagraphStyle('org', fontName='HV', fontSize=8.5, leading=11, textColor=muted),
+        'h1': ParagraphStyle('h1', fontName='HV-Bold', fontSize=13, leading=17, textColor=ink, alignment=TA_CENTER),
+        'sub': ParagraphStyle('sub', fontName='HV', fontSize=10, leading=13, textColor=ink, alignment=TA_CENTER),
+        'h2': ParagraphStyle('h2', fontName='HV-Bold', fontSize=10.5, leading=14, textColor=ink, spaceBefore=9,
                              spaceAfter=3),
-        'p': ParagraphStyle('p', fontName='HV', fontSize=10, leading=13.5, textColor=ink),
-        'small': ParagraphStyle('small', fontName='HV', fontSize=9, leading=12, textColor=muted),
-        'cap': ParagraphStyle('cap', fontName='HV', fontSize=9, leading=11, textColor=muted, alignment=TA_CENTER),
-        'risk': ParagraphStyle('risk', fontName='HV-Bold', fontSize=17, leading=21),
+        'p': ParagraphStyle('p', fontName='HV', fontSize=9.5, leading=12.5, textColor=ink),
+        'cell': ParagraphStyle('cell', fontName='HV', fontSize=9, leading=11.5, textColor=ink),
+        'th': ParagraphStyle('th', fontName='HV-Bold', fontSize=8.5, leading=11, textColor=ink),
+        'small': ParagraphStyle('small', fontName='HV', fontSize=8.5, leading=11, textColor=muted),
+        'cap': ParagraphStyle('cap', fontName='HV', fontSize=8.5, leading=11, textColor=muted, alignment=TA_CENTER),
     }
 
     def P(text, style='p'):
         return Paragraph(escape(str(text)).replace('\n', '<br/>'), st[style])
 
-    def B(label, value, style='p'):
-        return Paragraph(f'<b>{escape(str(label))}:</b> {escape(str(value))}', st[style])
-
-    def table(rows, widths, head=None):
-        data = ([[Paragraph(f'<b>{escape(h)}</b>', st['small']) for h in head]] if head else [])
-        data += [[P(c) for c in row] for row in rows]
-        t = Table(data, colWidths=widths)
-        t.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 0.6, line), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    def table(rows, widths, head=None, bold_col=None):
+        data = [[Paragraph(escape(h), st['th']) for h in head]] if head else []
+        for row in rows:
+            data.append([Paragraph(('<b>%s</b>' if j == bold_col else '%s') % escape(str(c)), st['cell'])
+                         for j, c in enumerate(row)])
+        t = Table(data, colWidths=widths, repeatRows=1 if head else 0)
+        t.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 0.5, grid), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                ('LEFTPADDING', (0, 0), (-1, -1), 4), ('RIGHTPADDING', (0, 0), (-1, -1), 4),
                                ('TOPPADDING', (0, 0), (-1, -1), 2), ('BOTTOMPADDING', (0, 0), (-1, -1), 3)]
-                              + ([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f1f5f9'))] if head else [])))
+                              + ([('BACKGROUND', (0, 0), (-1, 0), head_bg)] if head else [])))
         return t
 
+    def kv(rows):
+        return table(rows, [W * 0.36, W * 0.64])
+
     W = A4[0] - 36 * mm
-    story = [P(TITLE, 'h1'),
-             P(f'Дата и время: {created:%d.%m.%Y %H:%M} · отчёт № {rid} · версия модели: {version}', 'small'),
-             Spacer(1, 4)]
+    ok = r.get('status') == 'ok'
+    sex_ru = {'F': 'женский', 'M': 'мужской'}.get(survey.sex, 'не указан')
+    age_ru = 'не указан' if survey.age is None else f'{survey.age:g}'
 
-    disc = Table([[Paragraph(f'<b>{escape(DISCLAIMER)}</b> Оценка риска по цвету глаза на фото; есть ли анемия, '
-                             'показывает только общий анализ крови.', st['p'])]], colWidths=[W])
-    disc.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#334155')),
-                              ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f1f5f9')),
-                              ('LEFTPADDING', (0, 0), (-1, -1), 8), ('TOPPADDING', (0, 0), (-1, -1), 6),
-                              ('BOTTOMPADDING', (0, 0), (-1, -1), 7)]))
-    story += [disc, Spacer(1, 4),
-              P('Пациент (заполняет сам): ________________________________   Дата рождения: ______________', 'small')]
+    # шапка
+    top = Table([[P('HemaVision (PoC) — программа скрининга риска анемии. Не является медицинским изделием.', 'org'),
+                  Paragraph(f'Протокол № {escape(rid)}<br/>от {created:%d.%m.%Y}', st['org'])]],
+                colWidths=[W * 0.68, W * 0.32])
+    top.setStyle(TableStyle([('ALIGN', (1, 0), (1, 0), 'RIGHT'), ('LINEBELOW', (0, 0), (-1, 0), 1, ink),
+                             ('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+    story = [top, Spacer(1, 8), P('ПРОТОКОЛ СКРИНИНГОВОГО ИССЛЕДОВАНИЯ', 'h1'),
+             P('Оценка риска анемии по фотографии глаза (неинвазивно)', 'sub'), Spacer(1, 6)]
+    disc = Table([[Paragraph(f'<b>{escape(DISCLAIMER)}</b> Результат — скрининговая оценка риска по цвету тканей '
+                             'глаза; наличие анемии устанавливается только по общему анализу крови.', st['p'])]],
+                 colWidths=[W])
+    disc.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1.2, ink), ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                              ('TOPPADDING', (0, 0), (-1, -1), 5), ('BOTTOMPADDING', (0, 0), (-1, -1), 6)]))
+    story.append(disc)
 
-    # 1. Результат
-    rb = risk_block(r)
-    fg, bg = LEVEL_COLORS[rb['level']]
-    st['risk'].textColor = colors.HexColor(fg)
-    story.append(P('1. Результат оценки риска по фото', 'h2'))
-    cells = []
-    for lv in LEVELS:
-        on = lv == rb['level']
-        cells.append(Paragraph(('<b>' if on else '') + escape(_cap(lv)) + (' ▲ ваш результат</b>' if on else ''),
-                               st['p']))
-    scale = Table([cells], colWidths=[(W - 16) / 3] * 3)
-    scale_style = [('BOX', (i, 0), (i, 0), 0.6, line) for i in range(3)]
-    if rb['level']:
-        i = LEVELS.index(rb['level'])
-        scale_style += [('BOX', (i, 0), (i, 0), 2, colors.HexColor(fg)),
-                        ('BACKGROUND', (i, 0), (i, 0), colors.HexColor(bg))]
-    scale.setStyle(TableStyle(scale_style))
-    box = [Paragraph(escape(rb['title']), st['risk']), Spacer(1, 3), scale, Spacer(1, 4), P(rb['text'])]
-    box += [P('• ' + x) for x in rb['issues']]
-    box += [Spacer(1, 3), P('Что сделать: сдайте общий анализ крови (гемоглобин) и покажите этот отчёт врачу. '
-                            'Точно уровень гемоглобина показывает только анализ крови.')]
-    frame = Table([[box]], colWidths=[W])
-    frame.setStyle(TableStyle([('BOX', (0, 0), (-1, -1), 1, colors.HexColor(fg)),
-                               ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor(bg)),
-                               ('LEFTPADDING', (0, 0), (-1, -1), 8), ('RIGHTPADDING', (0, 0), (-1, -1), 8),
-                               ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 8)]))
-    story.append(frame)
+    # 1. Пациент
+    from .personalizer import WELLBEING
+    pat = [('Ф. И. О.', '_' * 46), ('Дата рождения', '_' * 20), ('Пол', sex_ru), ('Возраст, полных лет', age_ru)]
+    if survey.sex == 'F':
+        pat.append(('Беременность', RU3[survey.pregnant]))
+    pat += [(q, RU3[survey.wellbeing.get(k)]) for k, q in WELLBEING]
+    story += [P('1. Сведения о пациенте', 'h2'), kv(pat),
+              P('Ф. И. О. и дату рождения заполняет пациент или медицинский работник: приложение их не хранит. '
+                'Ответы о самочувствии — со слов пациента, на оценку риска не влияют.', 'small')]
 
-    story += [P('• Примечание: ' + str(x)) for x in r.get('notes') or []]
+    # 2. Исследование
+    tissue = TISSUE_TEXT.get(res.tissue, res.tissue) if res is not None and res.tissue else 'не определена'
+    story += [P('2. Сведения об исследовании', 'h2'),
+              kv([('Дата и время', f'{created:%d.%m.%Y %H:%M}'), ('Метод', METHOD_TEXT),
+                  ('Анализируемая ткань', tissue),
+                  ('Выбор ткани', PR.METHOD_RU.get(survey.method, 'автоматически')),
+                  ('Модель', r.get('model') or NO_DATA), ('Версия программы / модели', version),
+                  ('Статус исследования', f'{PR.STATUS_RU.get(r.get("status"), r.get("status") or NO_DATA)} '
+                                          f'(этап: {r.get("stage") or NO_DATA})')])]
 
-    # 2. Hb
-    t, txt = hb_block(r)
-    story += [P('2. Гемоглобин по фото', 'h2'), Paragraph(f'<b>{escape(t)}</b>', st['p']), P(txt)]
+    # 3. Результаты
+    story += [P('3. Результаты', 'h2'),
+              table(result_rows(r, survey, lab), [W * 0.23, W * 0.17, W * 0.07, W * 0.13, W * 0.40],
+                    head=('Показатель', 'Результат', 'Ед.', 'Референс', 'Примечание'), bold_col=1),
+              P('Референс гемоглобина — нижняя граница нормы ВОЗ 2011 для группы пациента (раздел 7).', 'small')]
 
-    # 3. Фото и маска
-    story.append(P('3. Фото и найденные ткани', 'h2'))
+    # 4. Качество
+    story += [P('4. Контроль качества изображения', 'h2'), kv(quality_rows(res))]
+
+    # 5. Иллюстрации
+    story.append(P('5. Иллюстрации', 'h2'))
     ims = images(r, photo)
     if ims:
         cw = W / len(ims)
         row_im, row_cap = [], []
-        for cap, im in ims:
-            w = min(cw - 6, 70 * mm)
+        for n, (cap, im) in enumerate(ims, 1):
+            w = min(cw - 6, 62 * mm)
             h = w * im.height / im.width
-            if h > 60 * mm:
-                h, w = 60 * mm, 60 * mm * im.width / im.height
+            if h > 50 * mm:
+                h, w = 50 * mm, 50 * mm * im.width / im.height
             buf = io.BytesIO()
             im.save(buf, format='JPEG', quality=85)
             buf.seek(0)
             row_im.append(Image(buf, width=w, height=h))
-            row_cap.append(Paragraph(escape(cap), st['cap']))
+            row_cap.append(Paragraph(f'Рис. {n}. {escape(cap)}', st['cap']))
         gal = Table([row_im, row_cap], colWidths=[cw] * len(ims))
         gal.setStyle(TableStyle([('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
-        story.append(KeepTogether([gal]))
+        legend = []
         if any(c.startswith('Найденные') for c, _ in ims):
-            story.append(P('Зелёный контур — слизистая нижнего века, голубой — белок глаза (склера): только эти '
-                           'области вошли в расчёт.', 'small'))
+            legend.append('Контуры на вырезе: зелёный — слизистая нижнего века, голубой — склера; в расчёт вошли '
+                          'только эти области.')
         if any(c == 'Глаза на фото' for c, _ in ims):
-            story.append(P('Зелёная рамка — глаз принят, красная — не подошёл.', 'small'))
+            legend.append('Рамки на фото лица: зелёная — глаз принят, красная — не подошёл.')
+        story.append(KeepTogether([gal] + [P(x, 'small') for x in legend]))
     else:
-        story.append(P('Изображения недоступны: ' + NO_DATA + '.', 'small'))
+        story.append(P('Изображения недоступны: ' + NO_DATA + '.'))
 
-    # 4. Качество
-    story += [P('4. Качество фотографии', 'h2'), table(quality_rows(res), [W * 0.55, W * 0.45])]
+    # 6. Интерпретация
+    rb = risk_block(r)
+    interp = [P(rb['text'])] + [P('• ' + x) for x in rb['issues']]
+    if ok and r.get('reasons'):
+        interp.append(P('Обоснование (автоматически): ' + '; '.join(str(x) for x in r['reasons']) + '.', 'small'))
+    interp += [P('Примечание: ' + str(x)) for x in r.get('notes') or []]
+    interp.append(P('Рекомендация: общий анализ крови с определением гемоглобина; оценка результата врачом. '
+                    'Точно уровень гемоглобина показывает только анализ крови.'))
+    story += [P('6. Интерпретация (формируется автоматически, не является заключением врача)', 'h2')] + interp
 
-    # 5. Анкета и анализ крови
-    story += [P('5. Анкета (со слов пользователя)', 'h2'), table(survey_rows(survey), [W * 0.62, W * 0.38]),
-              P('Ответы о самочувствии на оценку риска по фото не влияют.', 'small'),
-              P('Анализ крови (введён пользователем, отдельно от оценки по фото)', 'h2'),
-              P(lab['text'] if lab else 'Не введён.')]
-
-    # 6. Референсные значения
-    story.append(P('6. Применённые референсные значения', 'h2'))
+    # 7. Нормативные источники
+    story.append(P('7. Применённые референсные значения и источники', 'h2'))
     refs = references(r, survey, lab)
     if refs:
         story.append(table(refs, [W * 0.3, W * 0.3, W * 0.4], head=('Где применено', 'Значение', 'Источник')))
     else:
-        story.append(P('Не применялись: оценка по фото не выполнена, анализ крови не введён.'))
+        story.append(P('Не применялись: оценка по фото не выполнена, анализ крови не представлен.'))
 
-    # 7. Personalizer
-    story.append(P('7. AI Personalizer (объяснение и вопросы этой проверки)', 'h2'))
+    # 8. Ограничения
+    story += [P('8. Ограничения метода', 'h2'), P(LIMITS_TEXT, 'small')]
+
+    # 9. Отметки врача
+    sig = Table([[P('Заключение врача:'), P('')], [P(''), P('')], [P(''), P('')],
+                 [P('Врач (Ф. И. О., должность):'), P('')], [P('Подпись:'), P('Дата:')]],
+                colWidths=[W * 0.5, W * 0.5], rowHeights=[16, 16, 16, 18, 22])
+    sig.setStyle(TableStyle([('LINEBELOW', (0, 0), (-1, 3), 0.5, grid), ('LINEBELOW', (0, 4), (-1, 4), 0.5, grid),
+                             ('SPAN', (0, 0), (0, 0)), ('VALIGN', (0, 0), (-1, -1), 'BOTTOM'),
+                             ('LEFTPADDING', (0, 0), (-1, -1), 0)]))
+    story += [KeepTogether([P('9. Отметки врача', 'h2'), sig])]
+
+    # Приложение: Personalizer
+    story.append(P('Приложение. Ответы AI Personalizer этой проверки', 'h2'))
     ent = personalizer_entries(reply, history)
     if ent:
         for who, text in ent:
             story.append(Paragraph(f'<b>{escape(who)}:</b> ' + escape(text).replace('\n', '<br/>'), st['p']))
             story.append(Spacer(1, 2))
-        story.append(P('Personalizer только объясняет результат; риск и Hb по фото он не меняет.', 'small'))
+        story.append(P('Personalizer только объясняет результат; уровень риска и Hb по фото он не меняет.', 'small'))
     else:
         story.append(P('Ответов Personalizer нет.'))
 
-    # 8. Для врача
-    story += [P('8. Для врача: технические сведения', 'h2'),
-              B('Статус', f'{PR.STATUS_RU.get(r.get("status"), r.get("status") or NO_DATA)} '
-                          f'(этап: {r.get("stage") or NO_DATA})', 'small'),
-              B('Модель', r.get('model') or NO_DATA, 'small'), B('Версия модели', version, 'small')]
-    why = r.get('reasons') if r.get('status') == 'ok' else []
-    story += [P('Почему такой ответ (объяснение ядра): ' + '; '.join(str(x) for x in why), 'small')] if why else []
-    story += [P('Показатели модели получены ретроспективной кросс-валидацией на одном наборе данных (Eyes-defy: '
-                'взрослые Италии и Индии, снимки через насадку). Это не клиническая валидация; точность на других '
-                'телефонах, в других условиях и у жителей Казахстана не проверена.', 'small'),
-              Spacer(1, 6), Paragraph(f'<b>{escape(DISCLAIMER)}</b>', st['p'])]
+    class NumberedCanvas(rl_canvas.Canvas):
+        """«стр. N из M»: страницы откладываются и подписываются, когда известно их число."""
 
-    def footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont('HV', 8)
-        canvas.setFillColor(muted)
-        canvas.drawString(18 * mm, 10 * mm, DISCLAIMER)
-        canvas.drawString(18 * mm, 6.5 * mm, f'HemaVision PoC · {rid} · {version}'[:110])
-        canvas.drawRightString(A4[0] - 18 * mm, 10 * mm, f'стр. {doc.page}')
-        canvas.restoreState()
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._pages = []
+
+        def showPage(self):
+            self._pages.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            n = len(self._pages)
+            for page in self._pages:
+                self.__dict__.update(page)
+                self.saveState()
+                self.setFont('HV', 7.5)
+                self.setFillColor(muted)
+                self.setStrokeColor(grid)
+                self.line(18 * mm, 14 * mm, A4[0] - 18 * mm, 14 * mm)
+                self.drawString(18 * mm, 10 * mm, DISCLAIMER)
+                self.drawString(18 * mm, 6.5 * mm, f'HemaVision PoC · протокол № {rid} · {version}'[:110])
+                self.drawRightString(A4[0] - 18 * mm, 10 * mm, f'стр. {self._pageNumber} из {n}')
+                self.restoreState()
+                super().showPage()
+            super().save()
 
     doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=14 * mm,
-                            bottomMargin=16 * mm, title=TITLE, author='HemaVision PoC', subject=DISCLAIMER)
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+                            bottomMargin=18 * mm, title=TITLE, author='HemaVision PoC', subject=DISCLAIMER)
+    doc.build(story, canvasmaker=NumberedCanvas)
     return path

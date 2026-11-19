@@ -14,7 +14,7 @@ pytest.importorskip('reportlab')
 pypdf = pytest.importorskip('pypdf')
 from app.hemavision import pdf_report as R
 
-LEVEL_WORDS = ('НИЗКИЙ РИСК', 'СРЕДНИЙ РИСК', 'ВЫСОКИЙ РИСК')
+LEVEL_WORDS = ('НИЗКИЙ', 'СРЕДНИЙ', 'ВЫСОКИЙ')
 
 
 @pytest.fixture
@@ -52,18 +52,18 @@ def test_full_result_real_pipeline(tmp_path, backend, monkeypatch):
     _, hist = P.ask(P.RulesPersonalizer(), P.make_input(r, survey, lab), hist, 'Что такое ферритин?')
     txt, rd = _pdf(tmp_path, r, survey, res=res, lab=lab, photo=photo, model_version=backend.version, reply=reply,
                    history=hist)
-    assert f'{r["risk"].upper()} РИСК' in txt
+    assert r['risk'].upper() in txt and 'ПРОТОКОЛ СКРИНИНГОВОГО ИССЛЕДОВАНИЯ' in txt
     assert sum(w in txt for w in LEVEL_WORDS) == 1
-    assert R.DISCLAIMER in txt and 'Качество фотографии' in txt and 'Резкость' in txt
+    assert R.DISCLAIMER in txt and 'Контроль качества изображения' in txt and 'Резкость' in txt
     assert backend.version in txt and 'Дата и время' in txt
     assert 'ВОЗ 2011' in txt and 'норма Hb ≥ 120 г/л' in txt               # женщина 30 лет, ВОЗ 2011
     assert 'Вопрос: Что такое ферритин?' in txt and 'Ответов Personalizer нет' not in txt
     assert 'Анализ крови' in txt and '118 г/л' in txt
     assert _n_images(rd) >= 2                                                # исходное фото + маска
     if r['hb_range']:
-        assert 'НЕ лабораторное измерение' in txt and 'Неопределённость' in txt
+        assert 'НЕ лабораторное измерение' in txt and 'неопределённость' in txt
     else:
-        assert 'Hb по фото: не показан' in txt
+        assert 'не показан' in txt
 
 
 def test_hb_shown_only_from_core_with_uncertainty(tmp_path, backend, monkeypatch):
@@ -73,12 +73,12 @@ def test_hb_shown_only_from_core_with_uncertainty(tmp_path, backend, monkeypatch
     assert r['status'] == 'ok'
     r = {**r, 'hb_range': [104.0, 126.0], 'hb_note': 'в 80% случаев реальный Hb был в пределах ±11 г/л'}
     txt, _ = _pdf(tmp_path, r, V.Survey(sex='M', age=40), res=res)
-    assert 'Ориентировочный Hb по фото: 104–126 г/л' in txt
+    assert '104–126 г/л' in txt
     assert 'НЕ лабораторное измерение' in txt and '±11 г/л' in txt
     assert 'норма Hb ≥ 130 г/л' in txt and 'мужчины' in txt
     no_hb = {**r, 'hb_range': None, 'hb_note': 'цифра Hb не выдаётся: модель Hb почти не лучше константы'}
     txt, _ = _pdf(tmp_path, no_hb, V.Survey(sex='M', age=40), res=res)
-    assert '104' not in txt and 'Hb по фото: не показан' in txt and 'не лучше константы' in txt
+    assert '104' not in txt and 'не показан' in txt and 'не лучше константы' in txt
 
 
 def test_partial_result_empty_fields(tmp_path, backend, monkeypatch):
@@ -89,10 +89,10 @@ def test_partial_result_empty_fields(tmp_path, backend, monkeypatch):
     assert r['status'] == 'ok'
     r = {**r, 'crop': None, 'photo_preview': None}
     txt, rd = _pdf(tmp_path, r, V.Survey(), res=None, lab=None, photo=None, model_version='', reply=None)
-    assert 'Пол не указан' in txt and 'Возраст не указан' in txt
+    assert 'Пол не указан' in txt and 'Возраст, полных лет не указан' in txt
     assert 'Изображения недоступны' in txt and _n_images(rd) == 0
     assert 'Проверка качества не выполнялась' in txt
-    assert 'Ответов Personalizer нет' in txt and 'Не введён' in txt
+    assert 'Ответов Personalizer нет' in txt and 'не представлен' in txt
     assert 'модель не указана' in txt
     assert 'пол не указан: применены нормы женщин' in txt                    # как who_limits(None, None)
     assert R.DISCLAIMER in txt
@@ -107,8 +107,8 @@ def test_refusal_has_no_level_and_no_numbers(tmp_path, backend, case):
     assert r['status'] != 'ok'
     stub = P.StubPersonalizer().reply(P.make_input(r, survey))
     txt, _ = _pdf(tmp_path, r, survey, res=res, photo=None, model_version=backend.version, reply=stub)
-    assert 'РИСК НЕ ОПРЕДЕЛЁН' in txt and not any(w in txt for w in LEVEL_WORDS)
-    assert 'г/л' not in txt and 'Hb по фото: не оценивался' in txt
+    assert 'НЕ ОПРЕДЕЛЁН' in txt and not any(w in txt for w in LEVEL_WORDS)
+    assert 'г/л' not in txt and 'не оценивался' in txt
     assert 'Не применялись' in txt
     assert 'Ответов Personalizer нет' in txt                                 # заглушка не печатается как ответ
     for issue in r['issues']:
@@ -122,7 +122,7 @@ def test_refusal_ignores_stale_numbers(tmp_path):
          'hb_note': 'экспериментально', 'issues': ['снимок не похож на обучающие'], 'notes': [],
          'reasons': ['P(анемия) = 0.90'], 'model': 'm', 'crop': None}
     txt, _ = _pdf(tmp_path, r, V.Survey(sex='F', age=30))
-    assert 'ВЫСОКИЙ РИСК' not in txt and '80–100' not in txt and 'P(анемия)' not in txt and 'г/л' not in txt
+    assert 'ВЫСОКИЙ' not in txt and '80–100' not in txt and 'P(анемия)' not in txt and 'г/л' not in txt
 
 
 def test_cyrillic_fonts_embedded(tmp_path):
