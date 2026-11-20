@@ -241,8 +241,8 @@ def check(q, limits=None, file_q=None):
         issues.append(f'снимок размыт относительно размера глаза (размытие {rel_blur(q, lim):.3f} ширины века, '
                       f'допустимо ≤ {lim["rel_blur_max"]:.3f}) — увеличение вырезки резкость не вернёт')
     elif q.get('edge_sigma_rel', 0) > EDGE_SIGMA_REL_MAX:      # nan/inf: inf — краёв нет совсем (размыто)
-        issues.append(f'снимок размыт: края ткани размыты на {q["edge_sigma_rel"] * 100:.1f}% кадра (допустимо ≤ '
-                      f'{EDGE_SIGMA_REL_MAX * 100:.1f}%) — шум камеры маскировал размытие')
+        issues.append(f'снимок размыт: края ткани размыты на {q["edge_sigma_rel"] * 100:.2f}% кадра (допустимо ≤ '
+                      f'{EDGE_SIGMA_REL_MAX * 100:.2f}%) — шум камеры маскировал размытие')
     return issues
 
 

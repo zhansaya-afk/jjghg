@@ -58,7 +58,7 @@ def test_child_refusal_needs_no_model_file(monkeypatch):
 # ------------------------------------------------------------------ беременность
 @pytest.mark.parametrize('v,want', [(None, None), (float('nan'), None), ('', None), ('?', None), (True, True),
                                     (False, False), (1, True), (0, False), ('да', True), ('нет', False),
-                                    ('yes', True), ('False', False), (1.0, True)])
+                                    ('yes', True), ('False', False), (1.0, True), ('Иә', True), ('жоқ', False)])
 def test_norm_pregnant(v, want):
     assert norm_pregnant(v) is want
     assert is_pregnant(v) is (want is True)
@@ -156,3 +156,19 @@ def test_invalid_age_refused_safely(monkeypatch, age):
     assert r['status'] == 'unreliable' and r['stage'] == 'age'
     assert r['risk'] is None and r['p_anemia'] is None and r['hb_range'] is None
     assert 'возраст не распознан' in r['issues'][0] and 'возраст не распознан' in PR.format_result(r)
+
+
+# ------------------------------------------------------------------ пол в hb.csv (свои / казахстанские данные)
+@pytest.mark.parametrize('v,want', [('M', 'M'), ('F', 'F'), ('Male', 'M'), ('Donna', 'F'), ('М', 'M'), ('м', 'M'),
+                                    ('Ж', 'F'), ('Мужской', 'M'), ('женский', 'F'), ('ер', 'M'), ('Еркек', 'M'),
+                                    ('әйел', 'F'), ('Әйел', 'F'), ('?', None), ('', None), (None, None),
+                                    (float('nan'), None)])
+def test_norm_sex_ru_kz(v, want):
+    """Кириллические «М»/«Ж» и казахские «ер»/«әйел» раньше давали «пол неизвестен» → норма женщин 120 г/л и у
+    мужчин: мужчина с Hb 120–129 г/л размечался как «не анемия»."""
+    assert D.norm_sex(v) == want
+
+
+def test_male_cyrillic_label_uses_male_threshold():
+    sex = D.norm_sex('М')
+    assert is_anemic(125, sex, 40, None) and not is_anemic(125, D.norm_sex('Ж'), 40, None)

@@ -148,6 +148,23 @@ def test_hb_units_rejected(value, unit):
         hb_to_g_l(value, unit)
 
 
+@pytest.mark.parametrize('value,unit,g_l', [('12,5 г/дл', 'г/дл', 125), ('12,5 g/dL', 'г/дл', 125),
+                                            ('125 г/л', 'g/l', 125), (' 125 ', 'г/л', 125)])
+def test_hb_text_unit_agrees_with_field(value, unit, g_l):
+    assert hb_to_g_l(value, unit) == pytest.approx(g_l)
+
+
+@pytest.mark.parametrize('value,unit', [
+    ('12,5 г/дл', 'ммоль/л'),   # раньше: 12,5 × 16,11 = 201 г/л «норма» — молча неверно
+    ('12,5 г/дл', 'г/л'),       # раньше: «Hb = 12 г/л вне диапазона» — непонятная причина
+    ('7,8 ммоль/л', 'г/дл'),    # раньше: 78 г/л — молча неверно (правдоподобное число)
+    ('1 250', 'г/л'),           # раньше: число «1», «250» молча отброшено
+    ('125 abc', None)])
+def test_hb_text_unit_conflict_rejected(value, unit):
+    with pytest.raises(ValueError):
+        hb_to_g_l(value, unit)
+
+
 def test_lab_report_who():
     r = lab_hb_report(125, 'г/л', sex='M', age=40)
     assert r['grade'] == 'mild' and r['anemic'] and r['normal_from_g_l'] == 130

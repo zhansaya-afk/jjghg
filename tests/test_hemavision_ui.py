@@ -470,3 +470,32 @@ def test_pdf_failure_does_not_break_result(backend, monkeypatch):
     assert out[12]['r']['status'] == 'ok'
     pdf_btn, pdf_msg = out[-2:]
     assert pdf_btn['visible'] is False and pdf_msg['visible'] and 'нет шрифта' in pdf_msg['value']
+
+
+# ------------------------------------------------------------------ качество: только ткани, по которым оценено
+def _r_conj_ok_sclera_blurred():
+    blur = 'плохое качество: снимок размыт: края ткани размыты на 1.93% кадра (допустимо ≤ 1.90%)'
+    return {'status': 'ok', 'stage': 'ok', 'risk': 'средний', 'p_anemia': 0.5, 'hb_range': None, 'hb_note': 'x',
+            'hb_estimate': None, 'tissues': ['conj'], 'tissue_status': {'conj': 'пригодна', 'sclera': blur},
+            'issues': [], 'notes': [], 'reasons': ['оценено только по цвету конъюнктивы'], 'crop': None, 'conj': None,
+            'sclera': None, 'diag': [], 'model': 'm', 'kind': 'глаз', 'eye': 'e', 'method': 'auto'}
+
+
+def test_quality_card_judges_used_tissue_only():
+    """Конъюнктива годна, склера размыта → оценка по конъюнктиве: «Резкость» не «размыто» (раньше карточка писала
+    «размыто» рядом с готовым результатом), склера — «найдена, не использована (размыто)». Экран и PDF одинаково."""
+    from anemia import api as API
+    from app.hemavision import pdf_report as PDF
+    r = _r_conj_ok_sclera_blurred()
+    res = API.to_result(r, 'v')
+    assert res.quality['sharpness'] == 'размыто'                 # api.Result — по всему снимку, как раньше
+    items = {a: (k, b) for a, k, b in V.quality_items(res, r)}
+    assert items['Резкость'] == ('ok', 'в норме')
+    assert items['Белок глаза (склера)'] == ('na', 'найдена, не использована (размыто)')
+    assert items['Слизистая века (конъюнктива)'] == ('ok', 'найдена')
+    assert 'не использована' in V.quality_html(res, r) and 'размыто' not in V.quality_html(res, r).split('Свет')[0]
+    assert dict(PDF.quality_rows(res, r))['Резкость'] == 'в норме'
+    # отказ: проблемы всего снимка видны как раньше
+    bad = {**r, 'status': 'retake', 'stage': 'quality', 'risk': None, 'p_anemia': None, 'tissues': [],
+           'issues': ['снимок размыт']}
+    assert dict((a, b) for a, _, b in V.quality_items(API.to_result(bad, 'v'), bad))['Резкость'] == 'размыто'

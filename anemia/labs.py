@@ -34,9 +34,9 @@ def norm_pregnant(v):
     if isinstance(v, float) and v != v:
         return None
     s = str(v).strip().lower()
-    if s in ('1', '1.0', 'true', 'yes', 'y', 'да'):
+    if s in ('1', '1.0', 'true', 'yes', 'y', 'да', 'иә'):
         return True
-    if s in ('0', '0.0', 'false', 'no', 'n', 'нет'):
+    if s in ('0', '0.0', 'false', 'no', 'n', 'нет', 'жоқ'):
         return False
     return None
 
@@ -81,6 +81,10 @@ HB_UNITS = {'g/l': 1.0, 'г/л': 1.0, 'g/dl': 10.0, 'г/дл': 10.0, 'g%': 10.0,
 HB_PLAUSIBLE = (30.0, 250.0)                         # г/л: вне диапазона — почти наверняка не та единица
 
 
+def _unit_key(unit):
+    return str(unit).strip().lower().replace(' ', '')
+
+
 def hb_to_g_l(value, unit=None):
     """Hb из бланка анализа → г/л. value — число или строка («12,5 г/дл», «125»), unit — 'г/л', 'g/dL', 'ммоль/л'.
     Без единицы: число ≥ 30 считается г/л; меньшее неоднозначно (г/дл и ммоль/л пересекаются) → ошибка."""
@@ -88,14 +92,23 @@ def hb_to_g_l(value, unit=None):
         m = re.match(r'\s*([0-9]+(?:[.,][0-9]+)?)\s*(.*)$', value)
         if not m:
             raise ValueError(f'не понял значение Hb: {value!r}')
-        value, unit = float(m.group(1).replace(',', '.')), unit or (m.group(2).strip() or None)
+        text_unit = m.group(2).strip() or None
+        if text_unit is not None:           # единица в самой строке: должна быть известной и не спорить с полем
+            tu = _unit_key(text_unit)
+            if tu not in HB_UNITS:
+                raise ValueError(f'не понял значение Hb: {value!r} (после числа «{text_unit}» — не единица; '
+                                 'число пишите без пробелов внутри, единицу — г/л, г/дл или ммоль/л)')
+            if unit is not None and HB_UNITS.get(_unit_key(unit)) != HB_UNITS[tu]:
+                raise ValueError(f'в строке единица «{text_unit}», а выбрана «{unit}» — уберите единицу из числа '
+                                 'или выберите ту же')
+        value, unit = float(m.group(1).replace(',', '.')), unit or text_unit
     value = float(value)
     if unit is None:
         if value < HB_PLAUSIBLE[0]:
             raise ValueError(f'Hb = {value}: укажите единицу (г/л, г/дл или ммоль/л)')
         k = 1.0
     else:
-        u = unit.strip().lower().replace(' ', '')
+        u = _unit_key(unit)
         if u not in HB_UNITS:
             raise ValueError(f'неизвестная единица Hb: {unit!r}; допустимо: {", ".join(sorted(set(HB_UNITS)))}')
         k = HB_UNITS[u]
