@@ -61,7 +61,7 @@ def test_full_result_real_pipeline(tmp_path, backend, monkeypatch):
     assert 'Анализ крови' in txt and '118 г/л' in txt
     assert _n_images(rd) >= 2                                                # исходное фото + маска
     if r['hb_range']:
-        assert 'НЕ лабораторное измерение' in txt and 'неопределённость' in txt
+        assert 'НЕ анализ крови' in txt and 'точно не определить' in txt and 'неопределённость' in txt
     else:
         assert 'не показан' in txt
 
@@ -71,10 +71,11 @@ def test_hb_shown_only_from_core_with_uncertainty(tmp_path, backend, monkeypatch
     _route(monkeypatch, {'conj', 'sclera'})
     r, res = V.run_analysis(_jpeg(synthetic_eye()[0]), V.Survey(sex='M', age=40), backend)
     assert r['status'] == 'ok'
-    r = {**r, 'hb_range': [104.0, 126.0], 'hb_note': 'в 80% случаев реальный Hb был в пределах ±11 г/л'}
+    r = {**r, 'hb_range': [104.0, 126.0], 'hb_estimate': 113.4,
+         'hb_note': 'в 80% случаев реальный Hb был в пределах ±11 г/л'}
     txt, _ = _pdf(tmp_path, r, V.Survey(sex='M', age=40), res=res)
-    assert '104–126 г/л' in txt
-    assert 'НЕ лабораторное измерение' in txt and '±11 г/л' in txt
+    assert '~115 (точно не определить: 104–126) г/л' in txt
+    assert 'НЕ анализ крови' in txt and '±11 г/л' in txt
     assert 'норма Hb ≥ 130 г/л' in txt and 'мужчины' in txt
     no_hb = {**r, 'hb_range': None, 'hb_note': 'цифра Hb не выдаётся: модель Hb почти не лучше константы'}
     txt, _ = _pdf(tmp_path, no_hb, V.Survey(sex='M', age=40), res=res)
@@ -180,3 +181,16 @@ def test_ui_make_pdf_from_session_state(tmp_path, backend, monkeypatch):
     txt, rd = _text(path)
     assert 'Вопрос: Что такое гемоглобин?' in txt and 'Ответ: Белок крови.' in txt and backend.version in txt
     assert _n_images(rd) >= 2
+
+
+def test_photo_hb_for_doctor_always_with_caveat(tmp_path, backend, monkeypatch):
+    """PR #36: на экране числа Hb по фото нет, а в PDF для врача — число, интервал и оговорка о точности всегда."""
+    _route(monkeypatch, {'conj', 'sclera'})
+    r, res = V.run_analysis(_jpeg(synthetic_eye()[0]), V.Survey(sex='F', age=30), backend)
+    assert r['status'] == 'ok'
+    r = {**r, 'hb_range': [75.0, 120.0], 'hb_estimate': 96.0}
+    txt, _ = _pdf(tmp_path, r, V.Survey(sex='F', age=30), res=res)
+    flat = ' '.join(txt.split())
+    assert '~95 (точно не определить: 75–120) г/л' in flat
+    assert 'MAE ≈ 12 г/л' in flat and 'пациенту число не показывается' in flat
+    assert 'не показываем' in V.hb_html(r)
