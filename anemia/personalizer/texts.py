@@ -105,12 +105,34 @@ def other_groups(f, question="", hb=None):
             "Ответ дан по полу из вашего профиля; если он указан неверно, исправьте его."
         )
     if "беремен" in q and not F.is_pregnant(f) and p.get("sex") != "M":
-        add("При беременности порог ВОЗ — 110 г/л.", 110)
+        add("При беременности порог ВОЗ 2024 — 110 г/л в I и III триместре, 105 г/л во II.", 110)
     return join(*out)
+
+
+UNDETERMINED_TRIMESTER = (
+    "по ВОЗ 2024 категорию нельзя определить без недостающих данных: при беременности порог зависит от "
+    "триместра (I и III — от 110 г/л, II — от 105 г/л). Укажите триместр или уточните у врача."
+)
+UNDETERMINED_PREGNANCY = (
+    "по ВОЗ 2024 категорию нельзя определить без недостающих данных: не указано, есть ли беременность "
+    "(без беременности норма для женщин от 120 г/л, при беременности — от 105–110 г/л в зависимости от триместра)."
+)
+UNDETERMINED = "по ВОЗ 2024 категорию нельзя определить без недостающих данных (пол, возраст или беременность)."
+
+
+def _undetermined(f):
+    p = f.get("profile") or {}
+    if p.get("pregnant") is True:
+        return UNDETERMINED_TRIMESTER
+    if p.get("pregnant") is None and p.get("sex") != "M":
+        return UNDETERMINED_PREGNANCY
+    return UNDETERMINED
 
 
 def _lab_sentence(hb, grade, f, prefix=""):
     group, norm = F.group_name(f), F.norm_g_l(f)
+    if grade is None:  # ВОЗ 2024: категория зависит от того, что не указано (обычно триместр)
+        return f"{prefix}{_hb(hb)} г/л — {_undetermined(f)}"
     if grade == "norm":
         s = f"{prefix}{_hb(hb)} г/л — в пределах нормы ВОЗ для {group} (от {norm} г/л)"
         sex = (f.get("profile") or {}).get("sex")
@@ -181,9 +203,15 @@ def lab_grade(f, question=""):
     return F.grade_of(q[0], f) if q else None
 
 
+def _has_hb(f, question=""):
+    return bool(f.get("lab")) or F.hb_from_question(question, f) is not None
+
+
 def lab_advice(f, question=""):
     g = lab_grade(f, question)
     if g is None:
+        if _has_hb(f, question):  # ВОЗ 2024: категория не определена — к врачу всё равно
+            return f"Покажите анализ {doctor(f)} в ближайшие дни: он оценит результат с учётом недостающих данных."
         return ""
     if g == "norm":
         return (
@@ -575,6 +603,14 @@ def kk_lab(f, question=""):
         return ""
     grade = lab["grade"] if lab else F.grade_of(hb, f)
     group, norm = KK_GROUP.get(F.group_name(f), "әйелдерге"), F.norm_g_l(f)
+    if grade is None:  # ДДҰ 2024: триместр белгісіз (мәтінді қазақ тілін білетін адам тексеруі керек)
+        p = f.get("profile") or {}
+        why = (
+            "жүктілік кезінде шекті мән триместрге байланысты (I және III — 110 г/л, II — 105 г/л)"
+            if p.get("pregnant") is True
+            else "жыныс, жас немесе жүктілік толық көрсетілмеген"
+        )
+        return f"{_hb(hb)} г/л — ДДҰ 2024 бойынша санатты анықтау үшін деректер жеткіліксіз: {why}. Дәрігермен ақылдасыңыз."
     if grade == "norm":
         return f"{_hb(hb)} г/л — {group} арналған ДДҰ нормасы шегінде ({norm} г/л және одан жоғары). Әлсіздік болса, дәрігермен ақылдасыңыз."
     return f"{_hb(hb)} г/л {group} арналған ДДҰ нормасынан ({norm} г/л) төмен. Себебін дәрігер анықтайды, ферритин талдауы туралы сұраңыз."
