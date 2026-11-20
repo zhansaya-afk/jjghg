@@ -212,7 +212,9 @@ GUARD_EXPECTED = {
     'features.WORK_SIZE': ('dd7c1a3d9d56', 1, _INITIAL),
     'features.load_item': ('695a401e1094', 1, _INITIAL),
     'labs.is_pregnant': ('2852ae0fc212', 1, _INITIAL),
-    'labs.norm_pregnant': ('3baa797e19c5', 1, _INITIAL),
+    'labs.norm_pregnant': ('6ef4f620d7ff', 1, ('2026-11-20: + казахские «иә» / «жоқ»; у Eyes-defy поля беременности '
+                                               'нет (всегда None) — метки и признаки обучения не меняются, FEATURE_REV '
+                                               'тот же')),
     'predict.ADULT_MODEL': ('10ca6d3e7809', 1, _INITIAL),
     'predict.CONJ_DY_MIN': ('fb577e869653', 1, _INITIAL),
     'predict.CONJ_FRAC_NO_IRIS': ('8b49d70e9c2a', 1, _INITIAL),
@@ -583,3 +585,67 @@ def test_guard_expected_entry_format():
     assert guard_expected_problems({'predict.x': ('012', 1, 'причина')}, 1) \
         == ['predict.x: хэш должен быть строкой из 12 знаков']
     assert guard_expected_problems(GUARD_EXPECTED, STORE.FEATURE_REV) == []    # текущие записи корректны
+
+
+# ------------------------------------------------------------------ модель лица MediaPipe: sha256
+from anemia import predict as PR  # noqa: E402
+
+
+def _fake_mediapipe(monkeypatch):
+    import sys
+    import types
+    created = []
+
+    class _Landmarker:
+        @staticmethod
+        def create_from_options(opt):
+            created.append(opt)
+            return 'детектор'
+
+    vision = types.SimpleNamespace(FaceLandmarkerOptions=lambda **kw: kw, FaceLandmarker=_Landmarker)
+    mod = types.ModuleType('mediapipe.tasks.python')
+    mod.BaseOptions, mod.vision = (lambda **kw: kw), vision
+    for name in ('mediapipe', 'mediapipe.tasks'):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, 'mediapipe.tasks.python', mod)
+    monkeypatch.setattr(PR, '_FACE', {})
+    return created
+
+
+def test_face_model_wrong_sha_rejected_offline(tmp_path, monkeypatch):
+    """Битый или чужой файл модели лица без права скачивать → None с причиной, а не детектор на чужом файле."""
+    created = _fake_mediapipe(monkeypatch)
+    path = tmp_path / PR.FACE_MODEL_FILE
+    path.write_bytes(b'not a model')
+    lm, note = PR.face_landmarker(str(path), download=False)
+    assert lm is None and 'sha256' in note and not created
+
+
+def test_face_model_right_sha_used(tmp_path, monkeypatch):
+    _fake_mediapipe(monkeypatch)
+    path = tmp_path / PR.FACE_MODEL_FILE
+    path.write_bytes(b'x')
+    monkeypatch.setattr(PR, 'FACE_MODEL_SHA256', PR._sha256(str(path)))
+    lm, _ = PR.face_landmarker(str(path), download=False)
+    assert lm == 'детектор'
+
+
+def test_face_model_bad_download_not_kept(tmp_path, monkeypatch):
+    """Скачанный файл с другим sha256 не сохраняется под именем модели."""
+    import io
+    import urllib.request
+    _fake_mediapipe(monkeypatch)
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(b'truncated'))
+    path = tmp_path / PR.FACE_MODEL_FILE
+    lm, note = PR.face_landmarker(str(path), download=True)
+    assert lm is None and 'sha256' in note
+    assert not path.exists() and not (tmp_path / (PR.FACE_MODEL_FILE + '.part')).exists()
+
+
+def test_face_model_user_file_not_deleted(tmp_path, monkeypatch):
+    """Путь передан явно (api.load_models(face_model=…)) и sha256 другой → файл пользователя не удаляется."""
+    _fake_mediapipe(monkeypatch)
+    path = tmp_path / 'my_face.task'
+    path.write_bytes(b'user model')
+    lm, note = PR.face_landmarker(str(path), download=True)
+    assert lm is None and 'sha256' in note and path.read_bytes() == b'user model'

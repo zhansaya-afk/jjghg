@@ -28,7 +28,6 @@ NO_DATA = 'нет данных'
 WHO2011_SOURCE = ('ВОЗ 2011: WHO, Haemoglobin concentrations for the diagnosis of anaemia and assessment of '
                   'severity (WHO/NMH/NHD/MNM/11.1), таблица 1')
 LEVELS = ('низкий', 'средний', 'высокий')
-Q_TEXT = {'ok': 'в норме', None: 'не проверялось'}
 RU3 = {True: 'да', False: 'нет', None: 'не указано'}
 FONT_CANDIDATES = (     # (обычный, жирный)
     ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'),
@@ -141,20 +140,15 @@ def hb_block(r):
     return 'Hb по фото: не показан', _cap(r.get('hb_note') or NO_DATA) + '.'
 
 
-def quality_rows(res):
-    """Качество снимка (api.Result.quality) → [(показатель, значение)]. res None → одна строка «не проверялось»."""
+def quality_rows(res, r=None):
+    """Качество снимка → [(показатель, значение)] как на экране (view.quality_items: при оценке — по использованным
+    тканям). res None → одна строка «не проверялось»."""
     if res is None:
         return [('Проверка качества', 'не выполнялась')]
-    q = res.quality or {}
-    vis = q.get('tissue_visible') or {}
-
-    def tv(v):
-        return 'не проверялось' if v is None else 'найдена' if v else 'не найдена'
-    rows = [('Резкость', Q_TEXT.get(q.get('sharpness'), q.get('sharpness'))),
-            ('Свет', Q_TEXT.get(q.get('light'), q.get('light'))),
-            ('Слизистая нижнего века (конъюнктива)', tv(vis.get('conjunctiva'))),
-            ('Белок глаза (склера)', tv(vis.get('sclera')))]
-    rows.append(('Оценено по ткани', res.tissue or 'не оценивалось'))
+    from .view import quality_items
+    rows = [(a, b) for a, _, b in quality_items(res, r)]
+    if not res.tissue:
+        rows.append(('Оценено по ткани', 'не оценивалось'))
     return rows
 
 
@@ -373,7 +367,7 @@ def build_pdf(path, r, survey, *, res=None, lab=None, photo=None, model_version=
               P('Референс гемоглобина — нижняя граница нормы ВОЗ 2011 для группы пациента (раздел 7).', 'small')]
 
     # 4. Качество
-    story += [P('4. Контроль качества изображения', 'h2'), kv(quality_rows(res))]
+    story += [P('4. Контроль качества изображения', 'h2'), kv(quality_rows(res, r))]
 
     # 5. Иллюстрации
     story.append(P('5. Иллюстрации', 'h2'))

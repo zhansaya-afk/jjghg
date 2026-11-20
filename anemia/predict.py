@@ -247,6 +247,7 @@ def pick_model(bundle, age):
 FACE_MODEL_FILE = 'face_landmarker.task'
 FACE_MODEL_URL = ('https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/'
                   'face_landmarker.task')
+FACE_MODEL_SHA256 = '64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff'   # float16/1, 3 758 596 байт
 IRIS_MIN_R = 0.012       # самая мелкая радужка, которую ищем (доля короткой стороны кадра 1024 px → ≥ 6 px)
 IRIS_SCLERA_L = 0.6      # мелкая радужка: L* внутри ≤ 0,6 L* склеры (у глаза на фото проверки 0,37–0,40; без размеченных данных)
 SCLERA_LID_MARGIN = 1.0  # склера не дальше 1 r в сторону за край вывернутого века (конъюнктивы)
@@ -270,10 +271,20 @@ IRIS_CONTRAST = 20       # мелкую радужку принимаем, то�
 _FACE = {}
 
 
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def face_landmarker(path=None, download=True):
     """MediaPipe FaceLandmarker (как в ноутбуке v12) → (детектор или None, пояснение). Модель лица (3,7 МБ)
     скачивается один раз рядом с моделью риска ($ANEMIA_MODELS). Без mediapipe или без сети — None: тогда
     глаз ищется по всему кадру и по радужке."""
+    own = path is None                     # путь по умолчанию: битый файл можно удалить и скачать заново
     path = path or os.path.join(os.path.dirname(default_model_path()), FACE_MODEL_FILE)
     if path in _FACE:
         return _FACE[path]
@@ -283,6 +294,10 @@ def face_landmarker(path=None, download=True):
         _FACE[path] = (None, f'MediaPipe не установлен ({type(e).__name__}): лицо целиком не разобрать')
         return _FACE[path]
     try:
+        if os.path.exists(path) and _sha256(path) != FACE_MODEL_SHA256:
+            if not download or not own:     # чужой файл (путь передан явно) не удаляем
+                raise ValueError(f'sha256 не совпал: {os.path.basename(path)} повреждён или другой версии')
+            os.remove(path)                 # битая модель лица по пути по умолчанию: скачиваем заново
         if not os.path.exists(path):
             if not download:
                 raise FileNotFoundError(path)
@@ -290,6 +305,9 @@ def face_landmarker(path=None, download=True):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with urllib.request.urlopen(FACE_MODEL_URL, timeout=30) as resp, open(path + '.part', 'wb') as out:
                 out.write(resp.read())
+            if _sha256(path + '.part') != FACE_MODEL_SHA256:
+                os.remove(path + '.part')
+                raise ValueError('sha256 скачанной модели лица не совпал (обрыв загрузки или другая версия)')
             os.replace(path + '.part', path)
         opt = vision.FaceLandmarkerOptions(base_options=BaseOptions(model_asset_path=path), num_faces=1,
                                            min_face_detection_confidence=0.3, min_face_presence_confidence=0.3)

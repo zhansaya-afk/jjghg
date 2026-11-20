@@ -272,7 +272,7 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                                                                                                face is not None)),
                     V.risk_card_html(r) if err is None else V.error_html(err),
                     gr.update(value=V.hb_html(r), visible=bool(V.hb_html(r))), gr.update(value=lab_h, visible=bool(lab_h)),
-                    V.quality_html(res) if res is not None else '', V.summary_html(r, res),
+                    V.quality_html(res, r) if res is not None else '', V.summary_html(r, res),
                     _personalizer_html(reply), V.doctor_html(r, backend.version), gr.update(value=path, visible=True),
                     st, chat, [], '', gr.update(interactive=True), gr.update(interactive=True), pdf_b, pdf_m)
 
