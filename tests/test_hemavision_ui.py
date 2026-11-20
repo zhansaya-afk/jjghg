@@ -436,11 +436,37 @@ def test_full_path_photo_result_lab_personalizer(backend, monkeypatch):
     assert 'AI Personalizer' in p_card and '125 г/л' in p_card and chatbot == [] and q == ''
     with open(report['value'], encoding='utf-8') as f:
         assert '125 г/л' in f.read().split('Анализ крови (введён пользователем')[1]
-    msgs, q, chat = _fn(demo, 'on_ask')('Что такое ферритин?', chat)
+    pdf_btn, pdf_msg = out[-2:]                                                    # PDF из результата этой сессии
+    assert pdf_btn['visible'] and pdf_btn['value'].endswith('.pdf') and not pdf_msg['visible']
+    msgs, q, chat, pdf_btn, _ = _fn(demo, 'on_ask')('Что такое ферритин?', chat, state)
     assert q == '' and msgs[0]['content'] == 'Что такое ферритин?' and 'Ферритин' in msgs[1]['content']
-    msgs, _, chat = _fn(demo, 'on_ask')('Нәтижем нені білдіреді?', chat)
+    pypdf = pytest.importorskip('pypdf')
+    txt = ' '.join(' '.join(p.extract_text().split()) for p in pypdf.PdfReader(pdf_btn['value']).pages)
+    assert 'Вопрос: Что такое ферритин?' in txt and '125 г/л' in txt               # PDF обновлён после вопроса
+    msgs, _, chat, *_ = _fn(demo, 'on_ask')('Нәтижем нені білдіреді?', chat, state)
     assert len(msgs) == 4 and 'диагноз емес' in msgs[3]['content']
     assert chat['inp'].risk == r['risk'] and chat['inp'].lab == state['lab']    # диалог не меняет результат
     # без анализа крови: карточки нет, путь тот же
     out = _fn(demo, 'run')(*form, 'Авто', '', 'г/л', 'Не знаю', 'Не знаю', 'Не знаю')
     assert out[6]['visible'] is False and out[12]['lab'] is None
+
+
+def test_pdf_failure_does_not_break_result(backend, monkeypatch):
+    """Нет reportlab / шрифта → экран результата работает, кнопка PDF скрыта, причина показана."""
+    pytest.importorskip('gradio')
+    from app.hemavision import ui
+
+    def boom(*a, **k):
+        raise RuntimeError('нет шрифта')
+    monkeypatch.setattr(ui, 'make_pdf', boom)
+    _route(monkeypatch, {'conj', 'sclera'})
+    demo = ui.build(backend=backend)
+    import tempfile
+
+    from PIL import Image
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+        Image.fromarray((np.clip(synthetic_eye()[0], 0, 1) * 255).astype(np.uint8)).save(f, format='JPEG')
+    out = _fn(demo, 'run')(f.name, 'Женский', 30, 'Нет', 'Авто', '', 'г/л', 'Не знаю', 'Не знаю', 'Не знаю')
+    assert out[12]['r']['status'] == 'ok'
+    pdf_btn, pdf_msg = out[-2:]
+    assert pdf_btn['visible'] is False and pdf_msg['visible'] and 'нет шрифта' in pdf_msg['value']

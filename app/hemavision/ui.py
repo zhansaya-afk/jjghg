@@ -63,6 +63,15 @@ def _personalizer_html(reply):
     return f'<div class="hv-card hv-personalizer"><h3>{V._e(reply.title)}</h3><p class="hv-small">{text}</p></div>'
 
 
+def make_pdf(st, chat=None, version=''):
+    """PDF-отчёт текущей проверки во временный файл → путь. st — состояние экрана результата (r, survey, lab,
+    res, photo, reply); chat — диалог Personalizer этой проверки (история вопросов) или None."""
+    from .pdf_report import build_pdf
+    path = os.path.join(tempfile.mkdtemp(), 'hemavision_report.pdf')
+    return build_pdf(path, st['r'], st['survey'], res=st.get('res'), lab=st.get('lab'), photo=st.get('photo'),
+                     model_version=version, reply=st.get('reply'), history=(chat or {}).get('history') or ())
+
+
 def _blocks_kwargs(gr):
     """Gradio 6 принимает theme/css/js в launch(), Gradio 5 — в Blocks(). Возвращает (для Blocks, для launch)."""
     style = {'theme': theme(), 'css': CSS, 'js': LIGHT_JS}
@@ -89,7 +98,7 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
     with gr.Blocks(title='HemaVision — скрининг риска анемии', elem_classes='hv-app', analytics_enabled=False,
                    **blocks_kw) as demo:
         demo.hv_launch_kwargs = launch_kw
-        state = gr.State(None)            # {'r': dict analyze_photo, 'survey': Survey, 'lab': dict | None}
+        state = gr.State(None)            # {'r', 'survey', 'lab', 'res', 'photo', 'reply'} — для экрана и PDF
         chat_state = gr.State(None)       # {'inp': PersonalizerInput, 'history': tuple} — диалог этой проверки
         stepper = gr.HTML('')
 
@@ -186,7 +195,10 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
             with gr.Accordion('Для врача: технические сведения', open=False):
                 doctor = gr.HTML()
             gr.HTML(DISCLAIMER_HTML)
-            report = gr.DownloadButton('Скачать отчёт для врача (.txt)', visible=False, size='lg')
+            with gr.Row():
+                pdf_btn = gr.DownloadButton('Скачать PDF-отчёт для врача', visible=False, variant='primary', size='lg')
+                report = gr.DownloadButton('Скачать отчёт (.txt)', visible=False, size='lg')
+            pdf_msg = gr.HTML(visible=False)
             with gr.Row(elem_classes='hv-nav'):
                 home_btn = gr.Button('На главную', size='lg')
                 again = gr.Button('Новый снимок', variant='primary', size='lg')
@@ -195,6 +207,17 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
         screens = [home, photo_scr, survey_scr, analysis_scr, result_scr, stepper]
 
         # ---------------------------------------------------------------- логика
+        def pdf_outputs(st, chat=None):
+            """PDF из результата этой проверки (+ ответы Personalizer) → (кнопка, сообщение). Ошибка PDF (нет
+            reportlab или шрифта с кириллицей) не ломает экран результата: кнопка скрыта, причина видна."""
+            try:
+                path = make_pdf(st, chat, backend.version)
+            except Exception as e:  # noqa: BLE001
+                return (gr.update(visible=False),
+                        gr.update(visible=True, value=V.note_html('warn', f'PDF-отчёт не сформирован: '
+                                                                          f'{V._e(type(e).__name__)}: {V._e(e)}')))
+            return gr.update(value=path, visible=True), gr.update(visible=False, value='')
+
         def on_next_photo(p):
             if not p:
                 gr.Warning('Сначала загрузите или снимите фото.')
@@ -240,6 +263,9 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                 f.write(V.report_text(r, survey, backend.version, lab) if res is not None else
                         'Анализ не выполнен: ' + '; '.join(r['issues']) + '\n')
             lab_h = V.lab_html(lab, lab_err)
+            st = {'r': r, 'survey': survey, 'lab': lab, 'res': res, 'photo': p, 'reply': reply}
+            chat = {'inp': inp, 'history': start_history(reply)}
+            pdf_b, pdf_m = pdf_outputs(st, chat)
             return (V.pipeline_html(r, dt_s),
                     gr.update(value=crop, visible=crop is not None), gr.update(value=face, visible=face is not None),
                     gr.update(visible=crop is not None or face is not None, value=V.legend_html(crop is not None,
@@ -248,20 +274,21 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
                     gr.update(value=V.hb_html(r), visible=bool(V.hb_html(r))), gr.update(value=lab_h, visible=bool(lab_h)),
                     V.quality_html(res) if res is not None else '', V.summary_html(r, res),
                     _personalizer_html(reply), V.doctor_html(r, backend.version), gr.update(value=path, visible=True),
-                    {'r': r, 'survey': survey, 'lab': lab}, {'inp': inp, 'history': start_history(reply)}, [], '',
-                    gr.update(interactive=True), gr.update(interactive=True))
+                    st, chat, [], '', gr.update(interactive=True), gr.update(interactive=True), pdf_b, pdf_m)
 
-        def on_ask(q, chat):
+        def on_ask(q, chat, st):
             if not chat:
                 gr.Warning('Сначала проанализируйте фото.')
-                return gr.update(), q, chat
+                return gr.update(), q, chat, gr.update(), gr.update()
             rep, history = ask(personalizer, chat['inp'], chat['history'], q)
             if rep is None:             # пустой вопрос
-                return gr.update(), '', chat
+                return gr.update(), '', chat, gr.update(), gr.update()
             if not rep.available:       # лимит, ошибка движка или заглушка: ответ виден, в историю не идёт
-                return chat_messages(history) + [{'role': 'user', 'content': q},
-                                                 {'role': 'assistant', 'content': rep.text}], '', chat
-            return chat_messages(history), '', {**chat, 'history': history}
+                return (chat_messages(history) + [{'role': 'user', 'content': q},
+                                                  {'role': 'assistant', 'content': rep.text}], '', chat,
+                        gr.update(), gr.update())
+            chat = {**chat, 'history': history}
+            return (chat_messages(history), '', chat, *pdf_outputs(st, chat))   # PDF с этим вопросом и ответом
 
         inputs = [photo, sex, age, preg, method, lab_value, lab_unit, *answers]
         start.click(lambda: show('photo'), None, screens)
@@ -273,10 +300,11 @@ def build(model_path=None, personalizer: Personalizer | None = None, backend=Non
         go.click(check_lab, [sex, age, preg, lab_value, lab_unit], lab_msg).success(
             on_analyze, photo, screens + [pipeline, crop_img, face_img, legend, to_result, go]).success(
             run, inputs, [pipeline, crop_img, face_img, legend, risk_card, hb_card, lab_card, quality_card, summary,
-                          p_card, doctor, report, state, chat_state, chatbot, question, to_result, go],
+                          p_card, doctor, report, state, chat_state, chatbot, question, to_result, go, pdf_btn, pdf_msg],
             show_progress='hidden')
-        send.click(on_ask, [question, chat_state], [chatbot, question, chat_state])
-        question.submit(on_ask, [question, chat_state], [chatbot, question, chat_state])
+        ask_io = ([question, chat_state, state], [chatbot, question, chat_state, pdf_btn, pdf_msg])
+        send.click(on_ask, *ask_io)
+        question.submit(on_ask, *ask_io)
         back3.click(lambda: show('survey'), None, screens)
         to_result.click(lambda: show('result'), None, screens)
         again.click(lambda: show('photo') + [None], None, screens + [photo])

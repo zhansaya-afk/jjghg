@@ -17,9 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.6"]
+dev = ["pytest>=7", "ruff>=0.6", "reportlab>=4", "pypdf>=4"]   # reportlab, pypdf — тесты PDF-отчёта
 data = ["kagglehub>=0.2"]
-app = ["gradio>=6,<7"]       # app/collect.py: сбор своих фото
+app = ["gradio>=6,<7", "reportlab>=4"]       # app/collect.py: сбор своих фото; reportlab — PDF-отчёт HemaVision
 
 [tool.setuptools]
 packages = ["anemia"]
