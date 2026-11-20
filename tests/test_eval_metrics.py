@@ -533,3 +533,74 @@ def test_write_seg_metrics_failure_leaves_no_files(tmp_path, monkeypatch, capsys
     assert not list(tmp_path.iterdir()) and 'НЕ записаны' in capsys.readouterr().out
     meta = EV.write_seg_metrics(str(tmp_path), recs, 'core: второй проход: ValueError', 'failed')
     assert meta == {'status': 'failed', 'why': 'core: второй проход: ValueError'} and not list(tmp_path.iterdir())
+
+
+# ------------------------------------------------------------------ AUC по подгруппам (страна)
+def _auc_rows(score, y, strata, groups=None, n_boot=200):
+    from anemia.metrics import auc_by_stratum
+    groups = np.arange(len(y)) if groups is None else groups
+    return {r['подвыборка']: r for r in auc_by_stratum(score, y, strata, groups, n_boot=n_boot)}
+
+
+def test_auc_by_stratum_sizes_and_values():
+    y = np.array([1, 1, 0, 0, 1, 0, 0, 0])
+    s = np.array([.9, .8, .7, .1, .6, .5, .4, .3])
+    c = np.array(['India'] * 4 + ['Italy'] * 4)
+    R = _auc_rows(s, y, c)
+    assert set(R) == {'все', 'India', 'Italy', 'внутри стран'}
+    assert (R['все']['n'], R['все']['n_anemic'], R['все']['n_healthy']) == (8, 3, 5)
+    assert (R['India']['n'], R['India']['n_anemic'], R['India']['n_healthy']) == (4, 2, 2)
+    assert R['India']['auc'] == 1.0 and R['Italy']['auc'] == 1.0
+    assert R['внутри стран']['auc'] == 1.0          # внутри каждой страны больные выше здоровых
+    assert R['все']['auc'] < 1.0                      # а между странами — нет (0,7 здоровый Индии > 0,6 больной Италии)
+
+
+def test_within_country_auc_removes_country_shift():
+    """Скор = только страна: общий AUC высокий, внутри стран — 0,5 (ничьи)."""
+    y = np.array([1, 1, 1, 0] + [1, 0, 0, 0])
+    s = np.array([1.] * 4 + [0.] * 4)
+    c = np.array(['India'] * 4 + ['Italy'] * 4)
+    R = _auc_rows(s, y, c)
+    assert R['все']['auc'] > 0.7
+    assert R['внутри стран']['auc'] == 0.5
+    assert R['India']['auc'] == 0.5 and R['Italy']['auc'] == 0.5
+
+
+def test_auc_by_stratum_one_class_is_nan_not_zero():
+    y = np.array([1, 1, 0, 0, 1, 1])
+    s = np.array([.9, .2, .7, .1, .6, .5])
+    c = np.array(['India'] * 4 + ['Italy'] * 2)
+    R = _auc_rows(s, y, c)
+    assert R['Italy']['n_healthy'] == 0 and np.isnan(R['Italy']['auc']) and np.isnan(R['Italy']['auc_lo'])
+    assert R['внутри стран']['auc'] == R['India']['auc']      # пары есть только в Индии
+
+
+def test_auc_by_stratum_ci_brackets_point():
+    rng = np.random.default_rng(1)
+    y = rng.integers(0, 2, 120)
+    s = y + rng.normal(0, 1, 120)
+    c = np.where(rng.random(120) < .5, 'India', 'Italy')
+    for r in _auc_rows(s, y, c).values():
+        assert r['auc_lo'] <= r['auc'] <= r['auc_hi']
+
+
+def test_evaluate_auc_by_country_maps_groups_to_country(capsys):
+    df = pd.DataFrame({'dataset': 'eyes_defy', 'patient_id': ['ED_India_1', 'ED_India_2', 'ED_Italy_1', 'ED_Italy_2'],
+                       'group': ['g1', 'g2', 'g3', 'g4']})
+    O = pd.DataFrame({'group': ['g1', 'g2', 'g3', 'g4'], 'p': [.9, .2, .8, .1], 'anemic': [True, False, True, False]})
+    R = {r['подвыборка']: r for r in EV.auc_by_country(df, O, 'eyes_defy')}
+    assert R['India']['n'] == 2 and R['Italy']['n'] == 2 and R['все']['n'] == 4
+    assert R['внутри стран']['auc'] == 1.0 and R['India']['модель'] == 'eyes_defy'
+    EV.print_auc_by_country(list(R.values()))
+    out = capsys.readouterr().out
+    assert 'AUC по странам' in out and '| eyes_defy | India | 2 | 2 | 1 | 1 |' in out
+
+
+def test_evaluate_auc_by_country_drops_group_in_both_countries(capsys):
+    df = pd.DataFrame({'dataset': 'eyes_defy', 'patient_id': ['ED_India_1', 'ED_Italy_9', 'ED_India_2', 'ED_Italy_1',
+                                                              'ED_Italy_2'], 'group': ['gx', 'gx', 'g2', 'g3', 'g4']})
+    O = pd.DataFrame({'group': ['gx', 'gx', 'g2', 'g3', 'g4'], 'p': [.9, .9, .2, .8, .1],
+                      'anemic': [True, True, False, True, False]})
+    R = {r['подвыборка']: r for r in EV.auc_by_country(df, O, 'eyes_defy')}
+    assert R['все']['n'] == 3 and R['India']['n'] == 1 and R['Italy']['n_patients'] == 2
+    assert 'gx' in capsys.readouterr().out
