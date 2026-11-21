@@ -147,6 +147,18 @@ def test_merge_lis_guards(tmp_path):
         C.merge_lis(str(photos), str(lis), str(tmp_path / 'doc3' / 'hb.csv'))
 
 
+@pytest.mark.parametrize('clinic_id', ['123456789012', 'Иванова А.', 'MRN-00451', 'p0a1b2c'])
+def test_merge_lis_rejects_clinic_identifiers(tmp_path, clinic_id):
+    """В patient_id таблицы ЛИС — только код участника: ИИН, ФИО или номер карты дают ошибку, файл не создаётся."""
+    photos = _pilot_with_two(tmp_path)
+    lis = tmp_path / 'hb_lis.csv'
+    _write_lis(lis, [(clinic_id, '113', '0')])
+    out = tmp_path / 'doc' / 'hb.csv'
+    with pytest.raises(C.CollectError, match='id участника'):
+        C.merge_lis(str(photos), str(lis), str(out))
+    assert not out.exists()
+
+
 def test_merge_lis_script_prints_no_hb_values(tmp_path, capsys):
     photos = _pilot_with_two(tmp_path)
     lis = tmp_path / 'hb_lis.csv'
