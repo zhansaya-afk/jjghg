@@ -15,7 +15,7 @@ exp_country_relative_2026-11-12/РЕЗУЛЬТАТ.md, в metrics_history.csv н
 
 Правило решения (заранее, по модели «обе ткани»; модель «только конъюнктива» — для сведения, n мала):
     ПРИНЯТЬ ансамбль, если одновременно:
-    1) средний AUC трёх повторов E ≥ среднего AUC пяти A − 0,005 и нижняя граница парного 95% ДИ ΔAUC(E0 − A0)
+    1) средний AUC пяти повторов E ≥ среднего AUC пяти A − 0,005 и нижняя граница парного 95% ДИ ΔAUC(E0 − A0)
        > −0,02;
     2) средний AUC внутри стран E ≥ среднего у A − 0,005;
     3) разброс между повторами меньше: размах (max − min) FP + FN у пяти E меньше, чем у пяти A (поровну повторов);
@@ -30,7 +30,6 @@ exp_country_relative_2026-11-12/РЕЗУЛЬТАТ.md, в metrics_history.csv н
 Пациентские строки (OOF) — только в папку данных, не в репозиторий.
 """
 import argparse
-import contextlib
 import datetime as dt
 import json
 import os
@@ -50,32 +49,11 @@ import evaluate as EV  # noqa: E402
 
 from anemia import core as CORE  # noqa: E402
 from anemia import metrics as M  # noqa: E402
-from anemia import v12_model as V12  # noqa: E402
 from anemia.cache import FeatureCache, source_version  # noqa: E402
 
-N_ENS = 5
-ENS_SEED0 = 100        # seed ансамблей не пересекаются с seed A0–A4
+N_ENS = 5              # = CORE.N_ENSEMBLE на 2026-11-21; seed E<r>: CORE.ENS_SEED0 + 5r + k
 NAN = float('nan')
 KEYS = ('eyes_defy', 'eyes_defy_conj')
-
-
-@contextlib.contextmanager
-def ensemble(n):
-    """Внутри блока fit_core обучает n классификаторов (seed ENS_SEED0 + seed·n + k, k < n) и усредняет P(анемия)."""
-    fit0, p0 = CORE._fit_cls, CORE._p_anemia
-
-    def fit(T, feats, seed=0):
-        ms = [V12.fit(T[feats].values, T.y.values, ENS_SEED0 + seed * n + k) for k in range(n)]
-        return ms, V12.class_prior(T[T.aug == 0].y.values)
-
-    def p(m, prior, X):
-        return np.mean([p0(mi, prior, X) for mi in m], 0) if isinstance(m, list) else p0(m, prior, X)
-
-    CORE._fit_cls, CORE._p_anemia = fit, p
-    try:
-        yield
-    finally:
-        CORE._fit_cls, CORE._p_anemia = fit0, p0
 
 
 def run_variant(df, J, key, seed, n_ens):
@@ -88,9 +66,7 @@ def run_variant(df, J, key, seed, n_ens):
     S = EV._frame(J, 'test', key, s=True)
     S = S[S.group.isin(set(F.group))] if len(S) else None
     train = {f: CORE.usable(EV._frame(J, f), key) for f in sorted(set(df.fold.astype(int)))}
-    ctx = ensemble(n_ens) if n_ens > 1 else contextlib.nullcontext()
-    with ctx:
-        O, SP = CORE.cross_validate(F, feats, key, S, seed=seed, train_by_fold=train)
+    O, SP = CORE.cross_validate(F, feats, key, S, seed=seed, train_by_fold=train, n_ens=n_ens)
     return O.assign(accepted=O.ood.values <= CORE.OOD_MAX), SP
 
 

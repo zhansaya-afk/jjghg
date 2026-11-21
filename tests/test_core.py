@@ -275,3 +275,25 @@ def test_cross_validate_reports_calibration_and_raised():
     assert {'brier', 'brier_raw', 'ece', 'zsens', 'zspec', 'zsens_p', 'n_raised'} <= set(r)
     t = CORE.reliability(O.p.values, O.anemic.values)
     assert t.n.sum() == len(O)
+
+
+def test_risk_classifier_is_seed_ensemble():
+    """Модель риска — ансамбль N_ENSEMBLE классификаторов (seed ENS_SEED0 + k); P — среднее их P(анемия);
+    n = 1 воспроизводит прежний одиночный классификатор, старая модель (не список) читается как раньше."""
+    F, _ = _synthetic()
+    feats = ['c_x', 'c_z', 's_x', 'male']
+    B = CORE.fit_core(F, feats, 'eyes_defy')
+    X = F[F.aug == 0][feats].values
+    assert isinstance(B['cls'], list) and len(B['cls']) == CORE.N_ENSEMBLE == 5
+    each = [CORE._p_anemia(m, B['prior'], X) for m in B['cls']]
+    assert np.allclose(CORE._p_anemia(B['cls'], B['prior'], X), np.mean(each, 0))
+    assert np.allclose(CORE._p_anemia(B['cls'], B['prior'], X),
+                       CORE._p_anemia(CORE.fit_core(F, feats, 'eyes_defy')['cls'], B['prior'], X))   # детерминирован
+    one, prior = CORE._fit_cls(F, feats, seed=3, n=1)
+    old = V12.fit(F[feats].values, F.y.values, 3)
+    assert np.allclose(CORE._p_anemia(one, prior, X), CORE._p_anemia(old, prior, X))
+    assert np.allclose(CORE._p_anemia(old, prior, X), 1 - V12.predict(old, X, prior)[:, 0])
+    ens, _ = CORE._fit_cls(F, feats, seed=0)          # seed ансамбля 100…104 — как E0 эксперимента 2026-11-21
+    ref = [V12.fit(F[feats].values, F.y.values, CORE.ENS_SEED0 + k) for k in range(CORE.N_ENSEMBLE)]
+    assert CORE.ENS_SEED0 == 100
+    assert np.allclose(CORE._p_anemia(ens, prior, X), CORE._p_anemia(ref, prior, X))

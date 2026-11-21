@@ -45,6 +45,8 @@ HB_MIN_SKILL = 0.10      # Hb показываем, если MAE модели �
 HB_RANGE_Q = 0.80        # полуширина диапазона Hb — этот перцентиль |ошибки| на вложенной CV
 OOD_MAX = 0.30           # как в v12: больше 30% признаков далеко вне обучающего диапазона — снимок «не такой»
 INNER_FOLDS = 4
+N_ENSEMBLE = 5           # классификаторов риска с разными seed, P(анемия) = среднее (эксперимент 2026-11-21)
+ENS_SEED0 = 100          # seed ансамбля: ENS_SEED0 + seed·N_ENSEMBLE + k, k < N_ENSEMBLE (seed=0 → 100…104 = E0)
 RISK_LEVELS = ('низкий', 'средний', 'высокий')
 
 SPECS = {   # модель → датасет манифеста, признаки, какие ткани обязательны у снимка (снимок глаза взрослого;
@@ -80,13 +82,21 @@ def usable(F, key=None):
 
 
 # ------------------------------------------------------------------ части модели
-def _fit_cls(T, feats, seed=0):
-    m = V12.fit(T[feats].values, T.y.values, seed)
-    return m, V12.class_prior(T[T.aug == 0].y.values)
+def _fit_cls(T, feats, seed=0, n=None):
+    """Ансамбль из n классификаторов v12 (seed ENS_SEED0 + seed·n + k). Один классификатор зависел от случайного
+    повтора редких классов. Ансамбль принят по правилу scripts/experiment_core_seeds.py (заданному до запуска) за
+    меньший разброс между seed, не за точность: цифры — results/experiments.csv, id core_seeds.
+    n = 1 — прежняя модель с seed = seed (для сравнения в эксперименте)."""
+    n = N_ENSEMBLE if n is None else n
+    X, y = T[feats].values, T.y.values
+    ms = [V12.fit(X, y, seed)] if n == 1 else [V12.fit(X, y, ENS_SEED0 + seed * n + k) for k in range(n)]
+    return ms, V12.class_prior(T[T.aug == 0].y.values)
 
 
 def _p_anemia(m, prior, X):
-    return 1 - V12.predict(m, np.asarray(X, float), prior)[:, 0]
+    """P(анемия) = 1 − P(норма); m — список классификаторов (среднее) или один (модели до 2026-11-21)."""
+    X = np.asarray(X, float)
+    return np.mean([1 - V12.predict(mi, X, prior)[:, 0] for mi in (m if isinstance(m, list) else [m])], 0)
 
 
 def _hb_model():
@@ -153,16 +163,17 @@ def reconcile(level, hb_pred, hw, hb_ok, who_normal):
 
 
 # ------------------------------------------------------------------ обучение
-def fit_core(F, feats, dataset, seed=0, inner_folds=INNER_FOLDS, zone_target=ZONE_TARGET):
+def fit_core(F, feats, dataset, seed=0, inner_folds=INNER_FOLDS, zone_target=ZONE_TARGET, n_ens=None):
     """F: строки признаков (aug 0 — исходный снимок, aug > 0 — обучающие копии при другом свете), колонки
-    group, anemic, y (класс ВОЗ 0/1/2), hb_g_l. → словарь модели (всё, что нужно для anemia.predict)."""
+    group, anemic, y (класс ВОЗ 0/1/2), hb_g_l. n_ens — классификаторов риска (None → N_ENSEMBLE).
+    → словарь модели (всё, что нужно для anemia.predict)."""
     F = F.reset_index(drop=True)
     O = F[F.aug == 0].reset_index(drop=True)
     anem, hb = O.anemic.values.astype(bool), O.hb_g_l.values.astype(float)
     p_in, hb_in, hb0_in = np.zeros(len(O)), np.zeros(len(O)), np.zeros(len(O))
     for itr, ite in GroupKFold(min(inner_folds, O.group.nunique())).split(O, groups=O.group):
         T = F[F.group.isin(set(O.group.iloc[itr]))]          # копии при другом свете — только пациентов train
-        m, prior = _fit_cls(T, feats, seed)
+        m, prior = _fit_cls(T, feats, seed, n_ens)
         p_in[ite] = _p_anemia(m, prior, O[feats].values[ite])
         hb_in[ite] = _hb_model().fit(T[feats].values, T.hb_g_l.values).predict(O[feats].values[ite])
         hb0_in[ite] = np.median(hb[itr])
@@ -171,7 +182,7 @@ def fit_core(F, feats, dataset, seed=0, inner_folds=INNER_FOLDS, zone_target=ZON
     t_hi = max(zone_thresholds(p_in, anem, zone_target)[1], t_lo)
     t_lo, t_hi = (float(calibrate(cal, t)) for t in (t_lo, t_hi))
     mae, mae0 = M.mae(hb_in, hb), M.mae(hb0_in, hb)
-    model, prior = _fit_cls(F, feats, seed)
+    model, prior = _fit_cls(F, feats, seed, n_ens)
     X0 = O[feats].values.astype(float)
     return {
         'dataset': dataset, 'title': SPECS[dataset]['title'], 'tissues': SPECS[dataset]['tissues'], 'feats': list(feats),
@@ -195,7 +206,7 @@ def apply_core(B, X):
 
 
 # ------------------------------------------------------------------ проверка на фолдах манифеста
-def cross_validate(F, feats, dataset, S=None, seed=0, train_by_fold=None):
+def cross_validate(F, feats, dataset, S=None, seed=0, train_by_fold=None, n_ens=None):
     """OOF по фолдам манифеста: модель и все её пороги обучаются на 4 фолдах, применяются к пятому.
     S — признаки тех же снимков при 8 стресс-условиях света (group, cond): риск по ним считает модель того фолда,
     где пациент был тестовым. train_by_fold — {фолд f: обучающие строки}, если признаки обучающих снимков зависят
@@ -210,7 +221,7 @@ def cross_validate(F, feats, dataset, S=None, seed=0, train_by_fold=None):
         te = np.flatnonzero(O.fold.values == f)
         T = F[F.fold != f] if train_by_fold is None else train_by_fold[f]
         assert not set(T.group) & set(O.group.values[te]), 'пациент теста в обучении'
-        B = fit_core(T, feats, dataset, seed)
+        B = fit_core(T, feats, dataset, seed, n_ens=n_ens)
         p, lv, hbp, ood = apply_core(B, O[feats].values[te])
         up = np.zeros(len(te), bool)
         lv_p = lv
