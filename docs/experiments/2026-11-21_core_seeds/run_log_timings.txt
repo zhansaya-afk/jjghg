@@ -1,0 +1,31 @@
+# Строки хода запуска из вывода ячейки Colab 2026-11-21 (строки «libpng warning: iCCP: CRC error» опущены — безвредны)
+✅ код 970ef2e + скрипт эксперимента 65d3c33
+Eyes-defy-anemia: целостность проверена, 865 файлов совпали по sha1
+Eyes-defy-anemia: 218 пациентов, с Hb 217, с маской 218; {'Italy': 123, 'India': 95}
+кэш признаков: есть
+$ python scripts/experiment_core_seeds.py --data /content/hv_eval_970ef2e/data
+experiment_core_seeds · commit 970ef2e · → /content/hv_eval_970ef2e/data/results/experiments/core_seeds_20261121_075855
+сегментатор конъюнктивы: + 82 телефонных фото с масками (external/)
+маршрут: n_total 217, eyes_defy 185, eyes_defy_conj 30, отказ · нет тканей 2, IoU века в расчёте (принятые) 0.68, IoU века, отказ = 0 0.674
+[ 2297 с] eyes_defy A0: n 185, AUC 0.865, внутри стран 0.780, FP 25 FN 18, свет 45% (166 с)
+[ 2463 с] eyes_defy A1: n 185, AUC 0.869, внутри стран 0.785, FP 24 FN 16, свет 46% (166 с)
+[ 2626 с] eyes_defy A2: n 185, AUC 0.860, внутри стран 0.773, FP 23 FN 17, свет 46% (163 с)
+[ 2791 с] eyes_defy A3: n 185, AUC 0.868, внутри стран 0.785, FP 23 FN 15, свет 46% (165 с)
+[ 2954 с] eyes_defy A4: n 185, AUC 0.866, внутри стран 0.784, FP 23 FN 18, свет 43% (163 с)
+[ 3554 с] eyes_defy E0: n 185, AUC 0.867, внутри стран 0.783, FP 22 FN 19, свет 44% (600 с)
+[ 4159 с] eyes_defy E1: n 185, AUC 0.865, внутри стран 0.779, FP 21 FN 17, свет 45% (605 с)
+[ 4765 с] eyes_defy E2: n 185, AUC 0.869, внутри стран 0.786, FP 23 FN 18, свет 45% (606 с)
+[ 5369 с] eyes_defy E3: n 185, AUC 0.866, внутри стран 0.780, FP 23 FN 18, свет 42% (603 с)
+[ 5978 с] eyes_defy E4: n 185, AUC 0.868, внутри стран 0.789, FP 23 FN 16, свет 45% (609 с)
+[ 6033 с] eyes_defy_conj A0: n 30, AUC 0.950, внутри стран 0.931, FP 4 FN 0, свет 50% (52 с)
+[ 6085 с] eyes_defy_conj A1: n 30, AUC 0.963, внутри стран 0.948, FP 4 FN 0, свет 57% (52 с)
+[ 6137 с] eyes_defy_conj A2: n 30, AUC 0.969, внутри стран 0.966, FP 4 FN 0, свет 43% (52 с)
+[ 6190 с] eyes_defy_conj A3: n 30, AUC 0.969, внутри стран 0.948, FP 4 FN 0, свет 53% (53 с)
+[ 6241 с] eyes_defy_conj A4: n 30, AUC 0.944, внутри стран 0.931, FP 5 FN 1, свет 53% (51 с)
+[ 6419 с] eyes_defy_conj E0: n 30, AUC 0.957, внутри стран 0.948, FP 4 FN 0, свет 53% (178 с)
+[ 6596 с] eyes_defy_conj E1: n 30, AUC 0.963, внутри стран 0.948, FP 4 FN 0, свет 50% (177 с)
+[ 6773 с] eyes_defy_conj E2: n 30, AUC 0.963, внутри стран 0.948, FP 4 FN 0, свет 53% (177 с)
+[ 6949 с] eyes_defy_conj E3: n 30, AUC 0.963, внутри стран 0.948, FP 4 FN 0, свет 53% (176 с)
+[ 7125 с] eyes_defy_conj E4: n 30, AUC 0.957, внутри стран 0.931, FP 4 FN 0, свет 47% (175 с)
+Готово за 7128 с · ⏱ 119 мин
+Архив: /content/hv_eval_970ef2e/hemavision_core_seeds.zip

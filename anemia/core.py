@@ -84,8 +84,8 @@ def usable(F, key=None):
 # ------------------------------------------------------------------ части модели
 def _fit_cls(T, feats, seed=0, n=None):
     """Ансамбль из n классификаторов v12 (seed ENS_SEED0 + seed·n + k). Один классификатор зависел от случайного
-    повтора редких классов. Ансамбль принят по правилу scripts/experiment_core_seeds.py (заданному до запуска) за
-    меньший разброс между seed, не за точность: цифры — results/experiments.csv, id core_seeds.
+    повтора редких классов. ЭКСПЕРИМЕНТАЛЬНЫЙ КАНДИДАТ (PR #41), в основную модель не принят: улучшение точности
+    не доказано (docs/experiments/2026-11-21_core_seeds/, results/experiments.csv, id core_seeds).
     n = 1 — прежняя модель с seed = seed (для сравнения в эксперименте)."""
     n = N_ENSEMBLE if n is None else n
     X, y = T[feats].values, T.y.values
