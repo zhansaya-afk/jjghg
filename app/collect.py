@@ -102,8 +102,10 @@ def build(root=None, pilot=None):
             h, w = state['rgb'].shape[:2]
             drawn = C.mask_from_layers((editor or {}).get('layers'), (h, w))
             mask, src = C.choose_mask(drawn, state['auto'], MASK.get(mask_choice))
-            save = C.save_pilot_record if no_hb else C.save_record
-            out = save(root, state['rgb'], meta, mask, src, state['blur'])
+            if no_hb:                       # этап 1: в папке учеников Hb нет
+                out = C.save_pilot_record(root, state['rgb'], meta, mask, src, state['blur'])
+            else:
+                out = C.save_record(root, state['rgb'], meta, mask, src, state['blur'])
         except C.CollectError as e:
             return f'❌ {e}', counts()
         return f'✅ Сохранено: `{out["file"]}`' + (' + маска' if out['mask'] else ' (без маски)'), counts()
