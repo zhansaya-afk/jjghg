@@ -7,3 +7,11 @@
 
 Правила: кандидат принимается в `main` только при доказанном улучшении на тех же фолдах по пациенту и после решения
 команды. Агрегаты каждого эксперимента — строка в `results/experiments.csv`; пациентские строки — не в репозиторий.
+
+## Архивы Colab — сохранить вне Colab (в репозиторий не класть: строки по пациентам)
+| Архив | Что внутри | Где сейчас |
+|---|---|---|
+| `hemavision_eval_0d4e2db.zip` | baseline `0d4e2db`: запуски core, country, seg_ext — OOF, run.json, metrics_history, логи | `/content/hv_eval_0d4e2db/` в Colab пользователя |
+| `hemavision_core_seeds.zip` | эксперимент ансамбля: summary.csv, paired.csv, oof_*.csv, decision.md, run.json, лог | `/content/hv_eval_970ef2e/` в Colab пользователя |
+
+`/content` стирается при удалении рантайма — до сохранения архивов рантайм не удалять и не перезапускать.
