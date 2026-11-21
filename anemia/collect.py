@@ -1,9 +1,12 @@
 """Сбор своих фото со смартфона + лабораторный Hb того же дня → data/phone/ (формат anemia.data.load_phone).
 
 Логика без интерфейса (интерфейс — app/collect.py). Правила:
-- id участника только обезличенный: 'P' + 6 hex-символов, генерируется случайно; ФИО, телефон, имя исходного файла
-  нигде не сохраняются; EXIF/GPS/модель телефона отбрасываются (пиксели пересохраняются в PNG без метаданных).
+- id участника — псевдоним 'P' + 6 hex-символов, генерируется случайно (данные псевдонимизированы, а не обезличены:
+  фото глаза — биометрический признак); ФИО, телефон, имя исходного файла нигде не сохраняются; EXIF/GPS/модель
+  телефона отбрасываются (пиксели пересохраняются в PNG без метаданных).
 - Hb — из бланка анализа (labs.hb_to_g_l), хранится в hb.csv; оценка модели по фото здесь не считается и не пишется.
+- Пилот, этап 1 (протокол v1.1): запись без Hb (photo_meta, save_pilot_record → <root>/pilot/photos.csv); Hb из ЛИС
+  клиники сопоставляет по коду только врач-исследователь (merge_lis, scripts/merge_lis.py).
 - Дети младше 5 лет — отказ, как в ядре (predict.child_refused): модели для них нет.
 - Проверка снимка — те же функции, что в ядре: predict.frame_issues (кадр) и regions.quality (резкость, свет,
   размер ткани). Предложение маски конъюнктивы — regions.detect_regions (без обучения), дальше правка кистью.
@@ -56,7 +59,7 @@ class CollectError(ValueError):
 
 
 def new_id(existing=()):
-    """Случайный обезличенный id участника ('P3fa9c1'), не совпадающий с уже существующими."""
+    """Случайный псевдонимный id участника ('P3fa9c1'), не совпадающий с уже существующими."""
     existing = set(existing)
     while True:
         pid = 'P' + secrets.token_hex(3)
@@ -251,6 +254,13 @@ def save_record(root, rgb, meta, mask=None, mask_source='', blur=float('nan')):
     _check_writable(path)          # до записи снимка: без прав на запись ничего не сохраняется
     if os.path.exists(path):
         _upgrade_header(path)      # до записи снимка: при неожиданном заголовке ничего не сохраняется
+    out = _write_record(d, path, HB_COLUMNS_ALL, rgb, meta, mask, mask_source, blur)
+    return {'image': out['image'], 'mask': out['mask'], 'hb_csv': path, 'file': out['file']}
+
+
+def _write_record(d, path, columns, rgb, meta, mask, mask_source, blur):
+    """Снимок + маска в d/images, d/masks; строка (только columns) — в CSV path. Общая часть save_record и
+    save_pilot_record."""
     try:
         img_dir, mask_dir = os.path.join(d, 'images'), os.path.join(d, 'masks')
         os.makedirs(img_dir, exist_ok=True)
@@ -271,14 +281,15 @@ def save_record(root, rgb, meta, mask=None, mask_source='', blur=float('nan')):
                'blur': '' if np.isnan(blur) else round(blur, 2)}
         new = not os.path.exists(path)
         with open(path, 'a', newline='', encoding='utf-8') as f:
-            wr = csv.DictWriter(f, HB_COLUMNS_ALL)
+            wr = csv.DictWriter(f, columns)
             if new:
                 wr.writeheader()
-            wr.writerow({k: row.get(k, '') for k in HB_COLUMNS_ALL})
+            wr.writerow({k: row.get(k, '') for k in columns})
     except OSError as e:          # диск, права, сеть: понятное сообщение для оператора С1
-        raise CollectError(f'запись не удалась ({e.strerror or e}); строки hb.csv, записанные раньше, не изменены') from e
+        name = os.path.basename(path)
+        raise CollectError(f'запись не удалась ({e.strerror or e}); строки {name}, записанные раньше, не изменены') from e
     return {'image': os.path.join(d, img_rel), 'mask': os.path.join(d, mask_rel) if mask_rel else None,
-            'hb_csv': path, 'file': img_rel}
+            'csv': path, 'file': img_rel}
 
 
 def _read_only(p):
@@ -384,12 +395,169 @@ def summary(root):
             'anemic_patients': int(anemic)}
 
 
+# ------------------------------------------------------------------ пилот, этап 1: запись без Hb (протокол v1.1)
+# Ученики вносят снимок и анкету БЕЗ Hb: Hb этапа 1 врач-исследователь выгружает из лабораторной системы клиники
+# (ЛИС) в свою таблицу hb_lis.csv и сам сопоставляет её с фото по коду (merge_lis). В папке учеников Hb нет вообще.
+# Модель, пороги, признаки и метки здесь не участвуют: это только запись данных.
+PILOT_DIR = 'pilot'
+PILOT_CSV = 'photos.csv'
+PILOT_COLUMNS = [c for c in HB_COLUMNS_ALL if c not in ('hb_g_l', 'lab_gap_days')]
+PILOT_MIN_AGE = 18                 # критерий включения протокола (п. 3.1), не медицинский порог
+HB_FIELDS = ('hb', 'hb_g_l', 'lab_gap_days')
+LIS_REQUIRED = ('patient_id', 'hb_g_l', 'lab_gap_days')
+
+PILOT_PROTOCOL = """**Протокол съёмки пилота (v1.1, п. 7)**
+1. Одна модель телефона на весь этап; HDR, «улучшение», фильтры, портрет, зум и **вспышка выключены**.
+2. Свет: одна лампа, нейтральный белый LED 4000–5000 K, шторы закрыты. Тип лампы — в анкету.
+3. Участник смотрит вверх и **сам** чистым пальцем оттягивает нижнее веко; глаза не касаемся.
+4. Телефон в 10–15 см, фокус — тапом по веку, только глаз крупно. Правый глаз (нельзя — левый, отметить).
+5. Снимки 1 и 2 — стандартный свет (между ними веко опустить и оттянуть снова); снимок 3 — свет помещения.
+6. Не больше 3 попыток на снимок; не вышло — это отказ, запишите его в анкету.
+7. Результат программы участнику не показывается и здесь не считается."""
+
+
+def pilot_eligibility(age, pregnant):
+    """Критерии протокола пилота: только взрослые 18+, беременные не включаются. → возраст (float)."""
+    a = parse_age(age)
+    if a < PILOT_MIN_AGE:
+        raise CollectError(f'в пилот включаются только взрослые {PILOT_MIN_AGE}+ (протокол v1.1, п. 3.1)')
+    if norm_pregnant(pregnant):
+        raise CollectError('беременные в пилот не включаются (протокол v1.1, п. 3.2)')
+    return a
+
+
+def photo_meta(pid, sex, age, pregnant, eye, consent, optional=None):
+    """Анкета пилота (этап 1) без Hb → dict для photos.csv. Hb сюда не передаётся вовсе."""
+    if consent is not True:
+        raise CollectError('нет отметки о письменном согласии участника — без него фото не сохраняется')
+    pid = check_id(pid)
+    s = {'M': 'M', 'М': 'M', 'F': 'F', 'Ж': 'F'}.get(str(sex or '').strip().upper()[:1])
+    if s is None:
+        raise CollectError('укажите пол (М / Ж): от него зависит норма ВОЗ')
+    a = pilot_eligibility(age, pregnant)
+    if eye not in EYES:
+        raise CollectError('укажите глаз: L (левый) или R (правый)')
+    extra = optional_meta(False, **(optional or {}))
+    meta = {'patient_id': pid, 'sex': s, 'age': a, 'pregnant': False, 'eye': eye}
+    return {**meta, **{k: v for k, v in extra.items() if v != ''}}
+
+
+def pilot_paths(root):
+    d = os.path.join(root, PILOT_DIR)
+    return d, os.path.join(d, PILOT_CSV)
+
+
+def save_pilot_record(root, rgb, meta, mask=None, mask_source='', blur=float('nan')):
+    """Снимок + анкета без Hb → <root>/pilot/images, masks, photos.csv. Hb в meta → CollectError (ничего не пишется)."""
+    leaked = [k for k in HB_FIELDS if k in meta]
+    if leaked:
+        raise CollectError(f'в записи пилота не должно быть Hb ({", ".join(leaked)}): его вносит врач-исследователь '
+                           'из ЛИС отдельно; ничего не сохранено')
+    d, path = pilot_paths(root)
+    _check_writable(path)
+    if os.path.exists(path):
+        head, _ = _read_hb_csv(path)
+        if head != PILOT_COLUMNS:
+            raise CollectError(f'{PILOT_CSV}: неожиданные колонки {head}; ничего не сохранено')
+    return _write_record(d, path, PILOT_COLUMNS, rgb, meta, mask, mask_source, blur)
+
+
+def _pilot_rows(root):
+    _, path = pilot_paths(root)
+    if not os.path.exists(path):
+        return []
+    return _read_hb_csv(path)[1]
+
+
+def pilot_known_ids(root):
+    return {r['patient_id'] for r in _pilot_rows(root)}
+
+
+def pilot_summary(root):
+    """Сколько собрано на этапе 1: снимков, участников, с маской. Ни Hb, ни доли анемии здесь нет."""
+    rows = _pilot_rows(root)
+    return {'photos': len(rows), 'patients': len({r['patient_id'] for r in rows}),
+            'with_mask': sum(bool(r['mask_conj']) for r in rows)}
+
+
+def merge_lis(photos_csv, lis_csv, out_csv):
+    """Для врача-исследователя: photos.csv (без Hb) + hb_lis.csv из ЛИС → hb.csv в формате load_phone.
+
+    hb_lis.csv: patient_id, hb_g_l, lab_gap_days (+ необязательно unit, blood_time, analyzer — не копируются).
+    Пути к снимкам пишутся относительно папки out_csv. out_csv не перезаписывается и не может лежать в папке
+    учеников (рядом с photos.csv). Участники без Hb или с анализом не в тот же день (> MAX_LAB_GAP_DAYS) в hb.csv
+    не попадают, но возвращаются списками: их нужно отчитать (STARD), а не потерять молча.
+    Чтобы load_phone прочитал результат, out_csv должен называться <папка врача>/phone/hb.csv.
+    → {'merged': снимков, 'patients': участников, 'no_hb': [...], 'lab_gap_too_large': [...], 'lis_without_photo': [...]}"""
+    photos_dir = os.path.dirname(os.path.abspath(photos_csv))
+    out_dir = os.path.dirname(os.path.abspath(out_csv))
+    students_root = os.path.realpath(os.path.dirname(photos_dir))     # <data> учеников: pilot/ лежит внутри
+    real_out = os.path.realpath(out_dir)
+    if os.path.commonpath([real_out, students_root]) == students_root:
+        raise CollectError('hb.csv с Hb нельзя класть в папку данных учеников (ни в pilot/, ни рядом): '
+                           'укажите папку врача')
+    if os.path.exists(out_csv):
+        raise CollectError(f'{out_csv} уже есть — не перезаписываю; укажите новый файл')
+    head, photos = _read_hb_csv(photos_csv)
+    if head != PILOT_COLUMNS:
+        raise CollectError(f'{PILOT_CSV}: неожиданные колонки {head}')
+    lis_head, lis_rows = _read_hb_csv(lis_csv)
+    missing = [c for c in LIS_REQUIRED if c not in lis_head]
+    if missing:
+        raise CollectError(f'hb_lis.csv: нет колонок {missing}')
+    lis, seen = {}, set()
+    for i, r in enumerate(lis_rows, start=2):
+        pid = check_id(r['patient_id'])
+        if pid in seen:
+            raise CollectError(f'hb_lis.csv, строка {i}: код {pid} повторяется — оставьте одно значение')
+        seen.add(pid)
+        if _blank(r['hb_g_l']):
+            continue              # нет Hb: участник попадёт в no_hb (если есть снимок)
+        try:
+            hb = hb_to_g_l(r['hb_g_l'], (r.get('unit') or '').strip() or 'г/л')
+        except ValueError as e:
+            raise CollectError(f'hb_lis.csv, строка {i}: Hb: {e}') from None
+        try:
+            gap = int(r['lab_gap_days'])
+        except (TypeError, ValueError):
+            raise CollectError(f'hb_lis.csv, строка {i}: lab_gap_days — целое число дней') from None
+        lis[pid] = (round(hb, 1), gap)
+    try:
+        rel = os.path.relpath(photos_dir, out_dir)
+    except ValueError:            # Windows: другой диск — относительного пути нет, пишем абсолютный
+        rel = photos_dir
+    out_rows, no_hb, far = [], set(), set()
+    for r in photos:
+        pid = r['patient_id']
+        if pid not in lis:
+            no_hb.add(pid)
+            continue
+        hb, gap = lis[pid]
+        if not 0 <= gap <= MAX_LAB_GAP_DAYS:
+            far.add(pid)
+            continue
+        row = {**r, 'hb_g_l': hb, 'lab_gap_days': gap,
+               'file': os.path.join(rel, r['file']).replace(os.sep, '/'),
+               'mask_conj': os.path.join(rel, r['mask_conj']).replace(os.sep, '/') if r['mask_conj'] else ''}
+        out_rows.append(row)
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_csv, 'x', newline='', encoding='utf-8') as f:       # 'x': никогда не перезаписывает
+        wr = csv.DictWriter(f, HB_COLUMNS_ALL)
+        wr.writeheader()
+        for row in out_rows:
+            wr.writerow({k: row.get(k, '') for k in HB_COLUMNS_ALL})
+    photo_ids = {r['patient_id'] for r in photos}
+    return {'merged': len(out_rows), 'patients': len({r['patient_id'] for r in out_rows}), 'no_hb': sorted(no_hb), 'lab_gap_too_large': sorted(far),
+            'lis_without_photo': sorted(seen - photo_ids)}
+
+
 def load_for_collect(src):
     """Файл/массив → RGB float [0, 1] с поворотом по EXIF; оригинал (и его EXIF) дальше не используется."""
     return load_photo(src)
 
 
 __all__ = [
+    'PILOT_PROTOCOL',
     'PROTOCOL',
     'CollectError',
     'check_id',
@@ -397,10 +565,16 @@ __all__ = [
     'known_ids',
     'load_for_collect',
     'mask_from_layers',
+    'merge_lis',
+    'photo_meta',
+    'pilot_eligibility',
+    'pilot_known_ids',
+    'pilot_summary',
     'choose_mask',
     'outline',
     'new_id',
     'optional_meta',
+    'save_pilot_record',
     'save_record',
     'subject_meta',
     'summary',
