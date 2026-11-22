@@ -70,7 +70,7 @@ def analyze_series(photos, sex=None, age=None, pregnant=None, bundle=None, landm
     stage 'series' — принятых фото меньше min_ok (по умолчанию ни одного). analyze — подмена analyze_photo (тесты)."""
     analyze = analyze or PR.analyze_photo
     photos = list(photos)
-    out = {'status': 'retake', 'stage': 'series', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
+    out = {'status': 'retake', 'stage': 'series', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_estimate': None, 'hb_note': None,
            'model': None, 'tissues': [], 'reasons': [], 'issues': [], 'notes': [], 'disclaimer': PR.DISCLAIMER,
            'n_photos': len(photos), 'n_used': 0, 'used': [], 'p_each': [], 'level_each': [], 'per_photo': [],
            'results': [], 'method': method or 'auto', 'series': True}
@@ -160,6 +160,7 @@ def analyze_series(photos, sex=None, age=None, pregnant=None, bundle=None, landm
     if B['hb_ok']:
         lo, hi = CORE.hb_interval(hb_med, B['hb_halfwidth'])
         out['hb_range'] = (float(lo), float(hi))
+        out['hb_estimate'] = float(hb_med)
         out['hb_note'] = ('экспериментально: медиана прогнозов Hb по фото серии; ширина диапазона — как для одного '
                           f'фото (±{B["hb_halfwidth"]:.0f} г/л), сужение от серии не доказано')
         if lv > lv_p:
@@ -186,7 +187,8 @@ def format_series(s):
     if s['status'] == 'ok':
         lines.append(f"РИСК АНЕМИИ: {s['risk'].upper()} — {PR.RISK_TEXT[s['risk']]}")
         if s['hb_range']:
-            lines.append(f"Ориентировочный Hb: {s['hb_range'][0]:.0f}–{s['hb_range'][1]:.0f} г/л ({s['hb_note']})")
+            lines.append(f"Hb по фото: {PR.hb_text(s)} ({s['hb_note']})")
+            lines.append(f'Hb по фото — внимание: {PR.HB_DOCTOR_CAVEAT}')
         else:
             lines.append(f"Hb: {s['hb_note']}")
         lines += [f'Почему: {x}' for x in s['reasons']]

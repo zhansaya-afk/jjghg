@@ -948,6 +948,30 @@ def print_core_table(rows):
         print('| ' + ' | '.join(str(c) for c in cells) + ' |')
 
 
+def auc_by_country(df, O, key):
+    """AUC OOF ядра (принятые снимки) отдельно для Индии и Италии, общий и «внутри стран» (только пары одной
+    страны: сдвиг риска между странами на него не влияет) + размеры подвыборок. Ничего не обучает."""
+    per_group = pd.Series(country_of(df).values, index=df.group.values).groupby(level=0).agg(set)
+    mixed = set(per_group.index[per_group.map(len) > 1])     # копия снимка в обеих странах — страна неизвестна
+    if mixed:
+        print(f'   ⚠️ AUC по странам: группы в обеих странах исключены ({len(mixed)}): {sorted(mixed)}')
+    O = O[~O.group.isin(mixed)]
+    country = per_group.map(lambda c: next(iter(c)))
+    rows = M.auc_by_stratum(O.p.values, O.anemic.values, O.group.map(country).values, O.group.values)
+    return [{'модель': key, **r} for r in rows]
+
+
+def print_auc_by_country(rows):
+    print('\nAUC по странам (OOF, принятые снимки, ДИ — бутстрэп по пациентам). «Внутри стран» — только пары '
+          '«больной — здоровый» одной страны: честная оценка без смешения стран (Индия ~71% анемии, Италия ~19%).')
+    head = ['Модель', 'Подвыборка', 'Снимков', 'Пациентов', 'Анемия', 'Норма', 'AUC [95% ДИ]']
+    print('| ' + ' | '.join(head) + ' |')
+    print('|' + '---|' * len(head))
+    for r in rows:
+        cells = [r['модель'], r['подвыборка'], r['n'], r['n_patients'], r['n_anemic'], r['n_healthy'], fmt(r, 'auc', 3)]
+        print('| ' + ' | '.join(str(c) for c in cells) + ' |')
+
+
 # ------------------------------------------------------------------ вывод
 def fmt(r, k, nd=1, pct=False):
     v = r.get(k)
@@ -1126,7 +1150,7 @@ def main():
     print(f'Запуск {run_id} → {run_dir} · кэш признаков: {cache_mode} ({cache.root})')
     models = ['hgb', 'ridge'] if a.model == 'both' else [a.model]
     os.makedirs(res_dir, exist_ok=True)
-    rows = []
+    rows, auc_country_rows = [], []
     # метрики масок по снимкам (seg_ext, core) → seg_per_image.csv; seg_error = (статус, причина): после первой
     # ошибки второй проход в следующих наборах не запускается, и файлов нет во всём запуске
     seg_records, seg_error = [], None
@@ -1200,6 +1224,10 @@ def main():
                              'hb_pred', 'hb_hw', 'who_normal', 'ood', 'thr_sens', 'accepted'],
                          f'oof_{a.tag}_{key}_core.csv', run_dir, res_dir, backup_dir)
                 acc = O.accepted.values
+                if (df.dataset == 'eyes_defy').all():   # AUC по странам: смешение стран завышает общий AUC
+                    C = auc_by_country(df, O[acc], key)
+                    auc_country_rows += C
+                    pd.DataFrame(C).to_csv(os.path.join(run_dir, f'auc_by_country_{key}.csv'), index=False)
                 pd.concat([CORE.reliability(O[c].values[acc], O.anemic.values[acc]).assign(p=c)
                            for c in ('p_raw', 'p')]).to_csv(os.path.join(run_dir, f'reliability_{key}.csv'), index=False)
             RUNS.write_json(os.path.join(run_dir, f'routes_{ds}.json'), rc)
@@ -1246,6 +1274,8 @@ def main():
     seg_meta = write_seg_metrics(run_dir, seg_records, err_why, err_status)
     if any(r['task'] == 'core' for r in rows):
         print_core_table([r for r in rows if r['task'] == 'core'])
+    if auc_country_rows:
+        print_auc_by_country(auc_country_rows)
     if any(r['task'] == 'country' and 'share_low' in r for r in rows):
         print_core_table([r for r in rows if r['task'] == 'country' and 'share_low' in r])
     if any('tp' in r for r in rows):

@@ -259,11 +259,9 @@ def hb_html(r):
     модели Hb — в разделе для врача (doctor_html). Без оценки — пустая строка."""
     if r.get('status') != 'ok':
         return ''
-    if r.get('hb_range'):
-        lo, hi = r['hb_range']
-        return (f'<div class="hv-card"><h3>{icon("drop")} Ориентировочный гемоглобин по фото <span class="hv-tag">'
-                f'экспериментально</span></h3><p class="hv-hb">{lo:.0f}–{hi:.0f} <small>г/л</small></p><p class="hv-small">Это грубый '
-                f'ориентир по цвету на фото, а не результат анализа. {BLOOD_TEST}</p></div>')
+    if r.get('hb_range'):     # число Hb по фото пользователю не показывается (только врачу — в отчёте)
+        return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин по фото</h3><p>{_e(PR.HB_USER)}</p>'
+                f'<p class="hv-small">{BLOOD_TEST}</p></div>')
     return (f'<div class="hv-card"><h3>{icon("drop")} Гемоглобин</h3><p class="hv-small">По этому фото цифра гемоглобина '
             f'не показывается: модель Hb пока недостаточно точна. {BLOOD_TEST}</p></div>')
 
@@ -283,19 +281,43 @@ def lab_html(lab, error=None):
             '</p></div>')
 
 
-def quality_html(res):
+def quality_items(res, r=None):
+    """Качество снимка → [(показатель, 'ok' | 'bad' | 'na', текст)] для экрана и PDF. r — dict analyze_photo: при
+    оценке (status 'ok') резкость и свет — по тканям, по которым оценено; найденная, но непригодная ткань — «найдена,
+    не использована (…)». Раньше при годной конъюнктиве и размытой склере стояло «Резкость: размыто» рядом с готовым
+    результатом. api.Result.quality не меняется (весь снимок)."""
     q = res.quality
     vis = q.get('tissue_visible') or {}
+    ts = (r or {}).get('tissue_status') or {}
+    ok = r is not None and r.get('status') == 'ok'
+    used = tuple((r or {}).get('tissues') or ())
+    if ok:
+        q = {**q, **API._quality({**r, 'issues': [], 'tissue_status': {t: v for t, v in ts.items() if t in used}})}
 
-    def tv(v):
-        return ('na', 'не проверялось') if v is None else ('ok', 'найдена') if v else ('bad', 'не найдена')
+    def tv(v, t):
+        if v is None:
+            return 'na', 'не проверялось'
+        if not v:
+            return 'bad', 'не найдена'
+        st = ts.get(t)
+        if ok and t not in used and st and st != 'пригодна':
+            blur = API._quality({**r, 'issues': [], 'tissue_status': {t: st}})['sharpness'] == 'размыто'
+            return 'na', f'найдена, не использована ({"размыто" if blur else "непригодна"})'
+        return 'ok', 'найдена'
 
     def qv(v):
-        return ('na' if v is None else 'ok' if v == 'ok' else 'bad', Q_TEXT.get(v, v))
-    rows = [('Резкость', qv(q.get('sharpness'))), ('Свет', qv(q.get('light'))),
-            ('Слизистая века (конъюнктива)', tv(vis.get('conjunctiva'))), ('Белок глаза (склера)', tv(vis.get('sclera')))]
+        return ('na' if v is None else 'ok' if v == 'ok' else 'bad'), Q_TEXT.get(v, v)
+    rows = [('Резкость', *qv(q.get('sharpness'))), ('Свет', *qv(q.get('light'))),
+            ('Слизистая века (конъюнктива)', *tv(vis.get('conjunctiva'), 'conj')),
+            ('Белок глаза (склера)', *tv(vis.get('sclera'), 'sclera'))]
     if res.tissue:
-        rows.append(('Оценено по', ('ok', res.tissue)))
+        rows.append(('Оценено по', 'ok', res.tissue))
+    return rows
+
+
+def quality_html(res, r=None):
+    """Карточка «Качество снимка» (quality_items)."""
+    rows = [(a, (k, b)) for a, k, b in quality_items(res, r)]
     ic = {'ok': 'check', 'bad': 'x', 'na': 'minus'}
     li = ''.join(f'<li><span>{_e(a)}</span><span class="v {k}">{icon(ic[k])}{_e(b)}</span></li>' for a, (k, b) in rows)
     return f'<div class="hv-card"><h3>Качество снимка</h3><ul class="hv-qlist">{li}</ul></div>'
@@ -320,7 +342,7 @@ def doctor_html(r, version=''):
     if r.get('method'):
         items.append(f'Выбор ткани: {_e(PR.METHOD_RU.get(r["method"], "Авто"))}')
     items += [_e(x) for x in (r.get('reasons') if ok else r.get('issues')) or []]
-    if ok and r.get('hb_note'):
+    if ok and r.get('hb_note') and not r.get('hb_range'):   # цифры Hb по фото — только в отчёте для врача
         items.append('Hb: ' + _e(r['hb_note']))
     items += ['Примечание: ' + _e(x) for x in r.get('notes') or []]
     diag = ''.join(f'<li>{_e(x)}</li>' for x in r.get('diag') or [])

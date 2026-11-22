@@ -209,7 +209,7 @@ def test_ya6_cell_checks_the_knowledge_base(capsys):
 
 
 def test_ya5_cell_uses_neural_net_from_cell_n(monkeypatch, capsys):
-    answers = iter(["Со временем станет только хуже?", ""])
+    answers = iter(["Если запустить, что будет?", ""])
     monkeypatch.setattr(builtins, "input", lambda prompt="": next(answers, ""))
     src = (
         _ya5_source()
@@ -224,7 +224,7 @@ def test_ya5_cell_uses_neural_net_from_cell_n(monkeypatch, capsys):
     ns = {"r": PHOTO, "профиль_Я2": ("Женский", 32, "Нет")}
     exec(compile(src, "Я5", "exec"), dict(ns))  # noqa: S102 — без ячейки Н
     assert "запустите ячейку Н" in capsys.readouterr().out
-    answers = iter(["Со временем станет только хуже?", ""])
+    answers = iter(["Если запустить, что будет?", ""])
     ns["LLM"] = lambda messages, **kw: "can_worsen"
     exec(compile(src, "Я5", "exec"), ns)  # noqa: S102 — код ячейки блокнота
     out = capsys.readouterr().out

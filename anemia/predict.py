@@ -12,6 +12,7 @@
 Лабораторный Hb сюда не передаётся и с фото не смешивается: для него anemia.labs.lab_hb_report.
 """
 import io
+import math
 import os
 
 import cv2
@@ -21,6 +22,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from . import anatomy as AN
 from . import core as CORE
 from . import crop_quality as CQ
+from . import retake as RT
 from . import eyes as EYES
 from . import regions as R
 from . import segment_baseline as SB
@@ -41,6 +43,37 @@ RISK_TEXT = {'высокий': 'признаки бледности выраже
              'средний': 'по фото уверенно сказать нельзя — сдайте общий анализ крови (Hb)',
              'низкий': 'признаков анемии по фото нет; это не исключает анемию, при симптомах сдайте анализ крови'}
 DISCLAIMER = 'Скрининг риска по фото, не диагноз. Решение принимает врач по анализу крови.'
+HB_NOT_LAB = 'это НЕ анализ крови'
+# Показ, не расчёт (решение команды 2026-11-19): пользователю (экран, Personalizer) число Hb по фото не показывается
+# никогда — только уровень риска; врачу (Я2, отчёт .txt, PDF) — всегда, с оговоркой HB_DOCTOR_CAVEAT. Причина: модель
+# сжимает прогноз к середине и завышает низкий Hb, а порог по самой оценке таких людей не находит.
+HB_USER = ('Число гемоглобина по фото не показываем: по фото оно ненадёжно, особенно при низком гемоглобине '
+           '(обычно завышается). Сдайте общий анализ крови.')
+HB_DOCTOR_CAVEAT = ('точность оценки Hb по фото (Eyes-defy, OOF, предварительно): MAE ≈ 12 г/л, диапазон накрывает '
+                    'реальный Hb примерно у 80% пациентов; при реальном Hb < 100 г/л прогноз завышен в среднем на '
+                    '~18 г/л и диапазон накрывает реальный Hb лишь примерно у 60%; тяжёлую анемию оценка по фото не '
+                    'показывает; пациенту число не показывается')
+
+
+def hb_estimate_shown(r):
+    """Показываемая оценка Hb по фото, г/л: прогноз модели, округлённый до 5 (точнее модель не различает).
+    Нет поля hb_estimate (старый dict) → середина диапазона. Нет диапазона → None. Расчёт не меняет."""
+    if not r.get('hb_range'):
+        return None
+    lo, hi = r['hb_range']
+    est = r.get('hb_estimate')
+    est = (lo + hi) / 2 if est is None else est
+    return float(min(max(5 * math.floor(est / 5 + 0.5), lo), hi))
+
+
+def hb_text(r):
+    """Одна строка Hb по фото: «оценка ~105 г/л (точно не определить: 90–120), это НЕ анализ крови».
+    Без диапазона → ''."""
+    est = hb_estimate_shown(r)
+    if est is None:
+        return ''
+    lo, hi = r['hb_range']
+    return f'оценка ~{est:.0f} г/л (точно не определить: {lo:.0f}–{hi:.0f}), {HB_NOT_LAB}'
 
 
 class PhotoError(ValueError):
@@ -214,6 +247,7 @@ def pick_model(bundle, age):
 FACE_MODEL_FILE = 'face_landmarker.task'
 FACE_MODEL_URL = ('https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/'
                   'face_landmarker.task')
+FACE_MODEL_SHA256 = '64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff'   # float16/1, 3 758 596 байт
 IRIS_MIN_R = 0.012       # самая мелкая радужка, которую ищем (доля короткой стороны кадра 1024 px → ≥ 6 px)
 IRIS_SCLERA_L = 0.6      # мелкая радужка: L* внутри ≤ 0,6 L* склеры (у глаза на фото проверки 0,37–0,40; без размеченных данных)
 SCLERA_LID_MARGIN = 1.0  # склера не дальше 1 r в сторону за край вывернутого века (конъюнктивы)
@@ -237,10 +271,20 @@ IRIS_CONTRAST = 20       # мелкую радужку принимаем, то�
 _FACE = {}
 
 
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def face_landmarker(path=None, download=True):
     """MediaPipe FaceLandmarker (как в ноутбуке v12) → (детектор или None, пояснение). Модель лица (3,7 МБ)
     скачивается один раз рядом с моделью риска ($ANEMIA_MODELS). Без mediapipe или без сети — None: тогда
     глаз ищется по всему кадру и по радужке."""
+    own = path is None                     # путь по умолчанию: битый файл можно удалить и скачать заново
     path = path or os.path.join(os.path.dirname(default_model_path()), FACE_MODEL_FILE)
     if path in _FACE:
         return _FACE[path]
@@ -250,6 +294,10 @@ def face_landmarker(path=None, download=True):
         _FACE[path] = (None, f'MediaPipe не установлен ({type(e).__name__}): лицо целиком не разобрать')
         return _FACE[path]
     try:
+        if os.path.exists(path) and _sha256(path) != FACE_MODEL_SHA256:
+            if not download or not own:     # чужой файл (путь передан явно) не удаляем
+                raise ValueError(f'sha256 не совпал: {os.path.basename(path)} повреждён или другой версии')
+            os.remove(path)                 # битая модель лица по пути по умолчанию: скачиваем заново
         if not os.path.exists(path):
             if not download:
                 raise FileNotFoundError(path)
@@ -257,6 +305,9 @@ def face_landmarker(path=None, download=True):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with urllib.request.urlopen(FACE_MODEL_URL, timeout=30) as resp, open(path + '.part', 'wb') as out:
                 out.write(resp.read())
+            if _sha256(path + '.part') != FACE_MODEL_SHA256:
+                os.remove(path + '.part')
+                raise ValueError('sha256 скачанной модели лица не совпал (обрыв загрузки или другая версия)')
             os.replace(path + '.part', path)
         opt = vision.FaceLandmarkerOptions(base_options=BaseOptions(model_asset_path=path), num_faces=1,
                                            min_face_detection_confidence=0.3, min_face_presence_confidence=0.3)
@@ -969,7 +1020,8 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
                    этого набора тканей нет обученной модели), 'mismatch' (вырез вместо снимка глаза), 'age' (младше 5 лет), 'ood', 'ok';
         eye      — как найден глаз; tissue_status — {'conj': …, 'sclera': …}; tissues — какие ткани использованы;
         risk     — 'низкий' / 'средний' / 'высокий' или None; p_anemia — P(анемия) модели или None;
-        hb_range — (от, до) г/л, экспериментально, или None; hb_note — почему цифры Hb нет / что она значит;
+        hb_range — (от, до) г/л, экспериментально, или None; hb_estimate — сам прогноз Hb (г/л, без округления) или None,
+        показывать через hb_text; hb_note — почему цифры Hb нет / что она значит;
         model, kind — чем и по какому снимку оценено; reasons — почему такой ответ; issues — проблемы снимка;
         crop, conj, sclera — вырезка и маски (для показа, anemia.predict.overlay).
     Модель взрослых выбирается по пригодным тканям (обе / только конъюнктива / только склера): каждая обучена
@@ -981,6 +1033,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
     method = check_method(method)
     sex = _sex(sex)
     r = {'status': 'retake', 'stage': 'frame', 'risk': None, 'p_anemia': None, 'hb_range': None, 'hb_note': None,
+         'hb_estimate': None,
          'model': None, 'features': None, 'eye': None, 'tissue_status': {},
          'tissues': [], 'kind': None, 'reasons': [], 'issues': [], 'notes': [], 'crop': None, 'conj': None,
          'sclera': None, 'disclaimer': DISCLAIMER, 'diag': [], 'eyes': [], 'eye_box': None, 'photo_preview': None,
@@ -1125,6 +1178,7 @@ def analyze_photo(photo, sex=None, age=None, pregnant=None, bundle=None, landmar
         hw = B['hb_halfwidth']
         lo, hi = CORE.hb_interval(hb, hw)
         r['hb_range'] = (float(lo), float(hi))
+        r['hb_estimate'] = float(hb)          # сам прогноз; для показа — hb_text (округление до 5)
         if lv > lv_p:
             r['risk'] = CORE.RISK_LEVELS[lv]
             r['reasons'].append(f'по P уровень «{CORE.RISK_LEVELS[lv_p]}», но весь диапазон Hb {lo:.0f}–{hi:.0f} г/л ниже '
@@ -1156,11 +1210,15 @@ def format_result(r):
     if r['status'] == 'ok':
         lines.append(f"РИСК АНЕМИИ: {r['risk'].upper()} — {RISK_TEXT[r['risk']]}")
         if r['hb_range']:
-            lines.append(f"Ориентировочный Hb: {r['hb_range'][0]:.0f}–{r['hb_range'][1]:.0f} г/л ({r['hb_note']})")
+            lines.append(f"Hb по фото: {hb_text(r)} ({r['hb_note']})")
+            lines.append(f'Hb по фото — внимание: {HB_DOCTOR_CAVEAT}')
         else:
             lines.append(f"Hb: {r['hb_note']}")
         lines += [f'Почему: {x}' for x in r['reasons']]
     else:
+        hint = RT.retake_text(r)
+        if hint:
+            lines.append(hint)
         lines += [f'Проблема: {x}' for x in r['issues']]
     lines += [f'Примечание: {x}' for x in r['notes']]
     if r.get('diag'):

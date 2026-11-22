@@ -34,9 +34,9 @@ def norm_pregnant(v):
     if isinstance(v, float) and v != v:
         return None
     s = str(v).strip().lower()
-    if s in ('1', '1.0', 'true', 'yes', 'y', 'да'):
+    if s in ('1', '1.0', 'true', 'yes', 'y', 'да', 'иә'):
         return True
-    if s in ('0', '0.0', 'false', 'no', 'n', 'нет'):
+    if s in ('0', '0.0', 'false', 'no', 'n', 'нет', 'жоқ'):
         return False
     return None
 
@@ -81,6 +81,10 @@ HB_UNITS = {'g/l': 1.0, 'г/л': 1.0, 'g/dl': 10.0, 'г/дл': 10.0, 'g%': 10.0,
 HB_PLAUSIBLE = (30.0, 250.0)                         # г/л: вне диапазона — почти наверняка не та единица
 
 
+def _unit_key(unit):
+    return str(unit).strip().lower().replace(' ', '')
+
+
 def hb_to_g_l(value, unit=None):
     """Hb из бланка анализа → г/л. value — число или строка («12,5 г/дл», «125»), unit — 'г/л', 'g/dL', 'ммоль/л'.
     Без единицы: число ≥ 30 считается г/л; меньшее неоднозначно (г/дл и ммоль/л пересекаются) → ошибка."""
@@ -88,14 +92,23 @@ def hb_to_g_l(value, unit=None):
         m = re.match(r'\s*([0-9]+(?:[.,][0-9]+)?)\s*(.*)$', value)
         if not m:
             raise ValueError(f'не понял значение Hb: {value!r}')
-        value, unit = float(m.group(1).replace(',', '.')), unit or (m.group(2).strip() or None)
+        text_unit = m.group(2).strip() or None
+        if text_unit is not None:           # единица в самой строке: должна быть известной и не спорить с полем
+            tu = _unit_key(text_unit)
+            if tu not in HB_UNITS:
+                raise ValueError(f'не понял значение Hb: {value!r} (после числа «{text_unit}» — не единица; '
+                                 'число пишите без пробелов внутри, единицу — г/л, г/дл или ммоль/л)')
+            if unit is not None and HB_UNITS.get(_unit_key(unit)) != HB_UNITS[tu]:
+                raise ValueError(f'в строке единица «{text_unit}», а выбрана «{unit}» — уберите единицу из числа '
+                                 'или выберите ту же')
+        value, unit = float(m.group(1).replace(',', '.')), unit or text_unit
     value = float(value)
     if unit is None:
         if value < HB_PLAUSIBLE[0]:
             raise ValueError(f'Hb = {value}: укажите единицу (г/л, г/дл или ммоль/л)')
         k = 1.0
     else:
-        u = unit.strip().lower().replace(' ', '')
+        u = _unit_key(unit)
         if u not in HB_UNITS:
             raise ValueError(f'неизвестная единица Hb: {unit!r}; допустимо: {", ".join(sorted(set(HB_UNITS)))}')
         k = HB_UNITS[u]
@@ -307,6 +320,19 @@ def classify_who2024(hb_g_l, sex=None, age=None, pregnant=None, trimester=None):
             'normal_from_g_l': float(max(WHO2024_GROUPS[g][1] for g in groups)), 'group': label, 'notes': notes}
 
 
+def who2024_normal(sex=None, age=None, pregnant=None, trimester=None):
+    """Порог нормы ВОЗ 2024 для профиля, г/л (без поправок на высоту и курение). Неизвестный пол /
+    беременность / триместр → наибольший из возможных порогов (как normal_from_g_l в classify_who2024).
+    Неизвестный или < 6 мес возраст, противоречие → None."""
+    try:
+        s, a, p, t = _inputs(sex, age, pregnant, trimester)
+    except (_Invalid, ValueError):
+        return None
+    if a is None or a < WHO2024_MIN_AGE:
+        return None
+    return float(max(WHO2024_GROUPS[g][1] for g in _who_candidates(s, a, p, t)))
+
+
 def classify_kz2017(hb_g_l, sex=None, age=None, pregnant=None):
     """Степень АНЕМИИ по шкале протокола МЗ РК «ЖДА» 2017 (взрослые): анемия — Hb < 130 г/л у мужчин и < 120 г/л
     у женщин; лёгкая 90–120, средняя 70–89, тяжёлая < 70 г/л. Только по Hb: это не диагноз ЖДА (статус
@@ -364,8 +390,8 @@ def lab_report(value, unit=None, sex=None, age=None, pregnant=None, trimester=No
     """Интерпретация готового лабораторного Hb (ячейка Я3): ВОЗ 2024 и протокол МЗ РК 2017 — двумя отдельными
     системами. С оценкой по фото не связана: цифры фото-модели здесь не используются.
     → dict: прежние ключи (grade, grade_ru, anemic, normal_from_g_l, group — по ВОЗ 2024), who2024, kz2017,
-    iron_deficiency (отдельный статус железодефицита), text. В персонализатор (Я5) этот отчёт не передаётся:
-    Я5 получает прежний lab_hb_report (ВОЗ 2011).
+    iron_deficiency (отдельный статус железодефицита), text. Этот же отчёт получает персонализатор (Я5),
+    чтобы нормы в Я3 и Я5 совпадали.
     Ошибка числа или единицы → ValueError. Если по ВОЗ 2024 классифицировать нельзя (данных недостаточно или
     противоречие) → LabDataError (подкласс ValueError) с понятным сообщением и полным отчётом в .report."""
     hb = hb_to_g_l(value, unit)

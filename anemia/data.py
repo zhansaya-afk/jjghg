@@ -60,9 +60,13 @@ def norm_sex(v):
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
     s = str(v).strip().upper()
-    if s[:1] in ('M', 'U'):          # M, Male, Uomo
+    if s[:1] in ('M', 'U', 'М'):     # M, Male, Uomo; кириллица М, Мужской (М/Ж — как predict._sex и collect)
         return 'M'
-    if s[:1] in ('F', 'W', 'D'):     # F, Female, Woman, Donna
+    if s[:1] in ('F', 'W', 'D', 'Ж'):   # F, Female, Woman, Donna; Ж, Женский
+        return 'F'
+    if s.startswith('ЕР'):           # каз. ер, еркек — только для таблиц данных (UI и API принимают M/F, М/Ж)
+        return 'M'
+    if s.startswith('ӘЙЕЛ'):         # каз. әйел
         return 'F'
     return None
 

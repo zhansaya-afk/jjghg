@@ -54,6 +54,10 @@ def test_pregnancy_only_yes_no_and_only_for_women():
 
 
 # ------------------------------------------------------------------ нормальное фото
+def rep_doc(r, backend):
+    return V.report_text(r, V.Survey(), backend.version)
+
+
 def test_ok_result_shows_level_in_words_and_scale(backend, monkeypatch):
     _route(monkeypatch, {'conj', 'sclera'})
     r, res = V.run_analysis(_jpeg(synthetic_eye()[0]), V.parse_survey('Женский', 30, 'Нет', 'Авто'), backend)
@@ -64,8 +68,9 @@ def test_ok_result_shows_level_in_words_and_scale(backend, monkeypatch):
     assert card.count('ваш результат') == 1
     assert all(st == 'done' for _, st in V.step_states(r))
     hb = V.hb_html(r)
-    if r['hb_range']:
-        assert 'экспериментально' in hb and 'г/л' in hb and 'анализ крови' in hb
+    if r['hb_range']:     # число Hb по фото пользователю не показывается (только врачу — в отчёте)
+        assert 'не показываем' in hb and 'г/л' not in hb and 'анализ крови' in hb
+        assert 'Hb по фото: оценка ~' in rep_doc(r, backend) and PR.HB_DOCTOR_CAVEAT in rep_doc(r, backend)
     else:
         assert hb and 'г/л' not in hb.split('MAE')[0]
     q = V.quality_html(res)
@@ -86,7 +91,7 @@ def test_ood_refusal_has_no_level_no_hb(backend, monkeypatch):
     assert 'РИСК НЕ ОПРЕДЕЛЁН' in card and 'анализ крови' in card and hb == ''
     _no_numbers(card, hb)
     assert [st for _, st in V.step_states(r)] == ['done'] * 5 + ['fail']
-    assert 'Ориентировочный Hb' not in V.report_text(r, V.Survey(), backend.version)
+    assert 'Hb по фото' not in V.report_text(r, V.Survey(), backend.version)
 
 
 def test_child_refused_before_photo(backend):
@@ -307,7 +312,7 @@ def test_lab_goes_to_personalizer_but_not_into_photo_fields():
     assert (a.risk, a.p_anemia, a.hb_range) == (b.risk, b.p_anemia, b.hb_range) == ('высокий', 0.83, (92.0, 112.0))
     assert a.lab is None and b.lab is lab
     text = P.RulesPersonalizer().reply(b).text
-    assert 'риск анемии высокий' in text and '92–112 г/л' in text and '118 г/л' in text
+    assert 'риск анемии высокий' in text and '92' not in text and 'не показываем' in text and '118 г/л' in text
     # снимок не подошёл: про фото — «переснимите», анализ крови всё равно объясняется
     refused = P.make_input(_refused_dict(status='retake', stage='frame', issues=['снимок тёмный']), survey, lab)
     assert refused.risk is None and refused.hb_range is None and refused.lab is lab
@@ -431,11 +436,66 @@ def test_full_path_photo_result_lab_personalizer(backend, monkeypatch):
     assert 'AI Personalizer' in p_card and '125 г/л' in p_card and chatbot == [] and q == ''
     with open(report['value'], encoding='utf-8') as f:
         assert '125 г/л' in f.read().split('Анализ крови (введён пользователем')[1]
-    msgs, q, chat = _fn(demo, 'on_ask')('Что такое ферритин?', chat)
+    pdf_btn, pdf_msg = out[-2:]                                                    # PDF из результата этой сессии
+    assert pdf_btn['visible'] and pdf_btn['value'].endswith('.pdf') and not pdf_msg['visible']
+    msgs, q, chat, pdf_btn, _ = _fn(demo, 'on_ask')('Что такое ферритин?', chat, state)
     assert q == '' and msgs[0]['content'] == 'Что такое ферритин?' and 'Ферритин' in msgs[1]['content']
-    msgs, _, chat = _fn(demo, 'on_ask')('Нәтижем нені білдіреді?', chat)
+    pypdf = pytest.importorskip('pypdf')
+    txt = ' '.join(' '.join(p.extract_text().split()) for p in pypdf.PdfReader(pdf_btn['value']).pages)
+    assert 'Вопрос: Что такое ферритин?' in txt and '125 г/л' in txt               # PDF обновлён после вопроса
+    msgs, _, chat, *_ = _fn(demo, 'on_ask')('Нәтижем нені білдіреді?', chat, state)
     assert len(msgs) == 4 and 'диагноз емес' in msgs[3]['content']
     assert chat['inp'].risk == r['risk'] and chat['inp'].lab == state['lab']    # диалог не меняет результат
     # без анализа крови: карточки нет, путь тот же
     out = _fn(demo, 'run')(*form, 'Авто', '', 'г/л', 'Не знаю', 'Не знаю', 'Не знаю')
     assert out[6]['visible'] is False and out[12]['lab'] is None
+
+
+def test_pdf_failure_does_not_break_result(backend, monkeypatch):
+    """Нет reportlab / шрифта → экран результата работает, кнопка PDF скрыта, причина показана."""
+    pytest.importorskip('gradio')
+    from app.hemavision import ui
+
+    def boom(*a, **k):
+        raise RuntimeError('нет шрифта')
+    monkeypatch.setattr(ui, 'make_pdf', boom)
+    _route(monkeypatch, {'conj', 'sclera'})
+    demo = ui.build(backend=backend)
+    import tempfile
+
+    from PIL import Image
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+        Image.fromarray((np.clip(synthetic_eye()[0], 0, 1) * 255).astype(np.uint8)).save(f, format='JPEG')
+    out = _fn(demo, 'run')(f.name, 'Женский', 30, 'Нет', 'Авто', '', 'г/л', 'Не знаю', 'Не знаю', 'Не знаю')
+    assert out[12]['r']['status'] == 'ok'
+    pdf_btn, pdf_msg = out[-2:]
+    assert pdf_btn['visible'] is False and pdf_msg['visible'] and 'нет шрифта' in pdf_msg['value']
+
+
+# ------------------------------------------------------------------ качество: только ткани, по которым оценено
+def _r_conj_ok_sclera_blurred():
+    blur = 'плохое качество: снимок размыт: края ткани размыты на 1.93% кадра (допустимо ≤ 1.90%)'
+    return {'status': 'ok', 'stage': 'ok', 'risk': 'средний', 'p_anemia': 0.5, 'hb_range': None, 'hb_note': 'x',
+            'hb_estimate': None, 'tissues': ['conj'], 'tissue_status': {'conj': 'пригодна', 'sclera': blur},
+            'issues': [], 'notes': [], 'reasons': ['оценено только по цвету конъюнктивы'], 'crop': None, 'conj': None,
+            'sclera': None, 'diag': [], 'model': 'm', 'kind': 'глаз', 'eye': 'e', 'method': 'auto'}
+
+
+def test_quality_card_judges_used_tissue_only():
+    """Конъюнктива годна, склера размыта → оценка по конъюнктиве: «Резкость» не «размыто» (раньше карточка писала
+    «размыто» рядом с готовым результатом), склера — «найдена, не использована (размыто)». Экран и PDF одинаково."""
+    from anemia import api as API
+    from app.hemavision import pdf_report as PDF
+    r = _r_conj_ok_sclera_blurred()
+    res = API.to_result(r, 'v')
+    assert res.quality['sharpness'] == 'размыто'                 # api.Result — по всему снимку, как раньше
+    items = {a: (k, b) for a, k, b in V.quality_items(res, r)}
+    assert items['Резкость'] == ('ok', 'в норме')
+    assert items['Белок глаза (склера)'] == ('na', 'найдена, не использована (размыто)')
+    assert items['Слизистая века (конъюнктива)'] == ('ok', 'найдена')
+    assert 'не использована' in V.quality_html(res, r) and 'размыто' not in V.quality_html(res, r).split('Свет')[0]
+    assert dict(PDF.quality_rows(res, r))['Резкость'] == 'в норме'
+    # отказ: проблемы всего снимка видны как раньше
+    bad = {**r, 'status': 'retake', 'stage': 'quality', 'risk': None, 'p_anemia': None, 'tissues': [],
+           'issues': ['снимок размыт']}
+    assert dict((a, b) for a, _, b in V.quality_items(API.to_result(bad, 'v'), bad))['Резкость'] == 'размыто'
