@@ -7,6 +7,7 @@
 - Прототип v12: [notebooks/anemia_screening_v12.ipynb](notebooks/anemia_screening_v12.ipynb) — [Open in Colab](https://colab.research.google.com/github/zhansaya-afk/jjghg/blob/main/notebooks/anemia_screening_v12.ipynb).
 - Тесты: `pip install -e ".[dev]"` и `python -m pytest -q`; на каждый PR и push в `main` их запускает GitHub Actions (`.github/workflows/tests.yml`).
 - Правила разработки и план: [CLAUDE.md](CLAUDE.md).
+- Эксперименты: реестр [results/experiments.csv](results/experiments.csv). Фантом-эксперимент 2026-11-22 (4 телефона × 3 света, 97 снимков) — основной тест по заранее заданным критериям **не пройден**: [docs/phantom/README.md](docs/phantom/README.md). Фантом проверяет воспроизводимость съёмки и цветопередачи, а не медицинскую точность HemaVision.
 
 Данные и модели в репозиторий не коммитятся (`data/`, `models/`).
 
