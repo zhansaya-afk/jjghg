@@ -1,11 +1,13 @@
 """Фантом-эксперимент: печатная карточка + шкала образцов → a*, EI до/после коррекции по карточке.
 
 Проверяет камеру и коррекцию цвета (порядок образцов, разброс при другом свете/телефоне). НЕ проверяет связь с Hb,
-сегментацию и модель риска; модель не трогает. Подробно: anemia/phantom.py и docs/phantom_experiment.md.
+сегментацию и модель риска; модель не трогает. Подробно: anemia/phantom.py, docs/phantom_experiment.md (протокол),
+docs/phantom/README.md (результат 2026-11-22).
 
     python scripts/phantom_analysis.py card --out phantom_card.pdf            # лист A4 для печати (+ PNG рядом)
     python scripts/phantom_analysis.py analyze --photos DIR --out DIR_OUT      # DIR/p1/okno/*.jpg или p1_okno_01.jpg
     python scripts/phantom_analysis.py analyze --photos DIR --out DIR_OUT --gelatin   # + круги G1–G8 с желатином
+    python scripts/phantom_analysis.py analyze --photos DIR --out DIR_OUT --exploratory  # разведочно (после данных)
     python scripts/phantom_analysis.py demo --out DIR_OUT                      # синтетика: только проверка кода
 
 Выход analyze: samples.csv (каждый образец × снимок × коррекция), summary.csv, report.md, phantom_plot.png,
@@ -53,7 +55,7 @@ def list_photos(photos):
     return sorted(out)
 
 
-def analyze_dir(photos, kinds):
+def analyze_dir(photos, kinds, min_markers=3):
     rows, skipped = [], []
     for path, phone, light, rep in list_photos(photos):
         f = os.path.relpath(path, photos)
@@ -61,7 +63,7 @@ def analyze_dir(photos, kinds):
             skipped.append({'photo': f, 'reason': 'HEIC/DNG не читается: снимайте в JPEG (см. инструкцию)'})
             continue
         try:
-            d = P.analyze_image(load_rgb(path), kinds=kinds)
+            d = P.analyze_image(load_rgb(path), kinds=kinds, min_markers=min_markers)
         except Exception as e:                                          # noqa: BLE001 — причина в skipped.csv
             skipped.append({'photo': f, 'reason': str(e)})
             print(f'  пропущен {f}: {e}')
@@ -116,10 +118,14 @@ def plot(df, kind, path):
     return path
 
 
-def report_md(summary, kind, n_files, skipped, synthetic):
+def report_md(summary, kind, n_files, skipped, synthetic, exploratory=False):
     s = summary[COLS].copy()
     s['method'] = s.method.map(lambda m: f'{m} ({METHOD_RU[m]})')
     head = ['# Фантом-эксперимент: итог', '']
+    if exploratory:
+        head += [f'**РАЗВЕДОЧНЫЙ АНАЛИЗ — режим выбран после просмотра данных (лист по ≥ '
+                 f'{P.EXPLORATORY["min_markers"]} маркерам, без {", ".join(P.EXPLORATORY["drop"])}). Это гипотеза, '
+                 'не подтверждение; вердикт ниже справочный и не заменяет основной анализ.**', '']
     if synthetic:
         head += ['**СИНТЕТИКА — только проверка, что код работает. Это не результат эксперимента.**', '']
     head += [f'Образцы: {"печатная шкала S1–S8" if kind == "sample" else "желатин G1–G8"}. '
@@ -162,15 +168,18 @@ def code_version():
         return '?'
 
 
-def run_analysis(df, skipped, n_files, out, kind, synthetic=False):
+def run_analysis(df, skipped, n_files, out, kind, synthetic=False, exploratory=False):
     os.makedirs(out, exist_ok=True)
-    df = df.assign(synthetic=synthetic)
+    df = df.assign(synthetic=synthetic, exploratory=exploratory)
     df.to_csv(os.path.join(out, 'samples.csv'), index=False)
     skipped.to_csv(os.path.join(out, 'skipped.csv'), index=False)
     d = df[df.kind == kind]
+    if exploratory:
+        d = d[~d.name.isin(P.EXPLORATORY['drop'])]
     summary = P.summarize(d)
-    summary.assign(synthetic=synthetic).to_csv(os.path.join(out, 'summary.csv'), index=False)
-    md = report_md(summary, kind, n_files, skipped, synthetic)
+    summary.assign(synthetic=synthetic, exploratory=exploratory).to_csv(os.path.join(out, 'summary.csv'),
+                                                                        index=False)
+    md = report_md(summary, kind, n_files, skipped, synthetic, exploratory)
     with open(os.path.join(out, 'report.md'), 'w', encoding='utf-8') as fh:
         fh.write(md)
     plot(df, kind, os.path.join(out, 'phantom_plot.png'))
@@ -188,6 +197,8 @@ def main(argv=None):
     a.add_argument('--photos', required=True)
     a.add_argument('--out', required=True)
     a.add_argument('--gelatin', action='store_true', help='анализировать круги G1–G8 (желатин), а не S1–S8')
+    a.add_argument('--exploratory', action='store_true',
+                   help='разведочный режим (выбран после просмотра данных 22.11): лист по 2 маркерам, без S8')
     dm = sub.add_parser('demo')
     dm.add_argument('--out', required=True)
     args = ap.parse_args(argv)
@@ -200,14 +211,15 @@ def main(argv=None):
         return 0
     if args.cmd == 'analyze':
         kind = 'gel' if args.gelatin else 'sample'
-        df, skipped = analyze_dir(args.photos, (kind,))
+        mm = P.EXPLORATORY['min_markers'] if args.exploratory else 3
+        df, skipped = analyze_dir(args.photos, (kind,), mm)
         n = len(list_photos(args.photos))
         if df.empty:
             print('ни один снимок не разобран — см. skipped.csv')
             os.makedirs(args.out, exist_ok=True)
             skipped.to_csv(os.path.join(args.out, 'skipped.csv'), index=False)
             return 1
-        run_analysis(df, skipped, n, args.out, kind)
+        run_analysis(df, skipped, n, args.out, kind, exploratory=args.exploratory)
         return 0
     # demo: 2 «телефона» × 3 света × 2 повтора на синтетике
     sheet = P.render_sheet(150)

@@ -154,3 +154,25 @@ def test_script_folder_layout(tmp_path, sheet):
     assert [(g[1], g[2]) for g in got] == [('p1', 'led'), ('p1', 'okno'), ('p2', 'okno'), ('p2', 'okno')]
     df, sk = S.analyze_dir(str(tmp_path / 'ph'), ('sample',))
     assert df.photo.nunique() == 3 and len(sk) == 1 and 'HEIC' in sk.reason.iloc[0]
+
+
+def test_exploratory_mode_two_markers_and_drops_s8(tmp_path, sheet):
+    import sys
+    sys.path.insert(0, 'scripts')
+    import phantom_analysis as S
+    from PIL import Image
+    img = P.synthetic_photo(sheet, 6500, 1.0, 'p1', seed=1)
+    mk = P.detect_markers(img)
+    two = {k: mk[k] for k in (0, 1)}
+    assert P.sheet_homography(two, min_markers=2).shape == (3, 3)
+    with pytest.raises(ValueError):
+        P.sheet_homography(two)                     # основной анализ: по-прежнему ≥ 3
+    ph = tmp_path / 'ph' / 'p1' / 'okno'
+    ph.mkdir(parents=True)
+    for i, T in enumerate((6500, 5000)):
+        Image.fromarray(P.synthetic_photo(sheet, T, 1.0, 'p1', seed=i)).save(ph / f'{i}.jpg', quality=92)
+    assert S.main(['analyze', '--photos', str(tmp_path / 'ph'), '--out', str(tmp_path / 'o'), '--exploratory']) == 0
+    rep = (tmp_path / 'o' / 'report.md').read_text(encoding='utf-8')
+    assert 'РАЗВЕДОЧНЫЙ' in rep
+    sm = pd.read_csv(tmp_path / 'o' / 'summary.csv')
+    assert sm.exploratory.all()

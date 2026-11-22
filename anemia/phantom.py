@@ -41,6 +41,7 @@ SAMPLE_PALE = (0.95, 0.82, 0.80)         # sRGB 0–1, светлее самой
 SAMPLE_DARK = (0.62, 0.16, 0.20)         # темнее самой красной
 CLIP_HI, CLIP_LO = 0.98, 0.01            # доля канала: выше/ниже — поле пересвечено/провалено
 MIN_FIT_PATCHES = 8
+EXPLORATORY = {'min_markers': 2, 'drop': ('S8',)}   # разведочный режим 2026-11-22, выбран ПОСЛЕ просмотра данных
 MAX_CLIPPED = 0.2                        # образец с > 20% пересвеченных пикселей исключается из сводки
 NAME_RE = re.compile(r'^(?P<phone>[^_\s]+)_(?P<light>[^_\s]+)_(?P<rep>\d+)', re.I)
 
@@ -159,10 +160,12 @@ def detect_markers(rgb_u8, max_side=2000):
     return out
 
 
-def sheet_homography(markers):
-    """Гомография мм → пиксели по углам найденных маркеров (нужно ≥ 3 из 4)."""
-    if len(markers) < 3:
-        raise ValueError(f'на снимке найдено {len(markers)} из 4 маркеров (нужно ≥ 3): весь лист в кадре, без бликов')
+def sheet_homography(markers, min_markers=3):
+    """Гомография мм → пиксели по углам найденных маркеров. Основной анализ: ≥ 3 из 4 (записано до съёмки);
+    min_markers=2 — только разведочный режим (8 углов математически достаточно, но лист экстраполируется)."""
+    if len(markers) < min_markers:
+        raise ValueError(f'на снимке найдено {len(markers)} из 4 маркеров (нужно ≥ {min_markers}): '
+                         'весь лист в кадре, без бликов')
     ref = marker_corners_mm()
     src = np.concatenate([ref[i] for i in sorted(markers)])
     dst = np.concatenate([markers[i] for i in sorted(markers)]).astype(np.float32)
@@ -261,10 +264,10 @@ def card_residual_de(patches, fn):
 METHODS = ('raw', 'wb', 'ccm')
 
 
-def analyze_image(rgb_u8, kinds=('sample',)):
+def analyze_image(rgb_u8, kinds=('sample',), min_markers=3):
     """Один снимок → DataFrame (method, kind, name, R, G, B, L, a, b, EI, clipped, card_dE, n_fit)."""
     rgb01 = rgb_u8.astype(np.float32) / 255
-    patches = sample_patches(rgb01, sheet_homography(detect_markers(rgb_u8)))
+    patches = sample_patches(rgb01, sheet_homography(detect_markers(rgb_u8), min_markers))
     tgt = patches[patches.kind.isin(kinds)].reset_index(drop=True)
     out = []
     for m in METHODS:
