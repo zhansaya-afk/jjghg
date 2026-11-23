@@ -201,6 +201,12 @@ _OTHER_UNIT = (
     "час",
     "мин",
 )
+# казахские единицы целым словом: «10 жаста», «8 айлық», «2 апта», «3 күн», «2 рет», «70 пайыз», «5 жыл»;
+# не «95 айналасында», «105 жылдам», «98 рет-рет» (там число — Hb)
+_KK_OTHER_UNIT = re.compile(
+    r"(?:жас(?:та|ар|қа|ка|ында|ымда|тағы|тагы)?|ай(?:лық|лык|да|дан|ға|га)?|апта\w*|к[үу]н(?:де|нен|ге)?|"
+    r"рет(?!-)|пайыз\w*|жыл(?:да|дан|ға|га)?|са[ғг]ат\w*)\b"
+)
 
 
 def _last(rx, text):
@@ -219,7 +225,7 @@ def hb_from_question(question, facts):
         whole, dec = int(m.group(1)), m.group(2)
         tail = question[m.end() : m.end() + 12].lower().lstrip(" ,.")
         mmol = tail.startswith(("ммоль", "mmol"))
-        if tail.startswith(_OTHER_UNIT) and not mmol:
+        if (tail.startswith(_OTHER_UNIT) or _KK_OTHER_UNIT.match(tail)) and not mmol:
             continue
         head = question[max(0, m.start() - 30) : m.start()]
         if _last(_OTHER_WORD, head) > _last(
